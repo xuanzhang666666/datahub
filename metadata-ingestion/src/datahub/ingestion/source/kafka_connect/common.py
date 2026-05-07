@@ -645,7 +645,19 @@ def get_dataset_name(
     database_name: Optional[str],
     source_table: str,
 ) -> str:
-    return database_name + "." + source_table if database_name else source_table
+    if not database_name:
+        return source_table
+    # database_name is expected to be a single identifier. If it contains a
+    # dot it usually means the connector config has database.dbname set to a
+    # schema-qualified value (e.g. "mydb.public"); naively concatenating
+    # produces a doubled schema segment in the lineage URN.
+    if "." in database_name:
+        logger.warning(
+            f"database_name '{database_name}' contains a dot; using first "
+            "segment only to avoid duplicating schema in lineage URN"
+        )
+        database_name = database_name.split(".", 1)[0]
+    return f"{database_name}.{source_table}"
 
 
 def get_platform_instance(
