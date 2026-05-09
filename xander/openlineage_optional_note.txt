@@ -1,0 +1,3 @@
+Hive storage lineage from xander/recipes/hive_metastore_dw_order_v1_lineage.yml covers LOCATION -> hive dataset edges.
+For additional Hive-table -> Hive-table edges from Spark/Flink/schedulers, use OpenLineage into DataHub (see docs/lineage/openlineage.md).
+Emit datasets with the same Hive URN pattern as ingestion: platform hive, platform_instance blf-prod-hive, env PROD.
