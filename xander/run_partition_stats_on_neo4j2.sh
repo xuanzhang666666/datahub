@@ -1,12 +1,13 @@
 #!/bin/sh
-# Run on neo4j2 after get2: sync_partition_stats_to_datahub_trino.py + this file -> /data/datahub/scripts/
+# Run on the neo4j2 host (SSH session or cron). Deploy xander/sync_partition_stats_to_datahub_trino.py
+# beside this script under SCRIPT_DIR (/data/datahub/scripts/ after put2/get2 + mv).
 #
-# Default: run inside datahub-actions container (works with agent-bastion: only "docker *" is allowlisted,
-# not "python3 /path/..." or "sh /path/...").
+# Default path: docker cp into datahub-actions, then docker exec python3 (matches agent-bastion allowlist).
+# Laptop → bastion remote trigger without logging into neo4j2: use xander/exec_partition_sync_via_bastion.example.sh.
 #
-# Optional: RUN_ON_HOST=1 to use host python3 + DATAHUB_GMS_URL=http://127.0.0.1:8080 (direct SSH to neo4j2 only).
+# Optional: RUN_ON_HOST=1 uses host python3 + DATAHUB_GMS_URL=http://127.0.0.1:8080 (neo4j2 only, not via bastion chain).
 #
-# Trino: no password by default; omit TRINO_PASSWORD unless your coordinator uses Basic auth.
+# Trino: no password by default; set TRINO_PASSWORD only if your coordinator uses HTTP basic auth.
 set -e
 SCRIPT_DIR=/data/datahub/scripts
 PY=sync_partition_stats_to_datahub_trino.py
