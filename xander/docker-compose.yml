@@ -3,6 +3,10 @@ networks:
     name: datahub_network
 services:
   broker:
+    deploy:
+      resources:
+        limits:
+          memory: 4G
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -13,7 +17,7 @@ services:
     - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092
     - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
     - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
-    - KAFKA_HEAP_OPTS=-Xms512m -Xmx512m
+    - KAFKA_HEAP_OPTS=-Xms2g -Xmx2g
     - KAFKA_CONFLUENT_SUPPORT_METRICS_ENABLE=false
     - KAFKA_MESSAGE_MAX_BYTES=5242880
     - KAFKA_MAX_MESSAGE_BYTES=5242880
@@ -30,6 +34,10 @@ services:
     volumes:
     - /data/datahub/kafka:/var/lib/kafka/data
   datahub-actions:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     depends_on:
       datahub-gms:
         condition: service_healthy
@@ -49,6 +57,10 @@ services:
     hostname: actions
     image: ${DATAHUB_ACTIONS_IMAGE:-acryldata/datahub-actions}:${DATAHUB_VERSION:-v1.5.0.4}-slim
   datahub-frontend-react:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     depends_on:
       datahub-gms:
         condition: service_healthy
@@ -58,7 +70,7 @@ services:
     - DATAHUB_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     - DATAHUB_APP_VERSION=${DATAHUB_VERSION:-v1.5.0.4}
     - DATAHUB_PLAY_MEM_BUFFER_SIZE=10MB
-    - JAVA_OPTS=-Xms512m -Xmx512m -Dhttp.port=9002 -Dconfig.file=datahub-frontend/conf/application.conf -Djava.security.auth.login.config=datahub-frontend/conf/jaas.conf -Dlogback.configurationFile=datahub-frontend/conf/logback.xml -Dlogback.debug=false -Dpidfile.path=/dev/null
+    - JAVA_OPTS=-Xms2g -Xmx2g -Dhttp.port=9002 -Dconfig.file=datahub-frontend/conf/application.conf -Djava.security.auth.login.config=datahub-frontend/conf/jaas.conf -Dlogback.configurationFile=datahub-frontend/conf/logback.xml -Dlogback.debug=false -Dpidfile.path=/dev/null
     - KAFKA_BOOTSTRAP_SERVER=broker:29092
     - DATAHUB_TRACKING_TOPIC=DataHubUsageEvent_v1
     - ELASTIC_CLIENT_HOST=elasticsearch
@@ -72,6 +84,10 @@ services:
     volumes:
     - /data/datahub/plugins:/etc/datahub/plugins
   datahub-gms:
+    deploy:
+      resources:
+        limits:
+          memory: 8G
     depends_on:
       datahub-upgrade:
         condition: service_completed_successfully
@@ -94,7 +110,7 @@ services:
     - ES_BULK_REFRESH_POLICY=NONE
     - GRAPH_SERVICE_DIFF_MODE_ENABLED=true
     - GRAPH_SERVICE_IMPL=${GRAPH_SERVICE_IMPL:-elasticsearch}
-    - JAVA_OPTS=-Xms1g -Xmx1g
+    - JAVA_OPTS=-Xms8g -Xmx8g
     - DATAHUB_TOKEN_SERVICE_SIGNING_KEY=${DATAHUB_TOKEN_SERVICE_SIGNING_KEY:-AccLVCTZXKRmWPGQnvTSqMT6Duz3hAH3c1xsFNkqKz8z}
     - DATAHUB_TOKEN_SERVICE_SALT=${DATAHUB_TOKEN_SERVICE_SALT:-dH5T56hqS5P7GqhUQT2YnKdX4m7E3N8K}
     - KAFKA_BOOTSTRAP_SERVER=broker:29092
@@ -167,12 +183,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 8G
     environment:
     - discovery.type=single-node
     - ${XPACK_SECURITY_ENABLED:-xpack.security.enabled=false}
-    - ES_JAVA_OPTS=-Xms256m -Xmx512m -Dlog4j2.formatMsgNoLookups=true
-    - OPENSEARCH_JAVA_OPTS=-Xms768m -Xmx1024m -Dlog4j2.formatMsgNoLookups=true
+    - ES_JAVA_OPTS=-Xms4g -Xmx4g -Dlog4j2.formatMsgNoLookups=true
+    - OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g -Dlog4j2.formatMsgNoLookups=true
     - DISABLE_SECURITY_PLUGIN=true
     healthcheck:
       interval: 1s
@@ -199,6 +215,10 @@ services:
     labels:
       datahub_setup_job: true
   mysql:
+    deploy:
+      resources:
+        limits:
+          memory: 4G
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_bin --default-authentication-plugin=mysql_native_password
     environment:
     - MYSQL_DATABASE=datahub
@@ -220,11 +240,18 @@ services:
     volumes:
     - /data/datahub/mysql:/var/lib/mysql
   neo4j:
+    deploy:
+      resources:
+        limits:
+          memory: 16G
     environment:
     - NEO4J_AUTH=neo4j/datahub
     - NEO4J_dbms_default__database=graph.db
     - NEO4J_dbms_allow__upgrade=true
     - NEO4JLABS_PLUGINS=[]
+    - NEO4J_dbms_memory_heap_initial__size=2g
+    - NEO4J_dbms_memory_heap_max__size=8g
+    - NEO4J_dbms_memory_pagecache_size=2g
     healthcheck:
       interval: 5s
       retries: 30
@@ -239,6 +266,10 @@ services:
     volumes:
     - /data/datahub/neo4j:/data
   schema-registry:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     depends_on:
       broker:
         condition: service_healthy
@@ -257,6 +288,10 @@ services:
     ports:
     - ${DATAHUB_MAPPED_SCHEMA_REGISTRY_PORT:-8081}:8081
   zookeeper:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     environment:
     - ZOOKEEPER_CLIENT_PORT=2181
     - ZOOKEEPER_TICK_TIME=2000

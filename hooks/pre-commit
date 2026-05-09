@@ -1,0 +1,32 @@
+#!/bin/bash
+# Pre-commit hook: 防止误提交 xander 目录以外的文件
+
+# 获取所有暂存的文件
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+# 检查是否有非 xander 目录的文件
+NON_XANDER_FILES=""
+for file in $STAGED_FILES; do
+    # 检查文件是否在 xander 目录下
+    if [[ "$file" != xander/* ]]; then
+        NON_XANDER_FILES="$NON_XANDER_FILES\n  - $file"
+    fi
+done
+
+if [ -n "$NON_XANDER_FILES" ]; then
+    echo "=============================================="
+    echo "错误：禁止提交 xander 目录以外的文件！"
+    echo "=============================================="
+    echo "以下文件不在 xander/ 目录下，无法提交:"
+    echo -e "$NON_XANDER_FILES"
+    echo ""
+    echo "如果你确实需要提交这些文件，请先联系项目维护者。"
+    echo "=============================================="
+    exit 1
+fi
+
+exit 0
