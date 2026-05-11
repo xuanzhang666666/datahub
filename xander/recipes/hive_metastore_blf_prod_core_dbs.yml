@@ -1,0 +1,47 @@
+# Hive Metastore (Thrift) — single recipe: default + data_drink + 14 data_* DBs (all tables/views)
+#
+# Use this instead of separate per-db runs so catalog/schema containers and datasets are
+# emitted in one pipeline (same parent catalog key from _get_db_name → browse: <instance> → hive).
+#
+# Databases:
+#   default, data_drink,
+#   data_build, data_ic, data_logistics, data_md, data_promotion, data_shop,
+#   data_smartorder, data_smartorder_dev, data_supplychain, data_support,
+#   data_takeaway, data_tech, data_userinsight, data_userresearch
+#
+# URN pattern (include_catalog_name_in_ids=false):
+#   urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.<db>.<table>,PROD)
+#
+# Browse stability (repeat runs): keep these literals identical across every ingest:
+#   env: PROD
+#   platform_instance: blf-prod-hive
+#   catalog_name: hive  (HMS 2.x falls back to non-catalog APIs if needed)
+#
+# Runtime env: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
+#
+source:
+  type: hive-metastore
+  config:
+    connection_type: thrift
+    host_port: "${HMS_THRIFT_HOST}:${HMS_THRIFT_PORT}"
+    use_kerberos: false
+
+    env: PROD
+    platform_instance: blf-prod-hive
+    catalog_name: hive
+    emit_storage_lineage: false
+    hive_storage_lineage_direction: upstream
+    include_column_lineage: true
+    include_view_lineage: true
+
+    database_pattern:
+      allow:
+        - "^(default|data_drink|data_(build|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch))$"
+    table_pattern:
+      allow:
+        - "^(default|data_drink|data_(build|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch))\\..*$"
+
+sink:
+  type: datahub-rest
+  config:
+    server: "${DATAHUB_GMS_URL}"

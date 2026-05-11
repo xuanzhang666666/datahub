@@ -3,8 +3,8 @@
 # Matches dataset URN: urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.default.dw_order_v1,PROD)
 #
 # Prerequisites: pip install 'acryl-datahub[hive-metastore]'
-# Env (see ../run_hive_metastore_dw_order_v1_lineage_ingest.example.sh):
-#   HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
+# Runtime: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
+# Browse stability: env PROD + platform_instance blf-prod-hive + catalog_name hive.
 #
 source:
   type: hive-metastore
@@ -13,7 +13,9 @@ source:
     host_port: "${HMS_THRIFT_HOST}:${HMS_THRIFT_PORT}"
     use_kerberos: false
 
+    env: PROD
     platform_instance: blf-prod-hive
+    catalog_name: hive
     emit_storage_lineage: true
     hive_storage_lineage_direction: upstream
     include_column_lineage: false

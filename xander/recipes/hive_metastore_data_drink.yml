@@ -1,10 +1,14 @@
-# Hive Metastore (Thrift) — metadata + storage lineage for default.dw_order_v1
+# Hive Metastore (Thrift) — ingest all tables in database data_drink
 #
-# Matches dataset URN: urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.default.dw_order_v1,PROD)
+# To keep browse (blf-prod-hive → hive) consistent with other BLF DBs, prefer the unified recipe:
+#   xander/recipes/hive_metastore_blf_prod_core_dbs.yml
+#
+# Dataset URN pattern:
+#   urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.data_drink.<table>,PROD)
 #
 # Prerequisites: pip install 'acryl-datahub[hive-metastore]'
+# Browse stability: env PROD + platform_instance blf-prod-hive + catalog_name hive (same as unified recipe).
 # Runtime: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
-# Browse stability: env PROD + platform_instance blf-prod-hive + catalog_name hive (same as other BLF Hive recipes).
 #
 source:
   type: hive-metastore
@@ -19,14 +23,14 @@ source:
     emit_storage_lineage: false
     hive_storage_lineage_direction: upstream
     include_column_lineage: true
-    include_view_lineage: false
+    include_view_lineage: true
 
     database_pattern:
       allow:
-        - "^default$"
+        - "^data_drink$"
     table_pattern:
       allow:
-        - "^default\\.dw_order_v1$"
+        - "^data_drink\\..*$"
 
 sink:
   type: datahub-rest
