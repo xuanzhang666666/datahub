@@ -1,0 +1,140 @@
+query DatasetMetadataForLLM($urn: String!) {
+  dataset(urn: $urn) {
+    urn
+    exists
+    name
+    lastIngested
+    platform {
+      urn
+      name
+    }
+    browsePathV2 {
+      path {
+        name
+        entity {
+          urn
+        }
+      }
+    }
+    parentContainers {
+      count
+      containers {
+        urn
+        properties {
+          name
+        }
+      }
+    }
+    properties {
+      name
+      qualifiedName
+      description
+      externalUrl
+      origin
+      customProperties {
+        key
+        value
+      }
+    }
+    editableProperties {
+      description
+    }
+    subTypes {
+      typeNames
+    }
+    ownership {
+      owners {
+        owner {
+          ... on CorpUser {
+            urn
+            username
+          }
+          ... on CorpGroup {
+            urn
+            name
+          }
+        }
+      }
+    }
+    tags {
+      tags {
+        tag {
+          urn
+          properties {
+            name
+          }
+        }
+      }
+    }
+    glossaryTerms {
+      terms {
+        term {
+          urn
+          properties {
+            name
+          }
+        }
+      }
+    }
+    schemaMetadata {
+      name
+      hash
+      platformUrn
+      fields {
+        fieldPath
+        label
+        description
+        nativeDataType
+        nullable
+        isPartitioningKey
+        isPartOfKey
+      }
+    }
+    upstream: lineage(input: { direction: UPSTREAM, count: 40 }) {
+      total
+      relationships {
+        type
+        degree
+        entity {
+          urn
+          ... on Dataset {
+            name
+            properties {
+              name
+              description
+            }
+          }
+        }
+      }
+    }
+    downstream: lineage(input: { direction: DOWNSTREAM, count: 40 }) {
+      total
+      relationships {
+        type
+        degree
+        entity {
+          urn
+          ... on Dataset {
+            name
+            properties {
+              name
+              description
+            }
+          }
+        }
+      }
+    }
+    fineGrainedLineages {
+      transformOperation
+      query
+      upstreams {
+        urn
+        path
+      }
+      downstreams {
+        urn
+        path
+      }
+    }
+  }
+}
