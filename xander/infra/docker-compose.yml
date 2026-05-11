@@ -243,15 +243,15 @@ services:
     deploy:
       resources:
         limits:
-          memory: 16G
+          memory: 48G
     environment:
     - NEO4J_AUTH=neo4j/datahub
     - NEO4J_dbms_default__database=graph.db
     - NEO4J_dbms_allow__upgrade=true
     - NEO4JLABS_PLUGINS=[]
-    - NEO4J_dbms_memory_heap_initial__size=2g
-    - NEO4J_dbms_memory_heap_max__size=8g
-    - NEO4J_dbms_memory_pagecache_size=2g
+    - NEO4J_dbms_memory_heap_initial__size=4g
+    - NEO4J_dbms_memory_heap_max__size=24g
+    - NEO4J_dbms_memory_pagecache_size=12g
     healthcheck:
       interval: 5s
       retries: 30
