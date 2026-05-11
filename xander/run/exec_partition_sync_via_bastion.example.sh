@@ -1,7 +1,7 @@
 #!/bin/sh
 # One-off from your laptop: bastion → neo4j2, only allowlisted remote commands (docker cp / docker exec).
-# Pair with: xander/sync_partition_stats_to_datahub_trino.py deployed to neo4j2 /data/datahub/scripts/
-# (put2 + get2 or rsync). For cron or shell on neo4j2 itself, use xander/run_partition_stats_on_neo4j2.sh instead.
+# Pair with: xander/python/sync_partition_stats_to_datahub_trino.py deployed to neo4j2 /data/datahub/scripts/
+# (put2 + get2 or rsync). For cron or shell on neo4j2 itself, use xander/run/run_partition_stats_on_neo4j2.sh instead.
 # Adjust BASTION_KEY / REMOTE / CTR if your compose container name is not root-datahub-actions-1.
 
 set -e

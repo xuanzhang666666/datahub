@@ -1,0 +1,1 @@
+{"query":"query { searchAcrossEntities(input: { types: [DATASET], query: \"data_drink\", start: 0, count: 15 }) { total searchResults { entity { urn type ... on Dataset { name platform { name } dataPlatformInstance { instanceId } browsePathV2 { path { name } } } } } } }"}

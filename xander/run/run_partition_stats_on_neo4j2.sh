@@ -1,9 +1,9 @@
 #!/bin/sh
-# Run on the neo4j2 host (SSH session or cron). Deploy xander/sync_partition_stats_to_datahub_trino.py
+# Run on the neo4j2 host (SSH session or cron). Deploy xander/python/sync_partition_stats_to_datahub_trino.py
 # beside this script under SCRIPT_DIR (/data/datahub/scripts/ after put2/get2 + mv).
 #
 # Default path: docker cp into datahub-actions, then docker exec python3 (matches agent-bastion allowlist).
-# Laptop → bastion remote trigger without logging into neo4j2: use xander/exec_partition_sync_via_bastion.example.sh.
+# Laptop → bastion remote trigger without logging into neo4j2: use xander/run/exec_partition_sync_via_bastion.example.sh.
 #
 # Optional: RUN_ON_HOST=1 uses host python3 + DATAHUB_GMS_URL=http://127.0.0.1:8080 (neo4j2 only, not via bastion chain).
 #

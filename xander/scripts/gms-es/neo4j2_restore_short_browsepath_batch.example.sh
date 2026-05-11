@@ -5,7 +5,7 @@
 # Prerequisites: agent-bastion access to neo4j2.dp.data.bj1; put2/get2; flat FTP filename.
 # Bastion: use FQDN neo4j2.dp.data.bj1 (not neo4j2). Avoid && in one remote line if denied.
 #
-# 1) From repo root: cp xander/scripts/urns_hive_short_browsepath_batch.json ./u13.json
+# 1) From repo root: cp xander/scripts/gms-es/urns_hive_short_browsepath_batch.json ./u13.json
 # 2) put2 u13.json
 # 3) ssh ... "@neo4j2.dp.data.bj1 get2 u13.json"
 # 4) ssh ... "@neo4j2.dp.data.bj1 mv u13.json /tmp/urns_batch_restore.json"

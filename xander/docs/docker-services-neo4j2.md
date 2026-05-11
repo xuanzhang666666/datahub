@@ -119,4 +119,4 @@
 ## 相关文件
 
 - 配置文件: `/data/datahub/docker-compose.yml`
-- 部署文档: `xander/datahub-deploy-neo4j2.md`
+- 部署文档: `xander/docs/datahub-deploy-neo4j2.md`

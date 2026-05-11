@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fetch recent Hive partitions + row counts via Trino, write to DataHub structured properties.
 
-Deploy/run helpers (this repo, under xander/): run_partition_stats_on_neo4j2.sh (on-server),
-exec_partition_sync_via_bastion.example.sh (laptop via bastion).
+Deploy/run helpers (this repo, under xander/): xander/run/run_partition_stats_on_neo4j2.sh (on-server),
+xander/run/exec_partition_sync_via_bastion.example.sh (laptop via bastion).
 """
 
 from __future__ import annotations

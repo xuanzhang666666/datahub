@@ -1,0 +1,9 @@
+{
+  "size": 1,
+  "query": {
+    "match": {
+      "name": "pdw_netbee_device_rfid_cabinet_attr_log_di_ha_20220302_tmp"
+    }
+  },
+  "_source": ["urn", "browsePathV2"]
+}

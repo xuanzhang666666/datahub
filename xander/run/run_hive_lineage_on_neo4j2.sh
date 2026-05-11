@@ -3,11 +3,11 @@
 #
 # Deploy (flat names for put2 FTP):
 #   cp xander/recipes/hive_metastore_dw_order_v1_lineage.yml ./hive_metastore_dw_order_v1_lineage.yml
-#   cp xander/run_hive_lineage_on_neo4j2.sh ./run_hive_lineage_on_neo4j2.sh
+#   cp xander/run/run_hive_lineage_on_neo4j2.sh ./run_hive_lineage_on_neo4j2.sh
 #   put2 hive_metastore_dw_order_v1_lineage.yml ; put2 run_hive_lineage_on_neo4j2.sh
 # On neo4j2 after get2: mv both → /data/datahub/scripts/ && chmod +x run_hive_lineage_on_neo4j2.sh
 #
-# Bastion-safe remote trigger (no sh /path on host): see xander/exec_hive_lineage_ingest_via_bastion.example.sh
+# Bastion-safe remote trigger (no sh /path on host): see xander/run/exec_hive_lineage_ingest_via_bastion.example.sh
 #
 # If ingest fails at _sqlglot_patch / DiffApplyError: venv sqlglot drifted vs bundled patches.
 #   docker exec CTR /home/datahub/.venv/bin/pip install sqlglot==30.0.3 --force-reinstall --no-cache-dir
