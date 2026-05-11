@@ -116,7 +116,14 @@
 - **Total Memory**: ~8.5 GiB (不含 Elasticsearch 限制)
 - **Disk (Data)**: /data/datahub/*
 
+## Compose 中与运行态相关的调优（与 `xander/infra/docker-compose.yml` 对齐）
+
+- **`DATAHUB_TELEMETRY_ENABLED` 默认 `false`**：内网无法访问 Mixpanel 时避免 GMS 反复打 ERROR 日志；若需上报可宿主机 `export DATAHUB_TELEMETRY_ENABLED=true` 后再 `docker compose up -d`。
+- **前端 JVM 增加 `-Dplay.server.http.idleTimeout=300s`**：缓解 Play 默认 75s 空闲超时导致的 `HttpIdleTimeoutException`（慢 GraphQL 经 `/api/v2/graphql` 代理时）。
+- **Elasticsearch `yellow` + 单节点**：多为副本分片未分配，属单节点常态；若需 `green` 可对索引调 `number_of_replicas: 0`（运维侧 API，不必写进 compose）。
+
 ## 相关文件
 
 - 配置文件: `/data/datahub/docker-compose.yml`
 - 部署文档: `xander/docs/datahub-deploy-neo4j2.md`
+- 仓库模板: `xander/infra/docker-compose.yml`（合并到宿主机 compose 后需 **`docker compose up -d`** 重载 **gms**、**frontend** 方生效）

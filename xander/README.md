@@ -10,7 +10,7 @@
 | **`docs/`** | 说明与规范：`datahub-deploy-neo4j2.md`、`docker-services-neo4j2.md`、`datahub-ingestion-standards.md`（入仓约束） |
 | **`python/`** | 需在 neo4j2 / actions 容器旁部署的 Python 工具，如 `sync_partition_stats_to_datahub_trino.py` |
 | **`notes/`** | 短说明、可选流程笔记，如 `openlineage_optional_note.txt` |
-| **`infra/`** | 基础设施片段，如 `docker-compose.yml`（本机或 neo4j2 侧 compose） |
+| **`infra/`** | 基础设施片段，如 `docker-compose.yml`（本机或 neo4j2 侧 compose；已默认 **关闭 GMS telemetry**、**前端 HTTP idleTimeout=300s** 以降低内网噪音与慢 GraphQL 断连） |
 | **`scripts/gms-es/`** | 调 GMS（GraphQL/OpenAPI）、查 ES `datasetindex_v2` 的请求体与示例 JSON/shell、URN 片段、`restoreIndices` 辅助说明等 |
 | **`scripts/README.md`** | `scripts/` 下子目录说明（当前主要为 `gms-es/`） |
 | **`recipes/`** | `datahub ingest -c` 使用的 YAML recipe（如各 `hive_metastore_*.yml`） |
