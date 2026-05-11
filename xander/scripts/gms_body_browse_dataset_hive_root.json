@@ -1,0 +1,1 @@
+{"query":"query { browseV2(input: { types: [DATASET], path: [], start: 0, count: 30, orFilters: [{ and: [{ field: \"platform\", condition: EQUAL, values: [\"urn:li:dataPlatform:hive\"] }] }] }) { total start count groups { name count hasSubGroups } } }"}

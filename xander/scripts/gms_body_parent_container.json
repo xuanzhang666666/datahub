@@ -1,0 +1,1 @@
+{"query":"query { entity(urn: \"urn:li:container:b726a84f2f8cb27c3b872149be955760\") { urn type ... on Container { properties { name description customProperties { key value } } subTypes { typeNames } dataPlatformInstance { instanceId urn } browsePathV2 { path { name entity { urn } } } parentContainers { count containers { urn } } } } }"}

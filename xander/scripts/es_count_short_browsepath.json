@@ -1,0 +1,22 @@
+{
+  "size": 0,
+  "track_total_hits": true,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "platform.keyword": "urn:li:dataPlatform:hive"
+          }
+        }
+      ],
+      "must_not": [
+        {
+          "wildcard": {
+            "browsePathV2": "*dataPlatformInstance*"
+          }
+        }
+      ]
+    }
+  }
+}

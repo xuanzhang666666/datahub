@@ -1,0 +1,1 @@
+{"query":"query { browseV2(input: { types: [CONTAINER], path: [], start: 0, count: 50 }) { total start count groups { name count hasSubGroups entity { urn ... on Container { properties { name } subTypes { typeNames } } } } } }"}

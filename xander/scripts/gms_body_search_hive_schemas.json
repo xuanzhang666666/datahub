@@ -1,0 +1,1 @@
+{"query":"query { searchAcrossEntities(input: { types: [CONTAINER], query: \"data_\", start: 0, count: 50 }) { total searchResults { entity { urn type ... on Container { properties { name } subTypes { typeNames } dataPlatformInstance { instanceId } browsePathV2 { path { name entity { urn } } } } } } } }"}
