@@ -7,7 +7,7 @@
 #   urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.data_drink.<table>,PROD)
 #
 # Prerequisites: pip install 'acryl-datahub[hive-metastore]'
-# Browse stability: env PROD + platform_instance blf-prod-hive + catalog_name hive (same as unified recipe).
+# Browse stability: env PROD + platform_instance blf-prod-hive (omit catalog_name unless HMS uses it).
 # Runtime: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
 #
 source:
@@ -19,7 +19,6 @@ source:
 
     env: PROD
     platform_instance: blf-prod-hive
-    catalog_name: hive
     emit_storage_lineage: false
     hive_storage_lineage_direction: upstream
     include_column_lineage: true

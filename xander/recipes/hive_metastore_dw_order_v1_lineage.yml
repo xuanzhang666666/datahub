@@ -4,7 +4,7 @@
 #
 # Prerequisites: pip install 'acryl-datahub[hive-metastore]'
 # Runtime: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
-# Browse stability: env PROD + platform_instance blf-prod-hive + catalog_name hive (same as other BLF Hive recipes).
+# Browse stability: env PROD + platform_instance blf-prod-hive (omit catalog_name unless HMS uses it).
 #
 source:
   type: hive-metastore
@@ -15,7 +15,6 @@ source:
 
     env: PROD
     platform_instance: blf-prod-hive
-    catalog_name: hive
     emit_storage_lineage: false
     hive_storage_lineage_direction: upstream
     include_column_lineage: true

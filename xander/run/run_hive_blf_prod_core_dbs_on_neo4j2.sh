@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # neo4j2: HMS Thrift ingest for hive_metastore_blf_prod_core_dbs.yml (default + data_drink + 14 data_*).
-# Recipe pins env=PROD, platform_instance=blf-prod-hive, catalog_name=hive — keep in sync with xander/recipes copy.
+# Recipe pins env=PROD, platform_instance=blf-prod-hive — keep in sync with xander/recipes copy.
 #
 # Deploy (flat FTP names):
 #   put2 hive_metastore_blf_prod_core_dbs.yml
@@ -9,6 +9,7 @@
 #
 # Bastion: prefer docker cp + docker exec (see prior data_drink / multi_dbs runs).
 # PYTHONUNBUFFERED=1 in docker exec; DATAHUB_DOCKER_SUDO: auto|0|1 — auto tries docker → sg docker → sudo.
+# TZ — default Asia/Shanghai for Python logs inside docker exec / RUN_ON_HOST.
 #
 set -euo pipefail
 SCRIPT_DIR=/data/datahub/scripts
@@ -18,6 +19,7 @@ TMP_RECIPE="/tmp/$RECIPE_NAME"
 
 export HMS_THRIFT_HOST="${HMS_THRIFT_HOST:-hiveserver5.dp.data.bj1.wormpex.com}"
 export HMS_THRIFT_PORT="${HMS_THRIFT_PORT:-9083}"
+export TZ="${TZ:-Asia/Shanghai}"
 
 if [[ "${RUN_ON_HOST:-0}" == "1" ]]; then
   export DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-http://127.0.0.1:8080}"
@@ -81,6 +83,7 @@ GMS="${DATAHUB_GMS_URL:-http://datahub-gms:8080}"
 dh_docker cp "$HOST_RECIPE" "$CTR:$TMP_RECIPE"
 
 dh_docker exec \
+  -e TZ="$TZ" \
   -e PYTHONUNBUFFERED=1 \
   -e DATAHUB_TELEMETRY_ENABLED=false \
   -e HMS_THRIFT_HOST="$HMS_THRIFT_HOST" \

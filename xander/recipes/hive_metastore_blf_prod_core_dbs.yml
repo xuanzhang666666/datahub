@@ -12,10 +12,8 @@
 # URN pattern (include_catalog_name_in_ids=false):
 #   urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.<db>.<table>,PROD)
 #
-# Browse stability (repeat runs): keep these literals identical across every ingest:
-#   env: PROD
-#   platform_instance: blf-prod-hive
-#   catalog_name: hive  (HMS 2.x falls back to non-catalog APIs if needed)
+# Browse stability (repeat runs): keep env PROD + platform_instance blf-prod-hive identical.
+# Omit catalog_name unless HMS actually exposes DBs under that catalog (@hive# empty → 0 DBs).
 #
 # Runtime env: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
 #
@@ -28,7 +26,6 @@ source:
 
     env: PROD
     platform_instance: blf-prod-hive
-    catalog_name: hive
     emit_storage_lineage: false
     hive_storage_lineage_direction: upstream
     include_column_lineage: true

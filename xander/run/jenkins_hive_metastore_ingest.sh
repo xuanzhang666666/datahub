@@ -32,6 +32,7 @@
 #   JENKINS_BASTION_* / JENKINS_NEO4J2_TARGET / JENKINS_SSH_EXTRA_OPTS — only when MODE=bastion
 #   DATAHUB_DOCKER_SUDO — passed through to run_hive_* (auto|0|1); auto uses sg docker if Jenkins
 #     process was not restarted after usermod -aG docker.
+#   TZ — for log() timestamps (default Asia/Shanghai); Python ingest time uses run_hive_* docker -e TZ.
 #
 # HMS / GMS: see run_hive_*_on_neo4j2.sh defaults on neo4j2; override there or via a wrapper.
 set -eu
@@ -46,7 +47,7 @@ NEO4J2_TARGET="${JENKINS_NEO4J2_TARGET:-neo4j2.dp.data.bj1}"
 EXTRA_OPTS="${JENKINS_SSH_EXTRA_OPTS:-}"
 
 log() {
-  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
+  printf '%s %s\n' "$(TZ="${TZ:-Asia/Shanghai}" date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
 }
 
 log "jenkins_hive_metastore_ingest MODE=$MODE REMOTE_SCRIPT=$REMOTE_SCRIPT"

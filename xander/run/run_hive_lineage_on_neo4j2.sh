@@ -18,6 +18,7 @@
 #   DATAHUB_GMS_TOKEN optional; DATAHUB_ACTIONS_CONTAINER to pin container name
 #   PYTHONUNBUFFERED=1 set for docker/host so ingest progress streams to logs (e.g. Jenkins).
 #   DATAHUB_DOCKER_SUDO: auto|0|1 — auto tries docker → sg docker → sudo -n docker (see multi_dbs script).
+#   TZ — default Asia/Shanghai for Python logs inside docker exec / RUN_ON_HOST.
 set -euo pipefail
 SCRIPT_DIR=/data/datahub/scripts
 RECIPE_NAME=hive_metastore_dw_order_v1_lineage.yml
@@ -26,6 +27,7 @@ TMP_RECIPE="/tmp/$RECIPE_NAME"
 
 export HMS_THRIFT_HOST="${HMS_THRIFT_HOST:-hiveserver5.dp.data.bj1.wormpex.com}"
 export HMS_THRIFT_PORT="${HMS_THRIFT_PORT:-9083}"
+export TZ="${TZ:-Asia/Shanghai}"
 
 if [[ "${RUN_ON_HOST:-0}" == "1" ]]; then
   export DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-http://127.0.0.1:8080}"
@@ -89,6 +91,7 @@ GMS="${DATAHUB_GMS_URL:-http://datahub-gms:8080}"
 dh_docker cp "$HOST_RECIPE" "$CTR:$TMP_RECIPE"
 
 dh_docker exec \
+  -e TZ="$TZ" \
   -e PYTHONUNBUFFERED=1 \
   -e DATAHUB_TELEMETRY_ENABLED=false \
   -e HMS_THRIFT_HOST="$HMS_THRIFT_HOST" \
