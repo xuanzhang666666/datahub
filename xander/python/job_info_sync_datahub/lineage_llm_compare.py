@@ -96,19 +96,25 @@ def _deepseek_config() -> Tuple[str, str, str]:
 SYSTEM_PROMPT = """你是数据平台工程师，擅长阅读 Hive/Spark SQL、shell 与 Python 中的 SQL 片段。
 你必须只输出一个 JSON 对象（不要 markdown），schema 如下：
 {
-  "target_tables": [ {"db": "库名，省略时用 default", "table": "表名"} ],
-  "upstream_tables": [ {"db": "...", "table": "..."} ],
+  "lineage": [
+    {
+      "target": {"db": "库名，省略时用 default", "table": "表名"},
+      "upstreams": [ {"db": "...", "table": "..."} ]
+    }
+  ],
   "notes": "简短说明不确定处、动态表名、仅 shell 无 SQL 等"
 }
 规则：
-- target_tables：INSERT INTO/OVERWRITE、CREATE TABLE AS、CTAS 的写入目标物理表。
-- upstream_tables：FROM/JOIN/子查询中读取的物理表；排除 WITH 中 CTE 别名；排除明显临时变量占位。
-- 表名全部小写输出 db/table 字段内容。"""
+- lineage 数组：每个元素对应一条写入语句（INSERT INTO/OVERWRITE、CREATE TABLE AS 等）及其读取的上游表。
+- target：该写入语句的物理目标表，db 省略时用 default，全部小写。
+- upstreams：该目标表对应 SQL 中 FROM/JOIN/子查询读取的物理表；排除 WITH/CTE 别名；排除明显临时变量占位；全部小写。
+- 若脚本写入多个目标表，每个目标表单独列一条 lineage 条目，各自只列与该 SQL 语句相关的上游表。
+- 若同一目标表被多条 SQL 写入，合并为一条，upstreams 取并集。"""
 
 
 def _build_user_message(etl_script: str, max_chars: int = 120_000) -> str:
     body = etl_script if len(etl_script) <= max_chars else etl_script[:max_chars] + "\n... [truncated]"
-    return "以下为 ETL 脚本全文，请提取 target_tables 与 upstream_tables：\n\n" + body
+    return "以下为 ETL 脚本全文，请按 lineage 数组格式提取每个目标表及其对应的上游表：\n\n" + body
 
 
 def _openai_chat_json(

@@ -287,21 +287,83 @@ def evaluate_lineage_write_vote(
     return new_tls, decision, llm_dict
 
 
+def _parse_lineage_array(raw: Dict[str, Any]) -> List[TableLineage]:
+    """解析 LLM 返回的 lineage 数组格式，每个目标表使用自己对应的上游表集合。
+
+    支持新格式（lineage 数组）和旧格式（target_tables + upstream_tables 扁平列表）兜底。
+    """
+    def _norm_name(row: Any) -> Optional[str]:
+        if not isinstance(row, dict):
+            return None
+        db = str(row.get("db") or "default").strip().lower() or "default"
+        tbl = str(row.get("table") or "").strip().lower()
+        return f"{db}.{tbl}" if tbl else None
+
+    lineage_items = raw.get("lineage")
+    if isinstance(lineage_items, list) and lineage_items:
+        result: List[TableLineage] = []
+        seen_targets: Dict[str, TableLineage] = {}
+        for item in lineage_items:
+            if not isinstance(item, dict):
+                continue
+            tgt_name = _norm_name(item.get("target"))
+            if not tgt_name:
+                continue
+            up_names: Set[str] = set()
+            for row in (item.get("upstreams") or []):
+                u = _norm_name(row)
+                if u:
+                    up_names.add(u)
+            tgt_refs = full_names_to_refs({tgt_name})
+            if not tgt_refs:
+                continue
+            tgt_ref = tgt_refs[0]
+            if tgt_name in seen_targets:
+                # 同一目标表出现多次，合并上游
+                existing = seen_targets[tgt_name]
+                existing_up_names = {u.full_name for u in existing.upstreams}
+                merged = existing_up_names | up_names
+                existing.upstreams = full_names_to_refs(merged)
+            else:
+                tl = TableLineage(
+                    target=tgt_ref,
+                    upstreams=full_names_to_refs(up_names),
+                    source_block_indices=[],
+                )
+                seen_targets[tgt_name] = tl
+                result.append(tl)
+        return result
+
+    # 旧格式兜底：所有目标表共享全量上游（结构无法区分时退化）
+    dt, du = _tables_from_llm_payload(raw)
+    dt, du = _norm(dt), _norm(du)
+    if not dt:
+        return []
+    up_refs = full_names_to_refs(du)
+    return [
+        TableLineage(target=ref, upstreams=up_refs, source_block_indices=[])
+        for ref in full_names_to_refs(dt)
+    ]
+
+
 def evaluate_llm_only(
     etl_script: str,
     timeout_sec: int = 90,
 ) -> Tuple[List[TableLineage], LineageWriteDecision, Dict[str, Any]]:
     """仅用 LLM 提取表级血缘（不依赖 sqlglot）。
 
-    返回 (table_lineages, decision, raw_payload)，签名与 evaluate_lineage_write_vote 兼容。
+    LLM 返回 per-target lineage 数组，每个目标表有独立的上游表列表。
+    返回 (table_lineages, decision, raw_payload)。
     """
     from .lineage_llm_compare import call_llm_extract
 
     raw = call_llm_extract(etl_script, timeout_sec=timeout_sec)
-    dt, du = _tables_from_llm_payload(raw)
-    dt, du = _norm(dt), _norm(du)
+    table_lineages = _parse_lineage_array(raw)
 
-    if not dt:
+    if not table_lineages:
+        # 汇总用于 decision 字段
+        _, du = _tables_from_llm_payload(raw)
+        du = _norm(du)
         decision = LineageWriteDecision(
             write_upstream_lineage=False,
             status="SKIP_NO_TABLES",
@@ -309,26 +371,22 @@ def evaluate_llm_only(
             trust_score=0,
             selected_targets=set(),
             selected_upstreams=du,
-            deepseek_targets=dt,
+            deepseek_targets=set(),
             deepseek_upstreams=du,
         )
         return [], decision, raw
 
-    up_refs = full_names_to_refs(du)
-    tgt_refs = full_names_to_refs(dt)
-    table_lineages = [
-        TableLineage(target=ref, upstreams=up_refs, source_block_indices=[])
-        for ref in tgt_refs
-    ]
+    all_targets = {tl.target.full_name for tl in table_lineages}
+    all_upstreams = {u.full_name for tl in table_lineages for u in tl.upstreams}
     decision = LineageWriteDecision(
         write_upstream_lineage=True,
         status="LLM_EXTRACTED",
-        reason=f"LLM 提取到 {len(dt)} 个目标表",
+        reason=f"LLM 提取到 {len(table_lineages)} 个目标表",
         trust_score=90,
-        selected_targets=dt,
-        selected_upstreams=du,
-        deepseek_targets=dt,
-        deepseek_upstreams=du,
+        selected_targets=all_targets,
+        selected_upstreams=all_upstreams,
+        deepseek_targets=all_targets,
+        deepseek_upstreams=all_upstreams,
     )
     return table_lineages, decision, raw
 
