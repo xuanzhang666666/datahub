@@ -4,7 +4,7 @@
 #
 # Databases (exact list):
 #   default,
-#   data_build, data_ic, data_logistics, data_md, data_promotion, data_shop,
+#   data_build, data_finance, data_ic, data_logistics, data_md, data_promotion, data_shop,
 #   data_smartorder, data_smartorder_dev, data_supplychain, data_support,
 #   data_takeaway, data_tech, data_userinsight, data_userresearch
 #
@@ -33,11 +33,15 @@ source:
     database_pattern:
       allow:
         - "^default$"
-        - "^data_(build|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch)$"
+        - "^data_(build|finance|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch)$"
     table_pattern:
       allow:
         - "^default\\..*$"
-        - "^data_(build|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch)\\..*$"
+        - "^data_(build|finance|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch)\\..*$"
+      deny:
+        - "^data_finance\\.tmp_.*$"
+        - "^data_finance\\.bak_tmp.*$"
+        - "^data_finance\\.not_verified_tmp.*$"
 
 sink:
   type: datahub-rest

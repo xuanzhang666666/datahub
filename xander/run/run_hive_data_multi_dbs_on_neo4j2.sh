@@ -6,7 +6,9 @@
 #   cp xander/run/run_hive_data_multi_dbs_on_neo4j2.sh ./run_hive_data_multi_dbs_on_neo4j2.sh
 #   put2 hive_metastore_data_multi_dbs.yml
 #   put2 run_hive_data_multi_dbs_on_neo4j2.sh
-# On neo4j2 after get2: mv both → /data/datahub/scripts/ && chmod +x run_hive_data_multi_dbs_on_neo4j2.sh
+# On neo4j2 after get2:
+#   mv hive_metastore_data_multi_dbs.yml /data/datahub/recipes/
+#   mv run_hive_data_multi_dbs_on_neo4j2.sh /data/datahub/scripts/ && chmod +x /data/datahub/scripts/run_hive_data_multi_dbs_on_neo4j2.sh
 #
 # Bastion note: arbitrary script paths may be denied; use docker cp + docker exec like
 #   xander/run/run_hive_data_drink_on_neo4j2.sh flow, or ask for whitelist on this script path.
@@ -22,8 +24,9 @@
 #   TZ — default Asia/Shanghai for Python logs inside docker exec / RUN_ON_HOST.
 set -euo pipefail
 SCRIPT_DIR=/data/datahub/scripts
+RECIPE_DIR=/data/datahub/recipes
 RECIPE_NAME=hive_metastore_data_multi_dbs.yml
-HOST_RECIPE="$SCRIPT_DIR/$RECIPE_NAME"
+HOST_RECIPE="$RECIPE_DIR/$RECIPE_NAME"
 TMP_RECIPE="/tmp/$RECIPE_NAME"
 
 export HMS_THRIFT_HOST="${HMS_THRIFT_HOST:-hiveserver5.dp.data.bj1.wormpex.com}"
