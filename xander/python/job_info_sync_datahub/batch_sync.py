@@ -186,6 +186,7 @@ def sync_one(
             table_lineages, lineage_decision, _llm_raw = evaluate_llm_only(
                 etl_content,
                 timeout_sec=llm_timeout_sec,
+                job_file_name=jfn,
             )
             skip_upstream_lineage = not lineage_decision.write_upstream_lineage
             skip_upstream_lineage_reason = lineage_decision.reason

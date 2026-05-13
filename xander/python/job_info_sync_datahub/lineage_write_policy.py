@@ -349,6 +349,7 @@ def _parse_lineage_array(raw: Dict[str, Any]) -> List[TableLineage]:
 def evaluate_llm_only(
     etl_script: str,
     timeout_sec: int = 90,
+    job_file_name: str = "",
 ) -> Tuple[List[TableLineage], LineageWriteDecision, Dict[str, Any]]:
     """仅用 LLM 提取表级血缘（不依赖 sqlglot）。
 
@@ -357,7 +358,7 @@ def evaluate_llm_only(
     """
     from .lineage_llm_compare import call_llm_extract
 
-    raw = call_llm_extract(etl_script, timeout_sec=timeout_sec)
+    raw = call_llm_extract(etl_script, timeout_sec=timeout_sec, job_file_name=job_file_name)
     table_lineages = _parse_lineage_array(raw)
 
     if not table_lineages:

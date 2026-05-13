@@ -263,6 +263,7 @@ def run(
         table_lineages, lineage_decision, llm_raw = evaluate_llm_only(
             etl_content,
             timeout_sec=llm_timeout_sec,
+            job_file_name=jfn,
         )
         ctx.table_lineages = table_lineages
         ctx.field_lineages = field_lineages

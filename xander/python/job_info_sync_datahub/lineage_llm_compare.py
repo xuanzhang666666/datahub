@@ -109,11 +109,24 @@ SYSTEM_PROMPT = """你是数据平台工程师，擅长阅读 Hive/Spark SQL、s
 - target：该写入语句的物理目标表，db 省略时用 default，全部小写。
 - upstreams：该目标表对应 SQL 中 FROM/JOIN/子查询读取的物理表；排除 WITH/CTE 别名；排除明显临时变量占位；全部小写。
 - 若脚本写入多个目标表，每个目标表单独列一条 lineage 条目，各自只列与该 SQL 语句相关的上游表。
-- 若同一目标表被多条 SQL 写入，合并为一条，upstreams 取并集。"""
+- 若同一目标表被多条 SQL 写入，合并为一条，upstreams 取并集。
+- 脚本可能已按 '-- SQL 段 N --' 标注分段，每段对应一条写入语句，请按段分别提取各自的 target 和 upstreams。"""
 
 
-def _build_user_message(etl_script: str, max_chars: int = 120_000) -> str:
-    body = etl_script if len(etl_script) <= max_chars else etl_script[:max_chars] + "\n... [truncated]"
+def _build_user_message(etl_script: str, max_chars: int = 120_000, job_file_name: str = "") -> str:
+    if job_file_name.endswith(".job"):
+        segments = [s.strip() for s in etl_script.split(";") if s.strip()]
+        if len(segments) > 30:
+            segments = segments[:30]
+        if segments:
+            parts = [f"-- SQL 段 {i + 1} --\n{seg}" for i, seg in enumerate(segments)]
+            body = "\n\n".join(parts)
+        else:
+            body = etl_script
+    else:
+        body = etl_script
+    if len(body) > max_chars:
+        body = body[:max_chars] + "\n... [truncated]"
     return "以下为 ETL 脚本全文，请按 lineage 数组格式提取每个目标表及其对应的上游表：\n\n" + body
 
 
@@ -219,10 +232,10 @@ def tables_from_llm_payload(payload: Dict[str, Any]) -> Tuple[Set[str], Set[str]
     return _impl(payload)
 
 
-def call_llm_extract(etl_script: str, timeout_sec: int = 90) -> Dict[str, Any]:
+def call_llm_extract(etl_script: str, timeout_sec: int = 90, job_file_name: str = "") -> Dict[str, Any]:
     """调用 DeepSeek 提取目标/上游表，返回 LLM 原始 JSON payload。失败时抛出异常。"""
     db, dk, dm = _deepseek_config()
-    user_msg = _build_user_message(etl_script)
+    user_msg = _build_user_message(etl_script, job_file_name=job_file_name)
     return _openai_chat_json_with_fallback(db, dk, dm, user_msg, timeout_sec)
 
 
