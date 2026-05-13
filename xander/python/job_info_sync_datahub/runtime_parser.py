@@ -33,10 +33,21 @@ GITLAB_NAME_TO_PROJECT_PATH: Dict[str, str] = {
     "data_support": "data/data_support",
     "supplychain-jobs": "bach/supplychain-jobs",
     "data_analysis_etc_jobs": "data/analysis-etc-jobs",
+    "analysis-jobs-test": "data/analysis-jobs-test",
+    "other_campus_internal_control": "data/other-campus-internal-control",
 }
 
 # 匹配 --key=value 或 --key value 形式的运行参数
 _PARAM_RE = re.compile(r"--([A-Za-z0-9_\-]+)(?:=(\S+))?")
+
+# runner 脚本名 → 对应的 GitLab 中 jobs 目录前缀
+_RUNNER_JOB_DIR: Dict[str, str] = {
+    "w-run-task.sh": "jobs",
+    "bike-run-task.sh": "bike-jobs",
+    "yummy-run-task.sh": "yummy-jobs",
+}
+
+_RUNNER_RE = re.compile(r"/bin/((?:w|bike|yummy)-run-task\.sh)")
 
 
 def _real_shell_lines(shell: str) -> List[str]:
@@ -49,80 +60,77 @@ def _real_shell_lines(shell: str) -> List[str]:
     return out
 
 
-def _shell_lines_for_parse(shell: str) -> List[str]:
-    """返回可执行行；若无非注释 w-run-task.sh 行，则兼容 shebang 式注释行（去掉 #）。
-
-    区分两种情况：
-    - w-run-task.sh 在非注释行：真正通过 w-run-task.sh 执行，去 GitLab 拉文件。
-    - w-run-task.sh 只在注释行（如 #/home/.../w-run-task.sh）：注释引用，ETL 内联在 shell_command。
-    """
-    # 优先收集非注释行
-    real_lines: List[str] = []
-    comment_w_lines: List[str] = []  # shebang 式注释中含 w-run-task.sh 的行
-
-    for line in shell.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("#") and "w-run-task.sh" in s:
-            comment_w_lines.append(s.lstrip("#").strip())
-            continue
-        if s.startswith("#"):
-            continue
-        real_lines.append(s)
-
-    return real_lines
-
-
 def has_real_w_run_task(shell: str) -> bool:
-    """判断 shell_command 中是否有非注释的 w-run-task.sh 调用（需要去 GitLab 拉文件）。"""
+    """判断 shell_command 中是否有非注释的 runner 调用（需要去 GitLab 拉文件）。
+
+    支持 w-run-task.sh、bike-run-task.sh、yummy-run-task.sh。
+    """
     for line in shell.splitlines():
         s = line.strip()
-        if s and not s.startswith("#") and "w-run-task.sh" in s:
+        if s and not s.startswith("#") and _RUNNER_RE.search(s):
             return True
     return False
 
 
-def _get_w_run_task_line(shell: str) -> Optional[str]:
-    """返回最后一条 w-run-task.sh 行，优先非注释行，次选 shebang 式注释行。"""
-    real = [ln for ln in _real_shell_lines(shell) if "w-run-task.sh" in ln]
+def get_job_dir_name(shell: str) -> str:
+    """从 shell_command 中提取 runner 对应的 GitLab jobs 目录前缀（jobs / bike-jobs / yummy-jobs）。"""
+    line = _get_runner_line(shell)
+    if not line:
+        return "jobs"
+    m = _RUNNER_RE.search(line)
+    if not m:
+        return "jobs"
+    script_name = m.group(1)
+    return _RUNNER_JOB_DIR.get(script_name, "jobs")
+
+
+def _get_runner_line(shell: str) -> Optional[str]:
+    """返回最后一条 runner 行，优先非注释行，次选 shebang 式注释行。"""
+    real = [ln for ln in _real_shell_lines(shell) if _RUNNER_RE.search(ln)]
     if real:
         return real[-1].strip()
-    # 降级：shebang 式注释行（仅用于提取 gitlab_name / job_path，不代表真正调用）
+    # 降级：shebang 式注释行（#/home/.../w-run-task.sh）
     for line in shell.splitlines():
         s = line.strip()
-        if s.startswith("#") and "w-run-task.sh" in s:
+        if s.startswith("#") and _RUNNER_RE.search(s):
             return s.lstrip("#").strip()
     return None
 
 
-def _last_w_run_task_line(shell: str) -> str:
-    line = _get_w_run_task_line(shell)
+def _last_runner_line(shell: str) -> str:
+    line = _get_runner_line(shell)
     if not line:
         raise RuntimeError("shell_command 中未找到 w-run-task.sh 行")
     return line
 
 
 def extract_gitlab_name(shell: str) -> str:
-    """从 …/<gitlab_name>/bin/w-run-task.sh 提取 gitlab_name。"""
-    line = _last_w_run_task_line(shell)
-    idx = line.find("/bin/w-run-task.sh")
-    if idx < 0:
-        raise RuntimeError("shell_command 中无 /bin/w-run-task.sh，无法确定 gitlab_name")
+    """从 …/<gitlab_name>/bin/<runner>.sh 提取 gitlab_name。"""
+    line = _last_runner_line(shell)
+    m = _RUNNER_RE.search(line)
+    if not m:
+        raise RuntimeError("shell_command 中无 /bin/*-run-task.sh，无法确定 gitlab_name")
+    idx = m.start()
     prefix = line[:idx].rstrip()
     seg = prefix.split("/")[-1]
     if not seg:
-        raise RuntimeError("/bin/w-run-task.sh 前的路径段为空，无法确定 gitlab_name")
+        raise RuntimeError("/bin/*-run-task.sh 前的路径段为空，无法确定 gitlab_name")
     return seg
 
 
 def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
     """返回 (job_path, kind)，kind 为 'job' 或 'python'。"""
-    line = _last_w_run_task_line(shell)
-    m = re.search(r"/bin/w-run-task\.sh\s+(.*)$", line)
+    line = _last_runner_line(shell)
+    # 去掉 `|| echo "..."` 等尾部降级处理
+    line = re.split(r"\s*\|\|", line)[0].strip()
+
+    m = _RUNNER_RE.search(line)
     if not m:
+        raise RuntimeError("无法从 shell_command 解析 runner 后的参数")
+    tail = line[m.end():].strip()
+
+    if not tail:
         raise RuntimeError("无法从 shell_command 解析 w-run-task.sh 后的参数")
-    tail = m.group(1).strip()
 
     env_markers = (" prod", " before", " after")
 
@@ -141,9 +149,17 @@ def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
         return rest[:cut].strip(), "python"
 
     rest = tail
+    # 截断反引号命令（如 `date -d "-0 day"`）及 $(...) 展开
+    backtick_pos = rest.find("`")
+    dollar_pos = rest.find("$(")
+    for pos in (backtick_pos, dollar_pos):
+        if pos > 0:
+            rest = rest[:pos]
+    rest = rest.strip()
+
     cut = len(rest)
     for tok in rest.split():
-        if tok in ("prod", "before", "after") or tok.isdigit() or tok.startswith("--"):
+        if tok in ("prod", "before", "after") or tok.isdigit() or tok.startswith("--") or re.match(r"^date\b", tok):
             p = rest.find(tok)
             if 0 <= p < cut:
                 cut = p
@@ -152,7 +168,7 @@ def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
 
 def extract_runtime_params(shell: str) -> Dict[str, str]:
     """从 shell_command 中提取 --key=value / --key value 形式的运行参数。"""
-    line = _last_w_run_task_line(shell)
+    line = _last_runner_line(shell)
     params: Dict[str, str] = {}
     for m in _PARAM_RE.finditer(line):
         key = m.group(1)
@@ -185,8 +201,12 @@ def parse_runtime_context(
 
     etl_content 和 gitlab_file_path 由 gitlab_client 获取后传入。
     """
-    gitlab_name = extract_gitlab_name(shell_command)
-    project_path = resolve_project_path(gitlab_name)
+    try:
+        gitlab_name = extract_gitlab_name(shell_command)
+        project_path = resolve_project_path(gitlab_name)
+    except RuntimeError:
+        gitlab_name = ""
+        project_path = ""
     job_path, kind = extract_job_path_and_type(shell_command)
     jfn = job_file_name(job_path, kind)
     runtime_params = extract_runtime_params(shell_command)
@@ -213,17 +233,21 @@ def parse_runtime_context(
     )
 
 
-def candidate_gitlab_paths(job_path: str, jfn: str) -> List[str]:
-    """生成 GitLab 文件路径候选列表，按优先顺序排列。"""
+def candidate_gitlab_paths(job_path: str, jfn: str, job_dir: str = "jobs") -> List[str]:
+    """生成 GitLab 文件路径候选列表，按优先顺序排列。
+
+    job_dir: 仓库内的作业目录前缀（jobs / bike-jobs / yummy-jobs）。
+    """
     first_seg = job_path.split("/")[0]
     jp = job_path.strip().strip("/")
     return list(
         dict.fromkeys(
             [
-                f"jobs/{first_seg}/{jfn}",
-                f"jobs/{jp}.job",
-                f"jobs/{jp}.py",
-                f"jobs/{jp}/{jfn}",
+                f"{job_dir}/{first_seg}/{jfn}",
+                f"{job_dir}/{jp}.job",
+                f"{job_dir}/{jp}.py",
+                f"{job_dir}/{jp}.yml",
+                f"{job_dir}/{jp}/{jfn}",
             ]
         )
     )

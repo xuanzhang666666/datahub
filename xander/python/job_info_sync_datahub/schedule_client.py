@@ -41,6 +41,64 @@ def _trino_conn() -> "trino.dbapi.Connection":
     )
 
 
+def fetch_all_job_metadata(prefix: str = "pdw") -> List[JobMetadata]:
+    """一次性查询指定前缀的所有作业元数据，返回 JobMetadata 列表（批量模式）。"""
+    safe = prefix.replace("'", "''")
+    sql = f"""
+SELECT
+    job_display_name,
+    job_name,
+    try(from_utf8(from_base64(shell_commond))) AS shell_command,
+    upstream_jobs,
+    dt
+FROM {_DMP_TABLE}
+WHERE dt = (SELECT max(dt) FROM {_DMP_TABLE})
+  AND job_display_name LIKE '{safe}%'
+ORDER BY job_display_name
+""".strip()
+
+    logger.info("批量查询调度元数据: prefix=%s", prefix)
+    conn = _trino_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    results: List[JobMetadata] = []
+    for row in rows:
+        name = str(row[0]) if row[0] else ""
+        job_name = str(row[1]) if row[1] else ""
+        shell = str(row[2]) if row[2] else ""
+        upstream_raw = row[3]
+        dt = str(row[4]) if row[4] else ""
+
+        if not shell.strip():
+            continue  # 跳过 shell_command 为空的作业
+
+        upstream_jobs: List[str] = []
+        if upstream_raw and upstream_raw not in ("UNKNOWN_UPSTREAM_JOBS", "null", ""):
+            try:
+                parsed = json.loads(upstream_raw)
+                if isinstance(parsed, list):
+                    upstream_jobs = [str(j) for j in parsed if j]
+            except (json.JSONDecodeError, TypeError):
+                upstream_jobs = [j.strip() for j in str(upstream_raw).split(",") if j.strip()]
+
+        results.append(JobMetadata(
+            job_display_name=name,
+            job_name=job_name,
+            shell_command=shell,
+            upstream_jobs=upstream_jobs,
+            dt=dt,
+        ))
+
+    logger.info("批量查询完成: prefix=%s 有效作业=%d / %d", prefix, len(results), len(rows))
+    return results
+
+
 def fetch_job_metadata(job_display_name: str) -> JobMetadata:
     """从 DMP 调度表中查询指定作业的元数据，返回 JobMetadata。
 

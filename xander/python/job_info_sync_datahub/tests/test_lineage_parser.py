@@ -136,6 +136,33 @@ def test_build_lineage_summary_merge():
     assert "default.ods_b" in upstream_names
 
 
+# ---------------------------------------------------------------------------
+# CTE 过滤
+# ---------------------------------------------------------------------------
+
+
+def test_cte_not_in_upstreams():
+    """WITH CTE 名不应出现在上游表中。"""
+    sql = """
+    WITH base_data AS (
+        SELECT id, name FROM default.ods_source WHERE dt = '20260511'
+    ),
+    is_valid AS (
+        SELECT id FROM base_data WHERE name IS NOT NULL
+    )
+    INSERT OVERWRITE TABLE default.dwd_target
+    SELECT t1.id, t1.name FROM base_data t1 JOIN is_valid t2 ON t1.id = t2.id
+    """
+    block = parse_block_lineage(_make_block(sql))
+    assert block.status == ParseStatus.OK
+    upstream_names = [u.full_name for u in block.upstream_tables]
+    # CTE 名不应出现
+    assert "default.base_data" not in upstream_names
+    assert "default.is_valid" not in upstream_names
+    # 真实上游应存在
+    assert "default.ods_source" in upstream_names
+
+
 if __name__ == "__main__":
     test_insert_overwrite_target()
     test_insert_into_with_db()
@@ -147,4 +174,5 @@ if __name__ == "__main__":
     test_invalid_sql_marked_failed()
     test_select_only_skipped()
     test_build_lineage_summary_merge()
+    test_cte_not_in_upstreams()
     print("所有 lineage_parser 测试通过")

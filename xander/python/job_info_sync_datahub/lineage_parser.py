@@ -75,10 +75,24 @@ def _extract_target_tables(statement: exp.Expression) -> List[TableRef]:
     return targets
 
 
+def _collect_cte_names(statement: exp.Expression) -> Set[str]:
+    """收集 WITH 子句中定义的所有 CTE 名（小写），用于过滤伪上游引用。"""
+    cte_names: Set[str] = set()
+    with_node = statement.find(exp.With)
+    if with_node:
+        for cte in with_node.find_all(exp.CTE):
+            if cte.alias:
+                cte_names.add(cte.alias.lower())
+    return cte_names
+
+
 def _extract_upstream_tables(statement: exp.Expression) -> Set[TableRef]:
-    """从 AST 的 FROM / JOIN 节点提取所有上游表引用。"""
+    """从 AST 的 FROM / JOIN 节点提取所有上游表引用，自动排除 WITH CTE 定义。"""
+    cte_names = _collect_cte_names(statement)
     upstreams: Set[TableRef] = set()
     for tbl in statement.find_all(exp.Table):
+        if tbl.name.lower() in cte_names:
+            continue
         ref = _normalize_table_ref(tbl)
         if ref:
             upstreams.add(ref)
@@ -86,9 +100,12 @@ def _extract_upstream_tables(statement: exp.Expression) -> Set[TableRef]:
 
 
 def _table_alias_map(statement: exp.Expression) -> Dict[str, TableRef]:
-    """构建 alias → TableRef 的映射，用于字段溯源时解析表别名。"""
+    """构建 alias → TableRef 的映射，用于字段溯源时解析表别名。CTE 引用不入映射。"""
+    cte_names = _collect_cte_names(statement)
     alias_map: Dict[str, TableRef] = {}
     for tbl in statement.find_all(exp.Table):
+        if tbl.name.lower() in cte_names:
+            continue
         ref = _normalize_table_ref(tbl)
         if ref and tbl.alias:
             alias_map[tbl.alias.lower()] = ref
@@ -217,16 +234,39 @@ def parse_block_lineage(
     """
     _log = parent_logger or logger
 
+    def _try_parse(sql_text: str):
+        return sqlglot.parse(sql_text, dialect="hive", error_level=sqlglot.ErrorLevel.WARN)
+
+    def _strip_line_comments(sql_text: str) -> str:
+        """剥除 -- 注释行（含中文注释），避免 sqlglot tokenizing 失败。"""
+        cleaned = []
+        for line in sql_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("--"):
+                continue
+            # 截断行内 -- 注释（保留注释前内容）
+            idx = line.find(" --")
+            if idx >= 0:
+                line = line[:idx]
+            cleaned.append(line)
+        return "\n".join(cleaned)
+
     try:
-        statements = sqlglot.parse(block.raw_sql, dialect="hive", error_level=sqlglot.ErrorLevel.WARN)
+        statements = _try_parse(block.raw_sql)
     except Exception as exc:
-        block.status = ParseStatus.SQL_PARSE_FAILED
-        block.error_detail = str(exc)
-        log_phase_warning(
-            _log, SQL_PARSE_FAILED, job_display_name,
-            f"block #{block.index} sqlglot.parse 异常: {exc}"
-        )
-        return block
+        # 第一次失败时，剥掉 -- 注释行重试一次
+        try:
+            cleaned_sql = _strip_line_comments(block.raw_sql)
+            statements = _try_parse(cleaned_sql)
+            logger.debug("block #%d 剥除注释后重试解析成功", block.index)
+        except Exception as exc2:
+            block.status = ParseStatus.SQL_PARSE_FAILED
+            block.error_detail = str(exc2)
+            log_phase_warning(
+                _log, SQL_PARSE_FAILED, job_display_name,
+                f"block #{block.index} sqlglot.parse 异常: {exc2}"
+            )
+            return block
 
     if not statements:
         block.status = ParseStatus.SKIPPED

@@ -52,6 +52,7 @@ from .runtime_parser import (
     candidate_gitlab_paths,
     extract_gitlab_name,
     extract_job_path_and_type,
+    get_job_dir_name,
     has_real_w_run_task,
     job_file_name,
     parse_runtime_context,
@@ -200,7 +201,8 @@ def run(
         project_path = resolve_project_path(gitlab_name)
         job_path, kind = extract_job_path_and_type(metadata.shell_command)
         jfn = job_file_name(job_path, kind)
-        candidates = candidate_gitlab_paths(job_path, jfn)
+        job_dir = get_job_dir_name(metadata.shell_command)
+        candidates = candidate_gitlab_paths(job_path, jfn, job_dir)
 
         is_inline = not has_real_w_run_task(metadata.shell_command)
 

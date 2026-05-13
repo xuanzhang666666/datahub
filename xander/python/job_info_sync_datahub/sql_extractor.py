@@ -29,25 +29,26 @@ logger = get_logger("sql_extractor")
 # 正则模式
 # ---------------------------------------------------------------------------
 
-# VARNAME="value" 或 VARNAME='value'（单行大写赋值）
+# VARNAME="value" / VARNAME='value' / export VARNAME="value"（单行大写赋值，含 export 前缀）
 _SHELL_VAR_SINGLE_LINE_RE = re.compile(
-    r"""^\s*([A-Z][A-Z0-9_]*)\s*=\s*["']([^"'\n]*)["']\s*$""",
+    r"""^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*["']([^"'\n]*)["']\s*$""",
     re.MULTILINE,
 )
 
-# $HIVE <<EOF ... EOF  /  $HIVE -e <<EOF "..." EOF（兼容有无 -e，<<-EOF，尾部引号，缩进 EOF）
+# $HIVE / ${HIVE} / hive / ${hive} <<EOF ... EOF（含 -e，<<-EOF，尾部引号，缩进 EOF）
+_HIVE_CMD = r"\$(?:\{(?:HIVE|hive)\}|(?:HIVE|hive))"
 _HEREDOC_RE = re.compile(
-    r"""\$(?:HIVE|hive)\s+(?:-e\s+)?<<[-]?\s*(\w+)\s*"?\n(.*?)\n[ \t]*\1\b""",
+    r"""(?:{hive})\s+(?:-e\s+)?<<[-]?\s*(\w+)\s*"?\n(.*?)\n[ \t]*\1\b""".format(hive=_HIVE_CMD),
     re.DOTALL,
 )
 
-# $HIVE -e "..." / hive -e "..."（inline，含无 $ 前缀的 shell_command 内联格式）
+# $HIVE -e "..." / ${HIVE} -e "..." / hive -e "..."（inline，无 $ 前缀兼容 shell_command 内联）
 _INLINE_DOUBLE_RE = re.compile(
-    r'\$?(?:HIVE|hive)\s+-e\s+"((?:[^"\\]|\\.)*)"',
+    r'(?:{hive})\s+-e\s+"((?:[^"\\]|\\.)*)"'.format(hive=_HIVE_CMD),
     re.DOTALL,
 )
 _INLINE_SINGLE_RE = re.compile(
-    r"\$?(?:HIVE|hive)\s+-e\s+'((?:[^'\\]|\\.)*)'",
+    r"(?:{hive})\s+-e\s+'((?:[^'\\]|\\.)*)'".format(hive=_HIVE_CMD),
     re.DOTALL,
 )
 
