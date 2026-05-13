@@ -173,3 +173,4 @@ test-models/bin/
 
 # Git Worktree management (wtp)
 .wtp.yml
+*.gz
