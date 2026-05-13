@@ -3,6 +3,10 @@
 依赖：Python 标准库 urllib（无第三方依赖）
 环境变量：
   BLF_GITLAB_PRIVATE_TOKEN  私有仓库必填
+  BLF_GITLAB_SSL_VERIFY     未设置时：若 API 为 git.corp.bianlifeng.com 则默认不校验证书（Jenkins+Anaconda 常见缺链）。
+                            设为 1/true/on 强制校验；设为 0/false/off 显式关闭校验。
+  BLF_GITLAB_CA_BUNDLE      企业根 CA 的 PEM；强制校验时会读 BLF_GITLAB_CA_BUNDLE / SSL_CERT_FILE / REQUESTS_CA_BUNDLE，
+                            并回退尝试 CentOS 系统 bundle。
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,9 +26,61 @@ logger = get_logger("gitlab_client")
 
 GITLAB_API = "https://git.corp.bianlifeng.com/api/v4"
 
+_auto_insecure_logged = False
+
 
 def _get_token() -> Optional[str]:
     return os.getenv("BLF_GITLAB_PRIVATE_TOKEN")
+
+
+def _gitlab_ssl_context_strict() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ca = (
+        os.getenv("BLF_GITLAB_CA_BUNDLE")
+        or os.getenv("SSL_CERT_FILE")
+        or os.getenv("REQUESTS_CA_BUNDLE")
+    )
+    if ca and os.path.isfile(ca):
+        ctx.load_verify_locations(cafile=ca)
+        return ctx
+    for sys_ca in ("/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt"):
+        if os.path.isfile(sys_ca):
+            try:
+                ctx.load_verify_locations(cafile=sys_ca)
+            except ssl.SSLError:
+                continue
+            break
+    return ctx
+
+
+def _gitlab_ssl_context() -> ssl.SSLContext:
+    """GitLab HTTPS：未配置时对内网 git.corp 默认不校验，避免 Anaconda/Jenkins 缺 CA 导致全量失败。"""
+    global _auto_insecure_logged
+    raw = os.getenv("BLF_GITLAB_SSL_VERIFY")
+    if raw is not None:
+        v = raw.strip().lower()
+        if v in ("0", "false", "no", "off"):
+            logger.warning(
+                "BLF_GITLAB_SSL_VERIFY=%s：GitLab HTTPS 不校验证书",
+                raw.strip(),
+            )
+            return ssl._create_unverified_context()
+        if v in ("1", "true", "yes", "on"):
+            return _gitlab_ssl_context_strict()
+    if "corp.bianlifeng.com" in GITLAB_API:
+        if not _auto_insecure_logged:
+            logger.warning(
+                "GitLab: BLF_GITLAB_SSL_VERIFY 未设置，对内网 %s 默认不校验 HTTPS 证书；"
+                "需要校验请设置 BLF_GITLAB_SSL_VERIFY=1 并配置企业 CA（BLF_GITLAB_CA_BUNDLE 等）",
+                GITLAB_API,
+            )
+            _auto_insecure_logged = True
+        return ssl._create_unverified_context()
+    return _gitlab_ssl_context_strict()
+
+
+def _urlopen(req: urllib.request.Request, *, timeout: int):
+    return urllib.request.urlopen(req, timeout=timeout, context=_gitlab_ssl_context())
 
 
 def _build_request(url: str, token: Optional[str]) -> urllib.request.Request:
@@ -39,7 +96,7 @@ def get_project_id(project_path: str, token: Optional[str] = None) -> int:
     url = f"{GITLAB_API}/projects/{enc}"
     req = _build_request(url, token)
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403, 404):
@@ -67,7 +124,7 @@ def get_file_content(
         f"?ref={urllib.parse.quote(ref)}"
     )
     req = _build_request(url, token)
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with _urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     b64 = data.get("content")
     if not b64:
@@ -117,7 +174,7 @@ def search_blob_paths(
     )
     req = _build_request(url, token)
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError:
         return []
@@ -149,7 +206,7 @@ def download_etl_file(
     if token is None:
         token = _get_token()
 
-    logger.info(
+    logger.debug(
         "开始拉取 GitLab 文件: project=%s candidates=%s ref=%s",
         project_path,
         candidate_paths,

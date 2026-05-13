@@ -273,5 +273,5 @@ def extract_sql_blocks(
             i, len(cleaned), len(sql),
         )
 
-    logger.info("共提取 %d 个 SQL block，文件=%s", len(blocks), job_file_name)
+    logger.debug("共提取 %d 个 SQL block，文件=%s", len(blocks), job_file_name)
     return blocks

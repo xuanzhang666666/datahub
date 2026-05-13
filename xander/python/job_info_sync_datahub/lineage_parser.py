@@ -326,7 +326,7 @@ def parse_block_lineage(
     block.field_mappings = all_field_mappings
     block.confidence = overall_confidence
 
-    logger.info(
+    logger.debug(
         "block #%d 解析: targets=%s upstreams=%s fields=%d confidence=%s",
         block.index,
         [t.full_name for t in block.target_tables],
@@ -381,7 +381,7 @@ def build_lineage_summary(
     table_lineages = list(table_map.values())
     field_lineages = list(field_map.values())
 
-    logger.info(
+    logger.debug(
         "血缘汇总完成: table_lineages=%d field_lineages=%d",
         len(table_lineages),
         len(field_lineages),

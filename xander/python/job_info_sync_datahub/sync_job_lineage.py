@@ -181,6 +181,11 @@ def run(
     etl_file: Optional[str] = None,
     platform_instance: str = "blf-prod-hive",
     env: str = "PROD",
+    llm_compare: bool = False,
+    llm_timeout_sec: int = 240,
+    lineage_vote: bool = False,
+    discrepancy_log: Optional[str] = None,
+    audit_jsonl: Optional[str] = None,
 ) -> int:
     """主流程编排，返回 exit code（0=成功，非 0=失败）。"""
 
@@ -269,12 +274,124 @@ def run(
         len(field_lineages),
     )
 
-    if not table_lineages:
+    if not table_lineages and not lineage_vote:
         logger.warning(
             "ABNORMAL_JOB\tSQL_PARSE_FAILED\t%s\t未解析到任何目标表，请确认 ETL 脚本格式",
             job_display_name,
         )
         return 3
+
+    # ---- 3b 可选：双 LLM + 表级写入策略（会按需改写 table_lineages；审计落 JSONL）----
+    llm_dict: Optional[dict] = None
+    lineage_decision = None
+    if lineage_vote or llm_compare:
+        from .lineage_llm_compare import run_compare
+
+        logger.info(
+            "=== 可选：DeepSeek 与 sqlglot 表级对比%s ===",
+            " + 写入策略与审计" if lineage_vote else "",
+        )
+        try:
+            if lineage_vote:
+                from .lineage_write_policy import (
+                    append_lineage_audit_jsonl,
+                    default_audit_log_path,
+                    evaluate_lineage_write_vote,
+                )
+
+                table_lineages, lineage_decision, llm_dict = evaluate_lineage_write_vote(
+                    etl_content,
+                    jfn,
+                    metadata.dt or None,
+                    table_lineages,
+                    timeout_sec=llm_timeout_sec,
+                )
+                ctx.table_lineages = table_lineages
+                logger.info(
+                    "表级血缘策略: status=%s write_upstream=%s targets=%s upstreams=%s",
+                    lineage_decision.status,
+                    lineage_decision.write_upstream_lineage,
+                    sorted(lineage_decision.selected_targets),
+                    sorted(lineage_decision.selected_upstreams),
+                )
+                audit_path = (
+                    Path(audit_jsonl)
+                    if audit_jsonl
+                    else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(output_dir))
+                )
+                append_lineage_audit_jsonl(
+                    audit_path,
+                    job_display_name,
+                    lineage_decision,
+                    extra={"llm_verdict": llm_dict.get("verdict")},
+                )
+                logger.info("血缘审计已追加: %s", audit_path)
+                if output_dir:
+                    dout = Path(output_dir) / job_display_name / "lineage_write_decision.json"
+                    dout.parent.mkdir(parents=True, exist_ok=True)
+                    dout.write_text(
+                        json.dumps(lineage_decision.to_audit_dict(), ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    logger.info("策略产物: %s", dout)
+            elif llm_compare:
+                rep = run_compare(etl_content, jfn, metadata.dt or None, timeout_sec=llm_timeout_sec)
+                llm_dict = rep.to_dict()
+            if output_dir and llm_dict is not None:
+                lout = Path(output_dir) / job_display_name / "llm_compare.json"
+                lout.parent.mkdir(parents=True, exist_ok=True)
+                lout.write_text(json.dumps(llm_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+                logger.info("LLM 对比产物: %s", lout)
+            if llm_dict is not None:
+                logger.info(
+                    "LLM 对比 verdict=%s sqlglot_upstream=%s",
+                    llm_dict.get("verdict"),
+                    llm_dict.get("sqlglot_upstream"),
+                )
+        except Exception as exc:
+            logger.warning("LLM/策略失败（沿用 sqlglot 血缘）: %s", exc)
+            if lineage_vote:
+                try:
+                    from .lineage_write_policy import (
+                        LineageWriteDecision,
+                        append_lineage_audit_jsonl,
+                        default_audit_log_path,
+                    )
+                    st_set = {tl.target.full_name for tl in table_lineages}
+                    su_set = {u.full_name for tl in table_lineages for u in tl.upstreams}
+                    err_decision = LineageWriteDecision(
+                        write_upstream_lineage=True,
+                        status="LLM_POLICY_ERROR",
+                        reason=str(exc)[:500],
+                        selected_targets=st_set,
+                        selected_upstreams=su_set,
+                        sqlglot_targets=st_set,
+                        sqlglot_upstreams=su_set,
+                    )
+                    audit_path = (
+                        Path(audit_jsonl)
+                        if audit_jsonl
+                        else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(output_dir))
+                    )
+                    append_lineage_audit_jsonl(
+                        audit_path, job_display_name, err_decision,
+                        extra={"llm_error": str(exc)[:500]},
+                    )
+                except Exception:
+                    pass
+
+    if not table_lineages:
+        logger.warning(
+            "ABNORMAL_JOB\tSQL_PARSE_FAILED\t%s\t未解析到任何目标表（含 LLM 回填后仍为空）",
+            job_display_name,
+        )
+        return 3
+
+    skip_upstream_lineage = False
+    skip_upstream_lineage_reason = ""
+    if lineage_vote and lineage_decision is not None and not lineage_decision.write_upstream_lineage:
+        skip_upstream_lineage = True
+        skip_upstream_lineage_reason = lineage_decision.reason
 
     # ---- 4. 运行结构化属性 extractor ----
     logger.info("=== 阶段 4/5：运行结构化属性 extractors ===")
@@ -282,7 +399,7 @@ def run(
     ctx.structured_properties = props
     logger.info("结构化属性收集完成: %d 条", len(props))
 
-    # ---- 保存中间产物 ----
+    # ---- 保存中间产物（含投票后的 lineage）----
     if output_dir:
         _save_outputs(ctx, Path(output_dir))
 
@@ -301,6 +418,8 @@ def run(
         props=props,
         job_display_name=job_display_name,
         parent_logger=logger,
+        skip_upstream_lineage=skip_upstream_lineage,
+        skip_upstream_lineage_reason=skip_upstream_lineage_reason,
     )
 
     if ok:
@@ -370,6 +489,32 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别，默认 INFO",
     )
+    p.add_argument(
+        "--llm-compare",
+        action="store_true",
+        help="在血缘解析后调用 DeepSeek 与 sqlglot 对比，写入 llm_compare.json（需 .env 中 DEEPSEEK_API_KEY；建议配合 --output-dir）",
+    )
+    p.add_argument(
+        "--llm-timeout",
+        type=int,
+        default=90,
+        help="DeepSeek HTTP 超时秒数，默认 90",
+    )
+    p.add_argument(
+        "--lineage-vote",
+        action="store_true",
+        help="DeepSeek+sqlglot 表级策略：完全一致则写(trust=100)；单源则写(异常)；全无目标不写。审计见 --audit-jsonl",
+    )
+    p.add_argument(
+        "--discrepancy-log",
+        default=None,
+        help="血缘审计 JSONL（与 --audit-jsonl 并存时以后者为准）；可设 BLF_LINEAGE_DISCREPANCY_LOG",
+    )
+    p.add_argument(
+        "--audit-jsonl",
+        default=None,
+        help="血缘审计 JSONL 路径；默认可设 BLF_LINEAGE_AUDIT_JSONL 或 <output-dir>/lineage_audit.jsonl",
+    )
     return p.parse_args()
 
 
@@ -388,6 +533,11 @@ def main() -> int:
         etl_file=args.etl_file,
         platform_instance=args.platform_instance,
         env=args.env,
+        llm_compare=args.llm_compare,
+        llm_timeout_sec=args.llm_timeout,
+        lineage_vote=args.lineage_vote,
+        discrepancy_log=args.discrepancy_log,
+        audit_jsonl=args.audit_jsonl,
     )
 
 

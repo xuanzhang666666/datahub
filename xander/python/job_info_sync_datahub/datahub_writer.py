@@ -187,8 +187,10 @@ def emit_upstream_lineage(
     platform_instance: str = "blf-prod-hive",
     env: str = "PROD",
     token: Optional[str] = None,
+    *,
+    emit_field_lineage: bool = False,
 ) -> None:
-    """发送单个目标表的 upstreamLineage（含可确认的字段级血缘）。"""
+    """发送单个目标表的 upstreamLineage。默认仅表级（不写 fineGrainedLineages）。"""
     if not _SDK_AVAILABLE:
         raise RuntimeError(
             "datahub SDK 未安装，无法写入 upstreamLineage。"
@@ -207,11 +209,11 @@ def emit_upstream_lineage(
                 type=DatasetLineageTypeClass.TRANSFORMED,
             )
         )
-        # 字段级血缘：只写置信度为 HIGH 的映射
-        fg = _build_fine_grained(
-            downstream_urn, upstream_urn, field_lineages, table_lineage.target
-        )
-        fine_grained.extend(fg)
+        if emit_field_lineage:
+            fg = _build_fine_grained(
+                downstream_urn, upstream_urn, field_lineages, table_lineage.target
+            )
+            fine_grained.extend(fg)
 
     if not upstream_classes:
         logger.debug("目标表 %s 无上游，跳过 upstreamLineage", table_lineage.target.full_name)
@@ -284,9 +286,19 @@ class DatahubWriter:
         field_lineages: List[FieldLineage],
         job_display_name: str = "",
         parent_logger: Optional[logging.Logger] = None,
+        *,
+        skip: bool = False,
+        skip_reason: str = "",
+        emit_field_lineage: bool = False,
     ) -> bool:
-        """写入全部 upstreamLineage，返回是否全部成功。"""
+        """写入全部 upstreamLineage。skip=True 时不写表级血缘；emit_field_lineage 默认 False（仅表级）。"""
         _log = parent_logger or logger
+        if skip:
+            _log.warning(
+                "已跳过 upstreamLineage / 字段血缘写入 DataHub（不确定）: %s",
+                skip_reason or "见 lineage 投票与待确认 JSONL",
+            )
+            return True
         if self.dry_run:
             for tl in table_lineages:
                 _log.info(
@@ -305,6 +317,7 @@ class DatahubWriter:
                     self.platform_instance,
                     self.env,
                     self.token,
+                    emit_field_lineage=emit_field_lineage,
                 )
             except Exception as exc:
                 log_phase_error(
@@ -323,8 +336,12 @@ class DatahubWriter:
         props: List[StructuredPropertyValue],
         job_display_name: str = "",
         parent_logger: Optional[logging.Logger] = None,
+        *,
+        skip_upstream_lineage: bool = False,
+        skip_upstream_lineage_reason: str = "",
+        emit_field_lineage: bool = False,
     ) -> bool:
-        """将结构化属性写入每个目标表，并写入 upstreamLineage。"""
+        """将结构化属性写入每个目标表；upstreamLineage 在不确定时可跳过；默认不写字段级血缘。"""
         _log = parent_logger or logger
         all_ok = True
 
@@ -335,7 +352,15 @@ class DatahubWriter:
             if not ok:
                 all_ok = False
 
-        ok = self.write_lineage(table_lineages, field_lineages, job_display_name, _log)
+        ok = self.write_lineage(
+            table_lineages,
+            field_lineages,
+            job_display_name,
+            _log,
+            skip=skip_upstream_lineage,
+            skip_reason=skip_upstream_lineage_reason,
+            emit_field_lineage=emit_field_lineage,
+        )
         if not ok:
             all_ok = False
 

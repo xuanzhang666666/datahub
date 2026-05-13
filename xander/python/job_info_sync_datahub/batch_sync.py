@@ -27,7 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -116,6 +116,11 @@ def sync_one(
     env: str,
     dry_run: bool,
     prefetched_metadata: Optional[object] = None,
+    lineage_vote: bool = False,
+    llm_timeout_sec: int = 90,
+    audit_jsonl: Optional[str] = None,
+    discrepancy_log: Optional[str] = None,
+    batch_output_dir: Optional[str] = None,
 ) -> Dict:
     """同步单个作业，返回结果 dict（不抛异常）。
 
@@ -130,6 +135,12 @@ def sync_one(
         "target_table": None,
         "upstream_count": 0,
         "field_count": 0,
+        "lineage_status": None,
+        "lineage_reason": None,
+        "write_upstream_lineage": None,
+        "lineage_targets_chosen": None,
+        "lineage_sources_chosen": None,
+        "trust_score": None,
     }
     t0 = time.time()
     try:
@@ -169,7 +180,7 @@ def sync_one(
 
         table_lineages, field_lineages = build_lineage_summary(blocks)
 
-        if not table_lineages:
+        if not table_lineages and not lineage_vote:
             failed_blocks = [b for b in blocks if b.status == ParseStatus.SQL_PARSE_FAILED]
             if failed_blocks:
                 err = failed_blocks[0].error_detail or "SQL_PARSE_FAILED"
@@ -180,6 +191,59 @@ def sync_one(
                 result["status"] = "SKIP"
                 result["fail_category"] = None
                 result["error"] = "未提取到 SQL block 或无目标表"
+            result["elapsed"] = round(time.time() - t0, 1)
+            return result
+
+        skip_upstream_lineage = False
+        skip_upstream_lineage_reason = ""
+        lineage_decision = None
+        if lineage_vote:
+            from .lineage_write_policy import (
+                append_lineage_audit_jsonl,
+                default_audit_log_path,
+                evaluate_lineage_write_vote,
+            )
+
+            try:
+                table_lineages, lineage_decision, _llm = evaluate_lineage_write_vote(
+                    etl_content,
+                    jfn,
+                    metadata.dt or None,
+                    table_lineages,
+                    timeout_sec=llm_timeout_sec,
+                )
+                skip_upstream_lineage = not lineage_decision.write_upstream_lineage
+                skip_upstream_lineage_reason = lineage_decision.reason
+                result["lineage_status"] = lineage_decision.status
+                result["lineage_reason"] = lineage_decision.reason
+                result["write_upstream_lineage"] = lineage_decision.write_upstream_lineage
+                result["lineage_targets_chosen"] = sorted(lineage_decision.selected_targets)
+                result["lineage_sources_chosen"] = sorted(lineage_decision.selected_upstreams)
+                result["trust_score"] = lineage_decision.trust_score
+                audit_path = (
+                    Path(audit_jsonl)
+                    if audit_jsonl
+                    else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(batch_output_dir))
+                )
+                # 把 DeepSeek 错误也写进 audit（方便 Excel 展示失败原因）
+                llm_errors: List[str] = _llm.get("errors") or []
+                extra: Dict = {}
+                ds_err = _llm.get("deepseek_error")
+                if ds_err:
+                    extra["deepseek_error"] = str(ds_err)[:500]
+                if llm_errors:
+                    extra["llm_errors"] = llm_errors
+                append_lineage_audit_jsonl(audit_path, job_display_name, lineage_decision, extra=extra or None)
+            except Exception as exc:
+                result["lineage_status"] = "LLM_POLICY_ERROR"
+                result["lineage_reason"] = str(exc)[:500]
+                result["write_upstream_lineage"] = True
+                logger.warning("批量作业 %s LLM 策略失败，沿用 sqlglot: %s", job_display_name, exc)
+
+        if not table_lineages:
+            result["status"] = "SKIP"
+            result["fail_category"] = None
+            result["error"] = "无目标表（含 LLM 回填后仍为空）"
             result["elapsed"] = round(time.time() - t0, 1)
             return result
 
@@ -202,6 +266,8 @@ def sync_one(
             field_lineages=field_lineages,
             props=props,
             job_display_name=job_display_name,
+            skip_upstream_lineage=skip_upstream_lineage,
+            skip_upstream_lineage_reason=skip_upstream_lineage_reason,
         )
         if not ok:
             result["status"] = "FAIL"
@@ -233,21 +299,28 @@ def run_batch(
     platform_instance: str = "blf-prod-hive",
     env: str = "PROD",
     dry_run: bool = False,
+    lineage_vote: bool = False,
+    llm_timeout_sec: int = 90,
+    audit_jsonl: Optional[str] = None,
+    discrepancy_log: Optional[str] = None,
 ) -> None:
     report_file = Path(report_path)
+    report_parent = str(report_file.parent)
     report_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # 如果报告文件已存在，跳过已处理的作业
-    done: set = set()
+    # 若报告已存在：仅跳过「最后一条记录」为 OK/SKIP 的作业；FAIL 会在下次继续跑（避免旧失败永远卡住）
+    job_last_status: Dict[str, str] = {}
     if report_file.exists():
         with open(report_file, encoding="utf-8") as f:
             for line in f:
                 try:
-                    done.add(json.loads(line)["job"])
+                    r = json.loads(line)
+                    job_last_status[r["job"]] = r["status"]
                 except Exception:
                     pass
+        done = {j for j, st in job_last_status.items() if st in ("OK", "SKIP")}
         if done:
-            logger.info("跳过已处理作业: %d 个", len(done))
+            logger.info("跳过已成功或业务 SKIP 的作业: %d 个（历史 FAIL 将重试）", len(done))
 
     todo = [j for j in jobs if j not in done]
     total = len(todo)
@@ -266,9 +339,20 @@ def run_batch(
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {
                 pool.submit(
-                    sync_one, job, gms_url, gms_token, gitlab_token,
-                    platform_instance, env, dry_run,
+                    sync_one,
+                    job,
+                    gms_url,
+                    gms_token,
+                    gitlab_token,
+                    platform_instance,
+                    env,
+                    dry_run,
                     meta_map.get(job) if meta_map else None,
+                    lineage_vote,
+                    llm_timeout_sec,
+                    audit_jsonl,
+                    discrepancy_log,
+                    report_parent,
                 ): job
                 for job in todo
             }
@@ -282,11 +366,44 @@ def run_batch(
                     fail_cats[res["fail_category"]] = fail_cats.get(res["fail_category"], 0) + 1
 
                 completed_count += 1
+                job = res.get("job", "?")
+                st = res.get("status", "?")
+                elapsed = res.get("elapsed", 0)
+                ls = res.get("lineage_status") or "-"
+                trust = res.get("trust_score")
+                trust_s = str(trust) if trust is not None else "-"
+                tgt = res.get("target_table") or "-"
+                upc = res.get("upstream_count", 0)
+                err = (res.get("error") or "")[:120]
+                extra = ""
+                if st == "FAIL" and err:
+                    extra = f" err={err!r}"
+                elif ls not in (None, "-", "") and ls != "LLM_POLICY_ERROR":
+                    extra = f" lineage={ls} trust={trust_s}"
+                elif ls == "LLM_POLICY_ERROR" and err:
+                    extra = f" lineage={ls} err={err!r}"
+                logger.info(
+                    "[PROGRESS] %d/%d job=%s status=%s elapsed=%ss target=%s upstreams=%d OK=%d SKIP=%d FAIL=%d%s",
+                    completed_count,
+                    total,
+                    job,
+                    st,
+                    elapsed,
+                    tgt,
+                    upc,
+                    counters["OK"],
+                    counters.get("SKIP", 0),
+                    counters["FAIL"],
+                    extra,
+                )
                 if completed_count % 50 == 0 or completed_count == total:
                     logger.info(
-                        "进度 %d/%d  OK=%d SKIP=%d FAIL=%d",
-                        completed_count, total,
-                        counters["OK"], counters.get("SKIP", 0), counters["FAIL"],
+                        "进度汇总 %d/%d  OK=%d SKIP=%d FAIL=%d",
+                        completed_count,
+                        total,
+                        counters["OK"],
+                        counters.get("SKIP", 0),
+                        counters["FAIL"],
                     )
 
     # 最终汇总
@@ -301,14 +418,16 @@ def run_batch(
 
 
 def print_summary(report_path: str) -> None:
-    """从报告文件打印汇总统计。"""
-    results = []
+    """从报告文件打印汇总统计。同一 job 多行时取最后一行状态（与跳过逻辑一致）。"""
+    job_last: Dict[str, Dict[str, Any]] = {}
     with open(report_path, encoding="utf-8") as f:
         for line in f:
             try:
-                results.append(json.loads(line))
+                r = json.loads(line)
+                job_last[r["job"]] = r
             except Exception:
                 pass
+    results = list(job_last.values())
 
     ok = [r for r in results if r["status"] == "OK"]
     skip = [r for r in results if r["status"] == "SKIP"]
@@ -346,12 +465,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--platform-instance", default="blf-prod-hive")
     p.add_argument("--env", default="PROD")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument(
+        "--lineage-vote",
+        action="store_true",
+        help="启用 DeepSeek+sqlglot 表级策略与审计（与 sync_job_lineage --lineage-vote 一致）",
+    )
+    p.add_argument("--llm-timeout", type=int, default=90, help="DeepSeek HTTP 超时秒数，默认 90")
+    p.add_argument("--audit-jsonl", default=None, help="血缘审计 JSONL；默认可设 BLF_LINEAGE_AUDIT_JSONL")
+    p.add_argument(
+        "--discrepancy-log",
+        default=None,
+        help="血缘审计 JSONL（与 --audit-jsonl 并存时以后者为准）；可设 BLF_LINEAGE_DISCREPANCY_LOG",
+    )
     return p.parse_args()
 
 
+def _load_lineage_env_early() -> None:
+    """若设置了 BLF_LINEAGE_ENV_FILE，在解析 CLI 之前加载（与 Jenkins / docker 脚本一致）。"""
+    raw = os.environ.get("BLF_LINEAGE_ENV_FILE", "").strip()
+    if not raw:
+        return
+    try:
+        from .lineage_llm_compare import load_env_file
+
+        load_env_file(Path(raw), override=False)
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _load_lineage_env_early()
     args = parse_args()
     setup_logging(level=args.log_level)
+    # 屏蔽 DataHub SDK 和 urllib3 的重试 WARNING（正常失败已在 datahub_writer 层用 ERROR 记录）
+    import logging as _logging
+    _logging.getLogger("urllib3.connectionpool").setLevel(_logging.ERROR)
+    _logging.getLogger("urllib3.util.retry").setLevel(_logging.ERROR)
 
     if args.summary:
         print_summary(args.summary)
@@ -399,6 +548,10 @@ def main() -> int:
         platform_instance=args.platform_instance,
         env=args.env,
         dry_run=args.dry_run,
+        lineage_vote=args.lineage_vote,
+        llm_timeout_sec=args.llm_timeout,
+        audit_jsonl=args.audit_jsonl,
+        discrepancy_log=args.discrepancy_log,
     )
 
     print_summary(args.report)
