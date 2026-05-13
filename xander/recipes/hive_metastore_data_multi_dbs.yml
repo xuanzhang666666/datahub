@@ -1,10 +1,11 @@
 # Hive Metastore (Thrift) — ingest all tables/views in default + selected data_* databases
 #
 # Broader unified recipe (incl. data_drink): xander/recipes/hive_metastore_blf_prod_core_dbs.yml
+# data_finance (separate recipe + temp-table filters): xander/recipes/hive_metastore_data_finance.yml
 #
 # Databases (exact list):
 #   default,
-#   data_build, data_finance, data_ic, data_logistics, data_md, data_promotion, data_shop,
+#   data_build, data_ic, data_logistics, data_md, data_promotion, data_shop,
 #   data_smartorder, data_smartorder_dev, data_supplychain, data_support,
 #   data_takeaway, data_tech, data_userinsight, data_userresearch
 #
@@ -33,15 +34,11 @@ source:
     database_pattern:
       allow:
         - "^default$"
-        - "^data_(build|finance|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch)$"
+        - "^data_(build|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch)$"
     table_pattern:
       allow:
         - "^default\\..*$"
-        - "^data_(build|finance|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch)\\..*$"
-      deny:
-        - "^data_finance\\.tmp_.*$"
-        - "^data_finance\\.bak_tmp.*$"
-        - "^data_finance\\.not_verified_tmp.*$"
+        - "^data_(build|ic|logistics|md|promotion|shop|smartorder|smartorder_dev|supplychain|support|takeaway|tech|userinsight|userresearch)\\..*$"
 
 sink:
   type: datahub-rest

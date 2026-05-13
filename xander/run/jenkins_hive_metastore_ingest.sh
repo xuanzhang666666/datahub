@@ -9,6 +9,9 @@
 #
 # Prerequisites on neo4j2 (once, via your usual FTP/bastion deploy):
 #   - /data/datahub/scripts/run_hive_data_multi_dbs_on_neo4j2.sh (+ recipe yml), chmod +x
+#   - data_finance only: deploy hive_metastore_data_finance.yml to /data/datahub/recipes/ and
+#     run_hive_data_finance_on_neo4j2.sh to /data/datahub/scripts/; use a second Jenkins job with
+#     JENKINS_HIVE_REMOTE_SCRIPT=/data/datahub/scripts/run_hive_data_finance_on_neo4j2.sh
 #   - Optional: copy this file to /data/datahub/scripts/jenkins_hive_metastore_ingest.sh so
 #     Jenkins can run it without checking out the Git repo.
 #

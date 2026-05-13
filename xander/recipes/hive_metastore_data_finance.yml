@@ -1,0 +1,45 @@
+# Hive Metastore (Thrift) — ingest data_finance only (excludes temp-style tables).
+#
+# Multi-db recipe (without data_finance): xander/recipes/hive_metastore_data_multi_dbs.yml
+#
+# Excluded table names (SQL-style filters → regex):
+#   tmp_%           → ^data_finance\.tmp_.*$
+#   bak_tmp%        → ^data_finance\.bak_tmp.*$
+#   not_verified_tmp% → ^data_finance\.not_verified_tmp.*$
+#
+# Dataset URN pattern:
+#   urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.data_finance.<table>,PROD)
+#
+# Prerequisites: pip install 'acryl-datahub[hive-metastore]'
+# Runtime: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
+# Runner (neo4j2): xander/run/run_hive_data_finance_on_neo4j2.sh
+#
+source:
+  type: hive-metastore
+  config:
+    connection_type: thrift
+    host_port: "${HMS_THRIFT_HOST}:${HMS_THRIFT_PORT}"
+    use_kerberos: false
+
+    env: PROD
+    platform_instance: blf-prod-hive
+    emit_storage_lineage: false
+    hive_storage_lineage_direction: upstream
+    include_column_lineage: true
+    include_view_lineage: true
+
+    database_pattern:
+      allow:
+        - "^data_finance$"
+    table_pattern:
+      allow:
+        - "^data_finance\\..*$"
+      deny:
+        - "^data_finance\\.tmp_.*$"
+        - "^data_finance\\.bak_tmp.*$"
+        - "^data_finance\\.not_verified_tmp.*$"
+
+sink:
+  type: datahub-rest
+  config:
+    server: "${DATAHUB_GMS_URL}"
