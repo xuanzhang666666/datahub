@@ -287,6 +287,52 @@ def evaluate_lineage_write_vote(
     return new_tls, decision, llm_dict
 
 
+def evaluate_llm_only(
+    etl_script: str,
+    timeout_sec: int = 90,
+) -> Tuple[List[TableLineage], LineageWriteDecision, Dict[str, Any]]:
+    """仅用 LLM 提取表级血缘（不依赖 sqlglot）。
+
+    返回 (table_lineages, decision, raw_payload)，签名与 evaluate_lineage_write_vote 兼容。
+    """
+    from .lineage_llm_compare import call_llm_extract
+
+    raw = call_llm_extract(etl_script, timeout_sec=timeout_sec)
+    dt, du = _tables_from_llm_payload(raw)
+    dt, du = _norm(dt), _norm(du)
+
+    if not dt:
+        decision = LineageWriteDecision(
+            write_upstream_lineage=False,
+            status="SKIP_NO_TABLES",
+            reason="LLM 未提取到目标表",
+            trust_score=0,
+            selected_targets=set(),
+            selected_upstreams=du,
+            deepseek_targets=dt,
+            deepseek_upstreams=du,
+        )
+        return [], decision, raw
+
+    up_refs = full_names_to_refs(du)
+    tgt_refs = full_names_to_refs(dt)
+    table_lineages = [
+        TableLineage(target=ref, upstreams=up_refs, source_block_indices=[])
+        for ref in tgt_refs
+    ]
+    decision = LineageWriteDecision(
+        write_upstream_lineage=True,
+        status="LLM_EXTRACTED",
+        reason=f"LLM 提取到 {len(dt)} 个目标表",
+        trust_score=90,
+        selected_targets=dt,
+        selected_upstreams=du,
+        deepseek_targets=dt,
+        deepseek_upstreams=du,
+    )
+    return table_lineages, decision, raw
+
+
 def append_lineage_audit_jsonl(
     path: Path,
     job: str,

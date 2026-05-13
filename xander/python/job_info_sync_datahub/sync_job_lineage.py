@@ -4,7 +4,7 @@
 根据传入的 job_display_name，自动完成：
   1. 查询 DMP 调度元数据（Trino）
   2. 解析 shell_command → 拉取 GitLab ETL 脚本
-  3. 提取 SQL blocks → sqlglot AST 解析目标表、上游表、字段级血缘
+  3. 调用 LLM（DeepSeek）提取目标表 / 上游表级血缘
   4. 运行所有结构化属性 extractor
   5. 写入 DataHub（structuredProperties + upstreamLineage）
 
@@ -18,7 +18,7 @@
   python3 sync_job_lineage.py --job pdw_opc_flag_contact
 
 必要依赖：
-  pip install trino sqlglot acryl-datahub
+  pip install trino acryl-datahub openpyxl
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ if __name__ == "__main__" and __package__ is None:
 
 from .datahub_writer import DatahubWriter, make_dataset_urn_from_ref
 from .gitlab_client import download_etl_file
-from .lineage_parser import build_lineage_summary, parse_block_lineage
 from .logging_utils import (
     GITLAB_FETCH_FAILED,
     RUNTIME_PARSE_FAILED,
@@ -47,7 +46,7 @@ from .logging_utils import (
     log_phase_error,
     setup_logging,
 )
-from .models import JobContext, ParseStatus
+from .models import JobContext
 from .runtime_parser import (
     candidate_gitlab_paths,
     extract_gitlab_name,
@@ -59,7 +58,6 @@ from .runtime_parser import (
     resolve_project_path,
 )
 from .schedule_client import fetch_job_metadata
-from .sql_extractor import extract_sql_blocks
 from .structured_properties import DEFAULT_EXTRACTORS, run_all_extractors
 
 logger = get_logger("main")
@@ -249,152 +247,79 @@ def run(
             log_phase_error(logger, RUNTIME_PARSE_FAILED, job_display_name, str(exc))
         return 3
 
-    # ---- 3. 提取 SQL blocks + AST 血缘解析 ----
-    logger.info("=== 阶段 3/5：提取 SQL blocks + sqlglot AST 血缘解析 ===")
-    blocks = extract_sql_blocks(etl_content, jfn, date_str=metadata.dt)
-    for block in blocks:
-        parse_block_lineage(block, job_display_name, logger)
-    ctx.sql_blocks = blocks
-
-    successful_blocks = [b for b in blocks if b.status not in (ParseStatus.SQL_PARSE_FAILED, ParseStatus.SKIPPED)]
-    if not successful_blocks:
-        logger.warning(
-            "ABNORMAL_JOB\tSQL_PARSE_FAILED\t%s\t所有 SQL block 解析失败或为空，无血缘数据",
-            job_display_name,
-        )
-        # 继续执行（至少写入结构化属性）
-
-    table_lineages, field_lineages = build_lineage_summary(blocks)
-    ctx.table_lineages = table_lineages
-    ctx.field_lineages = field_lineages
-    logger.info(
-        "血缘解析完成: target_tables=%d upstream_relations=%d field_mappings=%d",
-        len(table_lineages),
-        sum(len(tl.upstreams) for tl in table_lineages),
-        len(field_lineages),
+    # ---- 3. LLM 表级血缘提取 ----
+    logger.info("=== 阶段 3/5：LLM 表级血缘提取 ===")
+    from .lineage_write_policy import (
+        LineageWriteDecision,
+        append_lineage_audit_jsonl,
+        default_audit_log_path,
+        evaluate_llm_only,
     )
 
-    if not table_lineages and not lineage_vote:
-        logger.warning(
-            "ABNORMAL_JOB\tSQL_PARSE_FAILED\t%s\t未解析到任何目标表，请确认 ETL 脚本格式",
-            job_display_name,
+    table_lineages: list = []
+    field_lineages: list = []
+    lineage_decision: Optional[LineageWriteDecision] = None
+    try:
+        table_lineages, lineage_decision, llm_raw = evaluate_llm_only(
+            etl_content,
+            timeout_sec=llm_timeout_sec,
         )
-        return 3
-
-    # ---- 3b 可选：双 LLM + 表级写入策略（会按需改写 table_lineages；审计落 JSONL）----
-    llm_dict: Optional[dict] = None
-    lineage_decision = None
-    if lineage_vote or llm_compare:
-        from .lineage_llm_compare import run_compare
-
+        ctx.table_lineages = table_lineages
+        ctx.field_lineages = field_lineages
         logger.info(
-            "=== 可选：DeepSeek 与 sqlglot 表级对比%s ===",
-            " + 写入策略与审计" if lineage_vote else "",
+            "LLM 血缘提取完成: status=%s targets=%s upstreams=%s trust=%s",
+            lineage_decision.status,
+            sorted(lineage_decision.selected_targets),
+            sorted(lineage_decision.selected_upstreams),
+            lineage_decision.trust_score,
+        )
+        audit_path = (
+            Path(audit_jsonl)
+            if audit_jsonl
+            else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(output_dir))
+        )
+        append_lineage_audit_jsonl(audit_path, job_display_name, lineage_decision)
+        logger.info("血缘审计已追加: %s", audit_path)
+        if output_dir:
+            lout = Path(output_dir) / job_display_name / "llm_extract.json"
+            lout.parent.mkdir(parents=True, exist_ok=True)
+            lout.write_text(json.dumps(llm_raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("LLM 提取失败，跳过血缘写入: %s", exc)
+        lineage_decision = LineageWriteDecision(
+            write_upstream_lineage=False,
+            status="LLM_ERROR",
+            reason=str(exc)[:500],
+            trust_score=0,
         )
         try:
-            if lineage_vote:
-                from .lineage_write_policy import (
-                    append_lineage_audit_jsonl,
-                    default_audit_log_path,
-                    evaluate_lineage_write_vote,
-                )
-
-                table_lineages, lineage_decision, llm_dict = evaluate_lineage_write_vote(
-                    etl_content,
-                    jfn,
-                    metadata.dt or None,
-                    table_lineages,
-                    timeout_sec=llm_timeout_sec,
-                )
-                ctx.table_lineages = table_lineages
-                logger.info(
-                    "表级血缘策略: status=%s write_upstream=%s targets=%s upstreams=%s",
-                    lineage_decision.status,
-                    lineage_decision.write_upstream_lineage,
-                    sorted(lineage_decision.selected_targets),
-                    sorted(lineage_decision.selected_upstreams),
-                )
-                audit_path = (
-                    Path(audit_jsonl)
-                    if audit_jsonl
-                    else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(output_dir))
-                )
-                append_lineage_audit_jsonl(
-                    audit_path,
-                    job_display_name,
-                    lineage_decision,
-                    extra={"llm_verdict": llm_dict.get("verdict")},
-                )
-                logger.info("血缘审计已追加: %s", audit_path)
-                if output_dir:
-                    dout = Path(output_dir) / job_display_name / "lineage_write_decision.json"
-                    dout.parent.mkdir(parents=True, exist_ok=True)
-                    dout.write_text(
-                        json.dumps(lineage_decision.to_audit_dict(), ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                    logger.info("策略产物: %s", dout)
-            elif llm_compare:
-                rep = run_compare(etl_content, jfn, metadata.dt or None, timeout_sec=llm_timeout_sec)
-                llm_dict = rep.to_dict()
-            if output_dir and llm_dict is not None:
-                lout = Path(output_dir) / job_display_name / "llm_compare.json"
-                lout.parent.mkdir(parents=True, exist_ok=True)
-                lout.write_text(json.dumps(llm_dict, ensure_ascii=False, indent=2), encoding="utf-8")
-                logger.info("LLM 对比产物: %s", lout)
-            if llm_dict is not None:
-                logger.info(
-                    "LLM 对比 verdict=%s sqlglot_upstream=%s",
-                    llm_dict.get("verdict"),
-                    llm_dict.get("sqlglot_upstream"),
-                )
-        except Exception as exc:
-            logger.warning("LLM/策略失败（沿用 sqlglot 血缘）: %s", exc)
-            if lineage_vote:
-                try:
-                    from .lineage_write_policy import (
-                        LineageWriteDecision,
-                        append_lineage_audit_jsonl,
-                        default_audit_log_path,
-                    )
-                    st_set = {tl.target.full_name for tl in table_lineages}
-                    su_set = {u.full_name for tl in table_lineages for u in tl.upstreams}
-                    err_decision = LineageWriteDecision(
-                        write_upstream_lineage=True,
-                        status="LLM_POLICY_ERROR",
-                        reason=str(exc)[:500],
-                        selected_targets=st_set,
-                        selected_upstreams=su_set,
-                        sqlglot_targets=st_set,
-                        sqlglot_upstreams=su_set,
-                    )
-                    audit_path = (
-                        Path(audit_jsonl)
-                        if audit_jsonl
-                        else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(output_dir))
-                    )
-                    append_lineage_audit_jsonl(
-                        audit_path, job_display_name, err_decision,
-                        extra={"llm_error": str(exc)[:500]},
-                    )
-                except Exception:
-                    pass
+            audit_path = (
+                Path(audit_jsonl)
+                if audit_jsonl
+                else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(output_dir))
+            )
+            append_lineage_audit_jsonl(
+                audit_path, job_display_name, lineage_decision,
+                extra={"llm_error": str(exc)[:500]},
+            )
+        except Exception:
+            pass
 
     if not table_lineages:
         logger.warning(
-            "ABNORMAL_JOB\tSQL_PARSE_FAILED\t%s\t未解析到任何目标表（含 LLM 回填后仍为空）",
+            "ABNORMAL_JOB\tSKIP_NO_TABLES\t%s\tLLM 未提取到目标表",
             job_display_name,
         )
         return 3
 
     skip_upstream_lineage = False
     skip_upstream_lineage_reason = ""
-    if lineage_vote and lineage_decision is not None and not lineage_decision.write_upstream_lineage:
+    if lineage_decision is not None and not lineage_decision.write_upstream_lineage:
         skip_upstream_lineage = True
         skip_upstream_lineage_reason = lineage_decision.reason
 
     # ---- 4. 运行结构化属性 extractor ----
-    logger.info("=== 阶段 4/5：运行结构化属性 extractors ===")
+    logger.info("=== 阶段 4/5：结构化属性 extractors ===")
     props = run_all_extractors(ctx, DEFAULT_EXTRACTORS)
     ctx.structured_properties = props
     logger.info("结构化属性收集完成: %d 条", len(props))

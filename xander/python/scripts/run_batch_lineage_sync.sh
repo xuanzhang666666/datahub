@@ -8,7 +8,6 @@ set -euo pipefail
 PREFIX="${PREFIX:-}"
 CONCURRENCY="${CONCURRENCY:-10}"
 DRY_RUN="${DRY_RUN:-0}"
-LINEAGE_VOTE="${LINEAGE_VOTE:-1}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-90}"
 JOB_FILE="${JOB_FILE:-}"
 RETRY_FAILED="${RETRY_FAILED:-0}"
@@ -47,7 +46,7 @@ echo " PYTHON=$PYTHON"
 echo " PKG_DIR=$PKG_DIR  PYTHONPATH_ROOT=$PYTHONPATH_ROOT"
 echo " REPORT_DIR=$REPORT_DIR"
 echo " PREFIX=$PREFIX  CONCURRENCY=$CONCURRENCY  DRY_RUN=$DRY_RUN"
-echo " LINEAGE_VOTE=$LINEAGE_VOTE  LLM_TIMEOUT=$LLM_TIMEOUT"
+echo " LLM_TIMEOUT=$LLM_TIMEOUT"
 echo " Each finished job prints one line: [PROGRESS] ... (see Jenkins console)"
 echo "==================================================================="
 
@@ -63,7 +62,7 @@ for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WO
 done
 
 # ── 依赖自检（不在此自动 pip：避免误用系统 3.6 / 错误 index；由你在目标环境里装好）────────
-if ! "$PYTHON" -c "import trino, sqlglot, openpyxl; from datahub.emitter.rest_emitter import DatahubRestEmitter" 2>/dev/null; then
+if ! "$PYTHON" -c "import trino, openpyxl; from datahub.emitter.rest_emitter import DatahubRestEmitter" 2>/dev/null; then
   echo "ERROR: 依赖 import 失败（解释器: $PYTHON，用户: $(id -un)）。" >&2
   if [[ "$PYTHON" == /root/* ]] && [[ "$(id -u)" -ne 0 ]]; then
     echo "Jenkins 以非 root 运行时，通常不能读取 /root 下 Anaconda 的 site-packages，与是否已 pip install 无关。" >&2
@@ -74,7 +73,7 @@ if ! "$PYTHON" -c "import trino, sqlglot, openpyxl; from datahub.emitter.rest_em
     echo "  3) 若策略允许，本 Job 改为以 root 执行。" >&2
   else
     echo "请在该环境中执行：" >&2
-    echo "  $PYTHON -m pip install -U trino sqlglot openpyxl 'acryl-datahub>=0.12'" >&2
+    echo "  $PYTHON -m pip install -U trino openpyxl 'acryl-datahub>=0.12'" >&2
     echo "或设置 LINEAGE_PYTHON 指向已安装上述包的 Python。" >&2
   fi
   exit 1
@@ -112,8 +111,7 @@ ARGS="--report $_REPORT"
 ARGS="$ARGS --audit-jsonl $REPORT_DIR/lineage_audit.jsonl"
 ARGS="$ARGS --concurrency $CONCURRENCY"
 ARGS="$ARGS --llm-timeout $LLM_TIMEOUT"
-[[ "$DRY_RUN"      == "1" ]] && ARGS="$ARGS --dry-run"
-[[ "$LINEAGE_VOTE" == "1" ]] && ARGS="$ARGS --lineage-vote"
+[[ "$DRY_RUN" == "1" ]] && ARGS="$ARGS --dry-run"
 
 if [[ -n "$JOB_FILE" ]]; then
   ARGS="$ARGS --job-file $JOB_FILE"

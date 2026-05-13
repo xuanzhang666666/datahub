@@ -37,9 +37,8 @@ import trino
 
 from .datahub_writer import DatahubWriter, make_dataset_urn_from_ref
 from .gitlab_client import download_etl_file
-from .lineage_parser import build_lineage_summary, parse_block_lineage
 from .logging_utils import get_logger, setup_logging
-from .models import JobContext, ParseStatus
+from .models import JobContext
 from .runtime_parser import (
     candidate_gitlab_paths,
     extract_gitlab_name,
@@ -51,7 +50,6 @@ from .runtime_parser import (
     resolve_project_path,
 )
 from .schedule_client import fetch_all_job_metadata, fetch_job_metadata
-from .sql_extractor import extract_sql_blocks
 from .structured_properties import DEFAULT_EXTRACTORS, run_all_extractors
 
 logger = get_logger("batch")
@@ -173,84 +171,53 @@ def sync_one(
                 token=gitlab_token,
             )
 
-        # 3. SQL 解析
-        blocks = extract_sql_blocks(etl_content, jfn, date_str=metadata.dt)
-        for block in blocks:
-            parse_block_lineage(block, job_display_name)
-
-        table_lineages, field_lineages = build_lineage_summary(blocks)
-
-        if not table_lineages and not lineage_vote:
-            failed_blocks = [b for b in blocks if b.status == ParseStatus.SQL_PARSE_FAILED]
-            if failed_blocks:
-                err = failed_blocks[0].error_detail or "SQL_PARSE_FAILED"
-                result["status"] = "FAIL"
-                result["fail_category"] = FAIL_SQL
-                result["error"] = err[:200]
-            else:
-                result["status"] = "SKIP"
-                result["fail_category"] = None
-                result["error"] = "未提取到 SQL block 或无目标表"
-            result["elapsed"] = round(time.time() - t0, 1)
-            return result
+        # 3. LLM 表级血缘提取
+        from .lineage_write_policy import (
+            append_lineage_audit_jsonl,
+            default_audit_log_path,
+            evaluate_llm_only,
+        )
 
         skip_upstream_lineage = False
         skip_upstream_lineage_reason = ""
-        lineage_decision = None
-        if lineage_vote:
-            from .lineage_write_policy import (
-                append_lineage_audit_jsonl,
-                default_audit_log_path,
-                evaluate_lineage_write_vote,
+        table_lineages: list = []
+        field_lineages: list = []
+        try:
+            table_lineages, lineage_decision, _llm_raw = evaluate_llm_only(
+                etl_content,
+                timeout_sec=llm_timeout_sec,
             )
-
-            try:
-                table_lineages, lineage_decision, _llm = evaluate_lineage_write_vote(
-                    etl_content,
-                    jfn,
-                    metadata.dt or None,
-                    table_lineages,
-                    timeout_sec=llm_timeout_sec,
-                )
-                skip_upstream_lineage = not lineage_decision.write_upstream_lineage
-                skip_upstream_lineage_reason = lineage_decision.reason
-                result["lineage_status"] = lineage_decision.status
-                result["lineage_reason"] = lineage_decision.reason
-                result["write_upstream_lineage"] = lineage_decision.write_upstream_lineage
-                result["lineage_targets_chosen"] = sorted(lineage_decision.selected_targets)
-                result["lineage_sources_chosen"] = sorted(lineage_decision.selected_upstreams)
-                result["trust_score"] = lineage_decision.trust_score
-                audit_path = (
-                    Path(audit_jsonl)
-                    if audit_jsonl
-                    else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(batch_output_dir))
-                )
-                # 把 DeepSeek 错误也写进 audit（方便 Excel 展示失败原因）
-                llm_errors: List[str] = _llm.get("errors") or []
-                extra: Dict = {}
-                ds_err = _llm.get("deepseek_error")
-                if ds_err:
-                    extra["deepseek_error"] = str(ds_err)[:500]
-                if llm_errors:
-                    extra["llm_errors"] = llm_errors
-                append_lineage_audit_jsonl(audit_path, job_display_name, lineage_decision, extra=extra or None)
-            except Exception as exc:
-                result["lineage_status"] = "LLM_POLICY_ERROR"
-                result["lineage_reason"] = str(exc)[:500]
-                result["write_upstream_lineage"] = True
-                logger.warning("批量作业 %s LLM 策略失败，沿用 sqlglot: %s", job_display_name, exc)
+            skip_upstream_lineage = not lineage_decision.write_upstream_lineage
+            skip_upstream_lineage_reason = lineage_decision.reason
+            result["lineage_status"] = lineage_decision.status
+            result["lineage_reason"] = lineage_decision.reason
+            result["write_upstream_lineage"] = lineage_decision.write_upstream_lineage
+            result["lineage_targets_chosen"] = sorted(lineage_decision.selected_targets)
+            result["lineage_sources_chosen"] = sorted(lineage_decision.selected_upstreams)
+            result["trust_score"] = lineage_decision.trust_score
+            audit_path = (
+                Path(audit_jsonl)
+                if audit_jsonl
+                else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(batch_output_dir))
+            )
+            append_lineage_audit_jsonl(audit_path, job_display_name, lineage_decision)
+        except Exception as exc:
+            result["lineage_status"] = "LLM_ERROR"
+            result["lineage_reason"] = str(exc)[:500]
+            result["write_upstream_lineage"] = False
+            logger.warning("批量作业 %s LLM 提取失败: %s", job_display_name, exc)
 
         if not table_lineages:
             result["status"] = "SKIP"
             result["fail_category"] = None
-            result["error"] = "无目标表（含 LLM 回填后仍为空）"
+            result["error"] = "LLM 未提取到目标表"
             result["elapsed"] = round(time.time() - t0, 1)
             return result
 
         # 4. 结构化属性
         ctx = JobContext(metadata=metadata)
         ctx.runtime = parse_runtime_context(job_display_name, metadata.shell_command, etl_content, used_path)
-        ctx.sql_blocks = blocks
+        ctx.sql_blocks = []
         ctx.table_lineages = table_lineages
         ctx.field_lineages = field_lineages
         props = run_all_extractors(ctx, DEFAULT_EXTRACTORS)
@@ -468,7 +435,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--lineage-vote",
         action="store_true",
-        help="启用 DeepSeek+sqlglot 表级策略与审计（与 sync_job_lineage --lineage-vote 一致）",
+        help="已废弃（LLM 提取现为默认行为），保留此参数仅为向后兼容，无实际效果",
     )
     p.add_argument("--llm-timeout", type=int, default=90, help="DeepSeek HTTP 超时秒数，默认 90")
     p.add_argument("--audit-jsonl", default=None, help="血缘审计 JSONL；默认可设 BLF_LINEAGE_AUDIT_JSONL")

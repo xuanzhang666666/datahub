@@ -213,6 +213,13 @@ def tables_from_llm_payload(payload: Dict[str, Any]) -> Tuple[Set[str], Set[str]
     return _impl(payload)
 
 
+def call_llm_extract(etl_script: str, timeout_sec: int = 90) -> Dict[str, Any]:
+    """调用 DeepSeek 提取目标/上游表，返回 LLM 原始 JSON payload。失败时抛出异常。"""
+    db, dk, dm = _deepseek_config()
+    user_msg = _build_user_message(etl_script)
+    return _openai_chat_json_with_fallback(db, dk, dm, user_msg, timeout_sec)
+
+
 def tables_from_sqlglot(etl_content: str, job_file_name: str, date_str: Optional[str]) -> Tuple[Set[str], Set[str]]:
     blocks = extract_sql_blocks(etl_content, job_file_name, date_str=date_str)
     for b in blocks:
