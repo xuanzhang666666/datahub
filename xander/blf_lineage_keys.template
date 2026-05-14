@@ -1,0 +1,41 @@
+# =============================================================================
+# 横板速览（变量名一览，填值请用下面分行 KEY=value）
+# MINIMAX_OPENAI_BASE_URL | MINIMAX_OPENAI_API_KEY | MINIMAX_MODEL | DEEPSEEK_OPENAI_BASE_URL | DEEPSEEK_API_KEY | DEEPSEEK_MODEL | OPENAI_BASE_URL | OPENAI_API_KEY | BLF_LINEAGE_LLM_MODEL | BLF_LINEAGE_ENV_FILE | BLF_LINEAGE_DISCREPANCY_LOG | DATAHUB_GMS_URL | DATAHUB_GMS_TOKEN | BLF_GITLAB_PRIVATE_TOKEN | TRINO_HOST | TRINO_PORT | TRINO_USER | TRINO_CATALOG | TRINO_SCHEMA
+# 使用：复制为 xander/python/.env（或任意路径）填写密钥；运行前 export BLF_LINEAGE_ENV_FILE=该文件绝对路径
+# 注意：勿把填好密钥的文件提交 git；本模板文件名不含 .env 前缀以免被仓库 .gitignore 误忽略。
+# =============================================================================
+
+# --- MiniMax（OpenAI 兼容，血缘 LLM 对比 lineage_llm_compare）---
+MINIMAX_OPENAI_BASE_URL=https://api.minimaxi.com/v1
+MINIMAX_OPENAI_API_KEY=
+MINIMAX_MODEL=MiniMax-M2.7-highspeed
+
+# --- DeepSeek（OpenAI 兼容）---
+DEEPSEEK_OPENAI_BASE_URL=https://api.deepseek.com/v1
+DEEPSEEK_API_KEY=
+DEEPSEEK_MODEL=deepseek-v4-pro
+
+# --- 可选：仅给 MiniMax 的旧式 OPENAI_*（未设 MINIMAX_OPENAI_API_KEY 时回退）---
+OPENAI_BASE_URL=
+OPENAI_API_KEY=
+BLF_LINEAGE_LLM_MODEL=MiniMax-M2.7-highspeed
+
+# --- 指定 env 文件路径（可选）---
+BLF_LINEAGE_ENV_FILE=
+
+# --- 血缘分歧 JSONL 全局路径（可选；也可用 sync_job_lineage --discrepancy-log）---
+BLF_LINEAGE_DISCREPANCY_LOG=
+
+# --- DataHub ---
+DATAHUB_GMS_URL=http://datahub-gms:8080
+DATAHUB_GMS_TOKEN=
+
+# --- GitLab ---
+BLF_GITLAB_PRIVATE_TOKEN=
+
+# --- Trino / DMP（schedule_client / batch_sync）---
+TRINO_HOST=10.253.7.167
+TRINO_PORT=8081
+TRINO_USER=xuan.zhang
+TRINO_CATALOG=hive
+TRINO_SCHEMA=default
