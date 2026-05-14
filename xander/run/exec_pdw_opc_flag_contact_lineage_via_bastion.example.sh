@@ -1,17 +1,11 @@
 #!/bin/sh
-# Laptop → bastion → neo4j2: ingest HMS lineage for default.pdw_opc_flag_contact only.
+# Laptop → bastion → neo4j2：对 default 库做 HMS 入仓（含 default.pdw_opc_flag_contact 等该库下全部表，recipe 已过滤 tmp_/bak_tmp 等）。
 #
-# Put recipe on neo4j2 host first (e.g. /data/datahub/scripts/hive_metastore_pdw_opc_flag_contact_lineage.yml).
+# 前置：同 exec_hive_lineage_ingest_via_bastion.example.sh（hive_ingest_one_database.yml + ingest 脚本）。
 
 set -e
 BASTION_KEY="${BASTION_KEY:-$HOME/.ssh/agent-bastion}"
-CTR="${DATAHUB_ACTIONS_CONTAINER:-root-datahub-actions-1}"
 REMOTE="@neo4j2.dp.data.bj1"
 BASE="ssh -i $BASTION_KEY -p 7233 -o StrictHostKeyChecking=no agent@10.253.40.11"
 
-HMS="${HMS_THRIFT_HOST:-hiveserver5.dp.data.bj1.wormpex.com}"
-HP="${HMS_THRIFT_PORT:-9083}"
-RECIPE="${HIVE_LINEAGE_RECIPE:-hive_metastore_pdw_opc_flag_contact_lineage.yml}"
-
-"$BASE" "$REMOTE docker cp /data/datahub/scripts/$RECIPE ${CTR}:/tmp/$RECIPE"
-"$BASE" "$REMOTE docker exec -e DATAHUB_TELEMETRY_ENABLED=false -e HMS_THRIFT_HOST=$HMS -e HMS_THRIFT_PORT=$HP -e DATAHUB_GMS_URL=http://datahub-gms:8080 ${CTR} datahub ingest -c /tmp/$RECIPE"
+"$BASE" "$REMOTE /data/datahub/scripts/ingest_hive_database_to_datahub.sh default"

@@ -1,19 +1,14 @@
 #!/bin/sh
-# From laptop through agent-bastion: copy recipe into datahub-actions, run datahub ingest (allowlisted docker only).
+# Laptop → bastion → neo4j2：在从机上执行「单库 HMS 入仓」（与 ingest_hive_database_to_datahub.sh 一致）。
 #
-# Preconditions on neo4j2: hive_metastore_dw_order_v1_lineage.yml already at /data/datahub/scripts/
-#   (put2/get2 flat file + mv; same as partition-stats deploy).
+# 前置：neo4j2 已部署 /data/datahub/recipes/hive_ingest_one_database.yml 与
+#   /data/datahub/scripts/ingest_hive_database_to_datahub.sh（chmod +x）。
 #
-# Adjust BASTION_KEY / REMOTE / CTR if needed.
+# 示例库名 default；按需改为 data_logistics 等。勿在一条远程命令里使用 &&（bastion 可能拦截）。
 
 set -e
 BASTION_KEY="${BASTION_KEY:-$HOME/.ssh/agent-bastion}"
-CTR="${DATAHUB_ACTIONS_CONTAINER:-root-datahub-actions-1}"
 REMOTE="@neo4j2.dp.data.bj1"
 BASE="ssh -i $BASTION_KEY -p 7233 -o StrictHostKeyChecking=no agent@10.253.40.11"
 
-HMS="${HMS_THRIFT_HOST:-hiveserver5.dp.data.bj1.wormpex.com}"
-HP="${HMS_THRIFT_PORT:-9083}"
-
-"$BASE" "$REMOTE docker cp /data/datahub/scripts/hive_metastore_dw_order_v1_lineage.yml ${CTR}:/tmp/hive_metastore_dw_order_v1_lineage.yml"
-"$BASE" "$REMOTE docker exec -e DATAHUB_TELEMETRY_ENABLED=false -e HMS_THRIFT_HOST=$HMS -e HMS_THRIFT_PORT=$HP -e DATAHUB_GMS_URL=http://datahub-gms:8080 ${CTR} datahub ingest -c /tmp/hive_metastore_dw_order_v1_lineage.yml"
+"$BASE" "$REMOTE /data/datahub/scripts/ingest_hive_database_to_datahub.sh default"

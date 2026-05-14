@@ -6,25 +6,30 @@
 
 | 目录 | 内容 |
 | --- | --- |
-| **`run/`** | 可执行脚本：`run_hive_*`（neo4j2 上 HMS 入仓等）、`exec_*`（经 bastion 触发）、`verify_*`、`blf_collect_*` 等 |
+| **`run/`** | 可执行脚本：HMS 入仓见 **`ingest_hive_database_to_datahub.sh`**；另有 `exec_*`（经 bastion）、`verify_*`、`blf_collect_*` 等 |
 | **`docs/`** | 说明与规范：`datahub-deploy-neo4j2.md`、`docker-services-neo4j2.md`、`datahub-ingestion-standards.md`（入仓约束） |
 | **`python/`** | 需在 neo4j2 / actions 容器旁部署的 Python 工具，如 `sync_partition_stats_to_datahub_trino.py` |
-| **`notes/`** | 短说明、可选流程笔记，如 `openlineage_optional_note.txt` |
+| **`notes/`** | 短说明、可选流程笔记；**运维踩坑**见 `notes/datahub_ops_pitfalls.md`（GMS 地址、delete、Navigate 分叉） |
 | **`infra/`** | 基础设施片段，如 `docker-compose.yml`（本机或 neo4j2 侧 compose；已默认 **关闭 GMS telemetry**、**前端 HTTP idleTimeout=300s** 以降低内网噪音与慢 GraphQL 断连） |
 | **`scripts/gms-es/`** | 调 GMS（GraphQL/OpenAPI）、查 ES `datasetindex_v2` 的请求体与示例 JSON/shell、URN 片段、`restoreIndices` 辅助说明等 |
 | **`scripts/README.md`** | `scripts/` 下子目录说明（当前主要为 `gms-es/`） |
-| **`recipes/`** | `datahub ingest -c` 使用的 YAML recipe（如各 `hive_metastore_*.yml`） |
+| **`recipes/`** | 当前仅 **`hive_ingest_one_database.yml`**：按环境变量 `HIVE_INGEST_DATABASE` 同步**单个 Hive 库**全表到 DataHub |
 | **`hooks/`** | 可选 git hook（仅约束 `xander/` 下文件的提交方式），按需自行链接到 `.git/hooks` |
 | **`.gitignore`** | 忽略本地临时文件，如 `tmp_*.ndjson`（勿将 ES bulk 导出等提交进库） |
 
-仓库根目录可能保留 **`hive_metastore_dw_order_v1_lineage.yml`** 等与 `put2`/扁平文件名部署对齐的副本，与 `recipes/` 中同名 recipe 可同时维护；以实际 diff 为准。
+## Hive 库 → DataHub（唯一入口）
 
-## 使用示例
-
-从仓库根目录执行（需先设置 `HMS_THRIFT_HOST`、`DATAHUB_GMS_URL` 等）：
+1. 将 `xander/recipes/hive_ingest_one_database.yml` 拷到 neo4j2：`/data/datahub/recipes/`
+2. 将 `xander/run/ingest_hive_database_to_datahub.sh` 拷到：`/data/datahub/scripts/` 并 `chmod +x`
 
 ```bash
-sh xander/run/run_hive_metastore_dw_order_v1_lineage_ingest.example.sh
+export LINEAGE_PYTHON=/opt/anaconda3/bin/python
+# 注意：宿主机 127.0.0.1:8080 可能是前端而非 GMS；务必与 neo4j2 上 docker 端口映射一致。
+# 批量删除等 CLI 推荐在容器内执行：见 notes/datahub_ops_pitfalls.md
+export DATAHUB_GMS_URL=http://127.0.0.1:8080
+sh xander/run/ingest_hive_database_to_datahub.sh data_logistics
 ```
 
-根目录 **`run_hive_lineage_on_neo4j2.sh`** 为薄包装，转发至 **`xander/run/run_hive_lineage_on_neo4j2.sh`**，兼容仍指向仓库根路径的旧文档或 cron。
+Jenkins：每个库一个 Job，在 shell 里传入对应库名即可。入仓在 **Jenkins slave（neo4j2）宿主机** 上跑 `python -m datahub ingest`，**不使用** Docker 容器执行 ingest。
+
+仓库根目录 **`run_hive_lineage_on_neo4j2.sh`** 为薄包装，转发至 **`xander/run/ingest_hive_database_to_datahub.sh`**，兼容仍指向根路径的旧 cron/文档（参数为 **Hive 库名**）。

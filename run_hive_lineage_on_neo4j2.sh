@@ -1,3 +1,3 @@
-#!/bin/sh
-# Wrapper: canonical script is xander/run/run_hive_lineage_on_neo4j2.sh (repo root path kept for old references).
-exec "$(dirname "$0")/xander/run/run_hive_lineage_on_neo4j2.sh" "$@"
+#!/usr/bin/env bash
+# 兼容旧路径：转发到统一的 Hive 库入仓脚本（参数为库名，如 default、data_logistics）。
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/xander/run/ingest_hive_database_to_datahub.sh" "$@"
