@@ -278,6 +278,7 @@ def run_batch(
 
     # 若报告已存在：仅跳过「最后一条记录」为 OK/SKIP 的作业；FAIL 会在下次继续跑（避免旧失败永远卡住）
     job_last_status: Dict[str, str] = {}
+    done: set = set()
     if report_file.exists():
         with open(report_file, encoding="utf-8") as f:
             for line in f:

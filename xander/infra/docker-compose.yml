@@ -87,7 +87,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8G
+          # 主机 ~125G RAM；表级血缘下游可达数千节点时 GMS 堆与 Graph 解析占用高。
+          # 堆必须明显小于 cgroup 上限，为 Metaspace / DirectBuffer / 线程栈留余量（曾 OOMKilled @8G+Xmx8g）。
+          memory: 32G
+    restart: unless-stopped
     depends_on:
       datahub-upgrade:
         condition: service_completed_successfully
@@ -110,7 +113,7 @@ services:
     - ES_BULK_REFRESH_POLICY=NONE
     - GRAPH_SERVICE_DIFF_MODE_ENABLED=true
     - GRAPH_SERVICE_IMPL=${GRAPH_SERVICE_IMPL:-elasticsearch}
-    - JAVA_OPTS=-Xms8g -Xmx8g
+    - JAVA_OPTS=-Xms4g -Xmx24g
     - DATAHUB_TOKEN_SERVICE_SIGNING_KEY=${DATAHUB_TOKEN_SERVICE_SIGNING_KEY:-AccLVCTZXKRmWPGQnvTSqMT6Duz3hAH3c1xsFNkqKz8z}
     - DATAHUB_TOKEN_SERVICE_SALT=${DATAHUB_TOKEN_SERVICE_SALT:-dH5T56hqS5P7GqhUQT2YnKdX4m7E3N8K}
     - KAFKA_BOOTSTRAP_SERVER=broker:29092
@@ -183,12 +186,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8G
+          # 血缘/搜索走 ES；大下游扇出时适当加大堆与 cgroup。
+          memory: 12G
     environment:
     - discovery.type=single-node
     - ${XPACK_SECURITY_ENABLED:-xpack.security.enabled=false}
-    - ES_JAVA_OPTS=-Xms4g -Xmx4g -Dlog4j2.formatMsgNoLookups=true
-    - OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g -Dlog4j2.formatMsgNoLookups=true
+    - ES_JAVA_OPTS=-Xms6g -Xmx6g -Dlog4j2.formatMsgNoLookups=true
+    - OPENSEARCH_JAVA_OPTS=-Xms6g -Xmx6g -Dlog4j2.formatMsgNoLookups=true
     - DISABLE_SECURITY_PLUGIN=true
     healthcheck:
       interval: 1s

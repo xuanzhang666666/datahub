@@ -7,37 +7,29 @@
 #   - agent-bastion + put2/get2 is only for **laptop → neo4j2** to deploy recipe/scripts; Jenkins
 #     does not need it once the slave runs on neo4j2.
 #
-# Prerequisites on neo4j2 (once, via your usual FTP/bastion deploy):
-#   - /data/datahub/scripts/run_hive_data_multi_dbs_on_neo4j2.sh (+ recipe yml), chmod +x
-#   - data_finance only: deploy hive_metastore_data_finance.yml to /data/datahub/recipes/ and
-#     run_hive_data_finance_on_neo4j2.sh to /data/datahub/scripts/; use a second Jenkins job with
-#     JENKINS_HIVE_REMOTE_SCRIPT=/data/datahub/scripts/run_hive_data_finance_on_neo4j2.sh
-#   - Optional: copy this file to /data/datahub/scripts/jenkins_hive_metastore_ingest.sh so
-#     Jenkins can run it without checking out the Git repo.
+# 默认走宿主机 ingest（由 run_hive_*_on_neo4j2.sh 内 python -m datahub，不经 Docker），与血缘任务
+# 共用 LINEAGE_PYTHON=/opt/anaconda3/bin/python 等约定。若未设置，本脚本在 local 模式下会给出
+# 与 neo4j2 常见部署一致的默认值（仍可在 Jenkins Job 里覆盖）。
 #
-# Jenkins Freestyle (slave = neo4j2.dp.data.bj1, label e.g. neo4j2_bj1-a5fb290e) — "Execute shell":
-#   bash /data/datahub/scripts/jenkins_hive_metastore_ingest.sh
-#   (sh is fine for this wrapper; it execs bash for run_hive_*.)
-#   If docker.sock permission denied: add agent user to group docker, OR configure NOPASSWD
-#   sudo for docker and export DATAHUB_DOCKER_SUDO=1 before this script (see run_hive_* header).
-#   # or, if the job checks out this repo on the same slave:
-#   bash "$WORKSPACE/xander/run/jenkins_hive_metastore_ingest.sh"
+# Prerequisites on neo4j2 (once):
+#   - /data/datahub/recipes/hive_metastore_data_multi_dbs.yml（或 finance 专用 recipe）
+#   - /data/datahub/scripts/run_hive_data_multi_dbs_on_neo4j2.sh（及 finance 脚本），chmod +x
+#   - Anaconda: /opt/anaconda3/bin/python -m pip install -U 'acryl-datahub[hive-metastore,presto-on-hive]'
+#   - Optional: copy this file to /data/datahub/scripts/jenkins_hive_metastore_ingest.sh
 #
-# Optional: from laptop only — trigger ingest through bastion (not for Jenkins slave):
-#   export JENKINS_HIVE_INGEST_MODE=bastion
-#   export JENKINS_BASTION_KEY="$HOME/.ssh/agent-bastion"
-#   export JENKINS_NEO4J2_TARGET=neo4j2.dp.data.bj1
-#   bash xander/run/jenkins_hive_metastore_ingest.sh
+# Jenkins Freestyle (slave = neo4j2) — "Execute shell":
+#   export LINEAGE_PYTHON=/opt/anaconda3/bin/python
+#   export DATAHUB_GMS_URL=http://127.0.0.1:8080
+#   sh /data/datahub/scripts/jenkins_hive_metastore_ingest.sh
+#   # data_finance only: set JENKINS_HIVE_REMOTE_SCRIPT=/data/datahub/scripts/run_hive_data_finance_on_neo4j2.sh
 #
 # Optional overrides:
 #   JENKINS_HIVE_INGEST_MODE       default local (bastion only for remote-from-laptop)
 #   JENKINS_HIVE_REMOTE_SCRIPT     default /data/datahub/scripts/run_hive_data_multi_dbs_on_neo4j2.sh
+#   LINEAGE_PYTHON / DATAHUB_GMS_URL — 见上；未设置时 local 模式默认 /opt/anaconda3/bin/python 与 http://127.0.0.1:8080
+#   HIVE_INGEST_USE_DOCKER=1 — 传给 run_hive_*，强制回退到 docker exec 旧路径
 #   JENKINS_BASTION_* / JENKINS_NEO4J2_TARGET / JENKINS_SSH_EXTRA_OPTS — only when MODE=bastion
-#   DATAHUB_DOCKER_SUDO — passed through to run_hive_* (auto|0|1); auto uses sg docker if Jenkins
-#     process was not restarted after usermod -aG docker.
-#   TZ — for log() timestamps (default Asia/Shanghai); Python ingest time uses run_hive_* docker -e TZ.
-#
-# HMS / GMS: see run_hive_*_on_neo4j2.sh defaults on neo4j2; override there or via a wrapper.
+#   TZ — for log() timestamps (default Asia/Shanghai)
 set -eu
 
 MODE="${JENKINS_HIVE_INGEST_MODE:-local}"
@@ -61,6 +53,12 @@ case "$MODE" in
       log "ERROR: not found: $REMOTE_SCRIPT"
       exit 1
     fi
+    # 与 Jenkins 血缘任务对齐的默认值（已在 Job 中 export 则不会覆盖）
+    LINEAGE_PYTHON="${LINEAGE_PYTHON:-/opt/anaconda3/bin/python}"
+    export LINEAGE_PYTHON
+    DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-http://127.0.0.1:8080}"
+    export DATAHUB_GMS_URL
+    log "defaults if unset: LINEAGE_PYTHON=$LINEAGE_PYTHON DATAHUB_GMS_URL=$DATAHUB_GMS_URL"
     if command -v bash >/dev/null 2>&1; then
       exec bash "$REMOTE_SCRIPT"
     fi

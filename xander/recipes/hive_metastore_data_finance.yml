@@ -14,6 +14,9 @@
 # Runtime: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, optional DATAHUB_GMS_TOKEN
 # Runner (neo4j2): xander/run/run_hive_data_finance_on_neo4j2.sh
 #
+# include_column_lineage: 为 false 时可避免对全平台大量表做 schema 预取（曾见 ~13 万条、~8 分钟+），
+# 显著缩短启动时间并降低内存；列级血缘可改由调度脚本血缘等其它链路维护。
+#
 source:
   type: hive-metastore
   config:
@@ -25,7 +28,7 @@ source:
     platform_instance: blf-prod-hive
     emit_storage_lineage: false
     hive_storage_lineage_direction: upstream
-    include_column_lineage: true
+    include_column_lineage: false
     include_view_lineage: true
 
     database_pattern:
