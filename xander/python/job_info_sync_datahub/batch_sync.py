@@ -49,7 +49,11 @@ from .runtime_parser import (
     parse_runtime_context,
     resolve_project_path,
 )
-from .schedule_client import fetch_all_job_metadata, fetch_job_metadata
+from .schedule_client import (
+    dmp_batch_exec_time_online_sql_clause,
+    fetch_all_job_metadata,
+    fetch_job_metadata,
+)
 from .structured_properties import DEFAULT_EXTRACTORS, run_all_extractors
 
 logger = get_logger("batch")
@@ -76,13 +80,13 @@ def fetch_all_jobs(prefix: str = "pdw") -> List[str]:
     )
     cur = conn.cursor()
     safe = prefix.replace("'", "''")
-    cur.execute(f"""
-        SELECT job_display_name
+    online_clause = dmp_batch_exec_time_online_sql_clause()
+    sql = f"""SELECT job_display_name
         FROM {_DMP_TABLE}
         WHERE dt = (SELECT max(dt) FROM {_DMP_TABLE})
           AND job_display_name LIKE '{safe}%'
-        ORDER BY job_display_name
-    """)
+{online_clause}ORDER BY job_display_name""".strip()
+    cur.execute(sql)
     rows = [r[0] for r in cur.fetchall()]
     cur.close()
     conn.close()

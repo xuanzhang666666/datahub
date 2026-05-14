@@ -13,6 +13,10 @@ source:
     host_port: "${HMS_THRIFT_HOST}:${HMS_THRIFT_PORT}"
     use_kerberos: false
 
+    # 须与 job_info_sync_datahub / datahub_writer 的 platform_instance 一致，否则与血缘写入的
+    # URN（hive,blf-prod-hive.db.table,PROD）不是同一实体，UI 按实例筛选或搜表名会对不上。
+    platform_instance: "blf-prod-hive"
+
     env: PROD
     emit_storage_lineage: false
     hive_storage_lineage_direction: upstream
@@ -27,6 +31,7 @@ source:
         - "^${HIVE_INGEST_DATABASE}\\..*$"
       deny:
         - "^${HIVE_INGEST_DATABASE}\\.tmp_.*$"
+        - "^${HIVE_INGEST_DATABASE}\\.temp_.*$"
         - "^${HIVE_INGEST_DATABASE}\\.bak_tmp.*$"
         - "^${HIVE_INGEST_DATABASE}\\.not_verified_.*$"
 

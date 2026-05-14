@@ -7,6 +7,9 @@
   TRINO_USER      默认 xuan.zhang
   TRINO_CATALOG   默认 hive
   TRINO_SCHEMA    默认 default
+  DMP_MIN_BATCH_EXEC_TIME  仅同步「仍在线」的作业：要求 batch_exec_time >= 该时间戳
+                            （下线后 batch_exec_time 不再更新，会低于阈值）。默认 2026-05-14 18:30:11。
+                            设为空字符串可关闭该条件（不推荐生产环境）。
 """
 
 from __future__ import annotations
@@ -31,6 +34,21 @@ logger = get_logger("schedule_client")
 _DMP_TABLE = "default.ods_data_platform_dmp_schedule_job_basic_info"
 
 
+def dmp_batch_exec_time_online_sql_clause() -> str:
+    """返回追加到 WHERE 的 SQL 片段：排除已下线作业（batch_exec_time 停滞在阈值之前）。
+
+    判定：batch_exec_time 为 NULL 或 cast 后 < DMP_MIN_BATCH_EXEC_TIME 视为下线，不参与同步。
+    """
+    raw = os.getenv("DMP_MIN_BATCH_EXEC_TIME", "2026-05-14 18:30:11").strip()
+    if not raw:
+        return ""
+    safe = raw.replace("'", "''")
+    return (
+        "  AND TRY_CAST(batch_exec_time AS TIMESTAMP) IS NOT NULL\n"
+        f"  AND TRY_CAST(batch_exec_time AS TIMESTAMP) >= TIMESTAMP '{safe}'\n"
+    )
+
+
 def _trino_conn() -> "trino.dbapi.Connection":
     return trino.dbapi.connect(
         host=os.getenv("TRINO_HOST", "10.253.7.167"),
@@ -44,6 +62,7 @@ def _trino_conn() -> "trino.dbapi.Connection":
 def fetch_all_job_metadata(prefix: str = "pdw") -> List[JobMetadata]:
     """一次性查询指定前缀的所有作业元数据，返回 JobMetadata 列表（批量模式）。"""
     safe = prefix.replace("'", "''")
+    online_clause = dmp_batch_exec_time_online_sql_clause()
     sql = f"""
 SELECT
     job_display_name,
@@ -54,10 +73,14 @@ SELECT
 FROM {_DMP_TABLE}
 WHERE dt = (SELECT max(dt) FROM {_DMP_TABLE})
   AND job_display_name LIKE '{safe}%'
-ORDER BY job_display_name
+{online_clause}ORDER BY job_display_name
 """.strip()
 
-    logger.info("批量查询调度元数据: prefix=%s", prefix)
+    logger.info(
+        "批量查询调度元数据: prefix=%s batch_exec_time_filter=%s",
+        prefix,
+        "on" if online_clause else "off",
+    )
     conn = _trino_conn()
     cur = conn.cursor()
     try:
@@ -105,6 +128,7 @@ def fetch_job_metadata(job_display_name: str) -> JobMetadata:
     如果查不到或 shell_command 为空，抛出 RuntimeError。
     """
     safe_name = job_display_name.replace("'", "''")
+    online_clause = dmp_batch_exec_time_online_sql_clause()
     sql = f"""
 SELECT
     job_display_name,
@@ -115,7 +139,7 @@ SELECT
 FROM {_DMP_TABLE}
 WHERE dt = (SELECT max(dt) FROM {_DMP_TABLE})
   AND job_display_name = '{safe_name}'
-""".strip()
+{online_clause}""".strip()
 
     logger.debug("查询调度元数据: job_display_name=%s", job_display_name)
     conn = _trino_conn()
@@ -128,7 +152,10 @@ WHERE dt = (SELECT max(dt) FROM {_DMP_TABLE})
         conn.close()
 
     if not rows:
-        raise RuntimeError(f"DMP 中未找到作业: {job_display_name!r}")
+        hint = ""
+        if online_clause:
+            hint = "（可能已下线：batch_exec_time 低于 DMP_MIN_BATCH_EXEC_TIME）"
+        raise RuntimeError(f"DMP 中未找到作业: {job_display_name!r}{hint}")
 
     row = rows[0]
     name, job_name, shell, upstream_raw, dt = (
