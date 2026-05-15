@@ -395,21 +395,11 @@ def _parse_lineage_array(raw: Dict[str, Any]) -> List[TableLineage]:
     ]
 
 
-def evaluate_llm_only(
-    etl_script: str,
-    timeout_sec: int = 90,
-    job_file_name: str = "",
-) -> Tuple[List[TableLineage], LineageWriteDecision, Dict[str, Any]]:
-    """仅用 LLM 提取表级血缘（不依赖 sqlglot）。
-
-    LLM 返回 per-target lineage 数组，每个目标表有独立的上游表列表。
-    依次应用 fqtn 规则校验与 Hive 表存在性校验（可通过环境变量跳过存在性校验）。
-    返回 (table_lineages, decision, raw_payload)。
-    """
-    from .lineage_llm_compare import call_llm_extract
-
-    raw = call_llm_extract(etl_script, timeout_sec=timeout_sec, job_file_name=job_file_name)
-    parsed = _parse_lineage_array(raw)
+def apply_lineage_filters_from_parsed(
+    parsed: List[TableLineage],
+    raw: Dict[str, Any],
+) -> Tuple[List[TableLineage], LineageWriteDecision]:
+    """对 LLM 解析结果做 fqtn 规则与 Hive 存在性过滤，产出与 batch_sync 一致的写入决策。"""
     ds_targets = {tl.target.full_name.lower() for tl in parsed}
     ds_upstreams = {u.full_name.lower() for tl in parsed for u in tl.upstreams}
 
@@ -426,7 +416,7 @@ def evaluate_llm_only(
             deepseek_targets=set(),
             deepseek_upstreams=du,
         )
-        return [], decision, raw
+        return [], decision
 
     table_lineages, fqtn_meta = filter_table_lineages_by_hive_fqtn_rules(parsed)
     if not table_lineages:
@@ -441,7 +431,7 @@ def evaluate_llm_only(
             deepseek_upstreams=set(ds_upstreams),
             fqtn_validation=fqtn_meta,
         )
-        return [], decision, raw
+        return [], decision
 
     hive_exist_meta: Dict[str, Any]
     if should_skip_hive_existence_check():
@@ -480,7 +470,7 @@ def evaluate_llm_only(
                 fqtn_validation=fqtn_meta,
                 hive_existence=hive_exist_meta,
             )
-        return [], decision, raw
+        return [], decision
 
     all_targets = {tl.target.full_name for tl in table_lineages}
     all_upstreams = {u.full_name for tl in table_lineages for u in tl.upstreams}
@@ -514,6 +504,25 @@ def evaluate_llm_only(
         fqtn_validation=fqtn_meta,
         hive_existence=hive_exist_meta,
     )
+    return table_lineages, decision
+
+
+def evaluate_llm_only(
+    etl_script: str,
+    timeout_sec: int = 90,
+    job_file_name: str = "",
+) -> Tuple[List[TableLineage], LineageWriteDecision, Dict[str, Any]]:
+    """仅用 LLM 提取表级血缘（不依赖 sqlglot）。
+
+    LLM 返回 per-target lineage 数组，每个目标表有独立的上游表列表。
+    依次应用 fqtn 规则校验与 Hive 表存在性校验（可通过环境变量跳过存在性校验）。
+    返回 (table_lineages, decision, raw_payload)。
+    """
+    from .lineage_llm_compare import call_llm_extract
+
+    raw = call_llm_extract(etl_script, timeout_sec=timeout_sec, job_file_name=job_file_name)
+    parsed = _parse_lineage_array(raw)
+    table_lineages, decision = apply_lineage_filters_from_parsed(parsed, raw)
     return table_lineages, decision, raw
 
 

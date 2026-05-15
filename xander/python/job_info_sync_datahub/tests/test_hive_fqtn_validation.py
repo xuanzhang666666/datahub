@@ -47,6 +47,10 @@ def test_dwa_before_dw_prefix() -> None:
     assert is_valid_hive_fqtn("default.dwa_sales_x") == (True, "")
 
 
+def test_is_valid_pdim_table_prefix() -> None:
+    assert is_valid_hive_fqtn("default.pdim_tag_info_sku_details_v1") == (True, "")
+
+
 def test_rejects_db_not_in_allowlist() -> None:
     assert is_valid_hive_fqtn("pdw.dw_order_v1")[0] is False
 

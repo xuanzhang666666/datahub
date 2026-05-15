@@ -5,8 +5,8 @@
   # 同步所有 pdw 开头的作业，并发 8
   python3 batch_sync.py --prefix pdw --concurrency 8 --report /tmp/batch_report.jsonl
 
-  # 从文件读取作业名列表
-  python3 batch_sync.py --job-file /tmp/pdw_jobs.txt --concurrency 8 --report /tmp/batch_report.jsonl
+  # 从文件读取作业名列表（# 开头为注释，强制重跑加 --force）
+  python3 batch_sync.py --job-file /tmp/pdw_jobs.txt --force --concurrency 8 --report /tmp/batch_report.jsonl
 
   # 只重跑失败的（从上次报告中提取）
   python3 batch_sync.py --retry-failed /tmp/batch_report.jsonl --concurrency 8
@@ -280,6 +280,17 @@ def sync_one(
     return result
 
 
+def load_jobs_from_file(path: str) -> List[str]:
+    """从文本文件读取作业名：每行一个，跳过空行与 # 注释，去重保序。"""
+    names: List[str] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        names.append(s)
+    return list(dict.fromkeys(names))
+
+
 def run_batch(
     jobs: List[str],
     report_path: str,
@@ -294,15 +305,16 @@ def run_batch(
     llm_timeout_sec: int = 90,
     audit_jsonl: Optional[str] = None,
     discrepancy_log: Optional[str] = None,
+    force: bool = False,
 ) -> None:
     report_file = Path(report_path)
     report_parent = str(report_file.parent)
     report_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # 若报告已存在：仅跳过「最后一条记录」为 OK/SKIP 的作业；FAIL 会在下次继续跑（避免旧失败永远卡住）
-    job_last_status: Dict[str, str] = {}
+    # 若报告已存在：仅跳过「最后一条记录」为 OK/SKIP 的作业；--force 时全部重跑
     done: set = set()
-    if report_file.exists():
+    if not force and report_file.exists():
+        job_last_status: Dict[str, str] = {}
         with open(report_file, encoding="utf-8") as f:
             for line in f:
                 try:
@@ -313,6 +325,8 @@ def run_batch(
         done = {j for j, st in job_last_status.items() if st in ("OK", "SKIP")}
         if done:
             logger.info("跳过已成功或业务 SKIP 的作业: %d 个（历史 FAIL 将重试）", len(done))
+    elif force:
+        logger.info("force=True：忽略报告中已有 OK/SKIP，名单内作业全部重跑")
 
     todo = [j for j in jobs if j not in done]
     total = len(todo)
@@ -476,6 +490,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="血缘审计 JSONL（与 --audit-jsonl 并存时以后者为准）；可设 BLF_LINEAGE_DISCREPANCY_LOG",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="忽略报告中已有 OK/SKIP，对名单内作业全部重跑（常与 --job-file 联用）",
+    )
     return p.parse_args()
 
 
@@ -511,8 +530,11 @@ def main() -> int:
         run_batch._prefetched_meta = {m.job_display_name: m for m in all_meta}
         jobs = list(run_batch._prefetched_meta.keys())
     elif args.job_file:
-        jobs = [l.strip() for l in Path(args.job_file).read_text().splitlines() if l.strip()]
+        jobs = load_jobs_from_file(args.job_file)
         logger.info("从文件读取 %d 个作业: %s", len(jobs), args.job_file)
+        if not jobs:
+            logger.error("作业列表为空: %s", args.job_file)
+            return 2
     else:  # retry-failed
         jobs = []
         with open(args.retry_failed, encoding="utf-8") as f:
@@ -551,6 +573,7 @@ def main() -> int:
         llm_timeout_sec=args.llm_timeout,
         audit_jsonl=args.audit_jsonl,
         discrepancy_log=args.discrepancy_log,
+        force=args.force,
     )
 
     print_summary(args.report)
