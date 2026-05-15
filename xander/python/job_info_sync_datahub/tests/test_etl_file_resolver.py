@@ -105,6 +105,29 @@ class TestResolveEtlFile(unittest.TestCase):
             self.assertEqual(disp, f"localfolder:thrall/{rel}")
             self.assertEqual(src, "local")
 
+    def test_empty_project_path_skips_gitlab_uses_local_only(self) -> None:
+        """project_path 为空时不得调用 GitLab，仅从 localfolder 读。"""
+        rel = "jobs/foo/x.job"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data_shop" / "jobs" / "foo").mkdir(parents=True)
+            (root / "data_shop" / rel).write_text("local-only-body", encoding="utf-8")
+
+            def read_git(_p: str) -> Optional[str]:
+                raise AssertionError("GitLab must not be queried when project_path is empty")
+
+            disp, content, src = resolve_etl_file(
+                gitlab_name="data_shop",
+                project_path="",
+                candidate_paths=[rel],
+                job_file_name="x.job",
+                local_root=root,
+                read_gitlab_at_path=read_git,
+            )
+        self.assertEqual(content, "local-only-body")
+        self.assertEqual(src, "local")
+        self.assertTrue(disp.startswith("localfolder:data_shop/"))
+
     def test_both_same_uses_git(self) -> None:
         rel = "jobs/foo/bar.job"
         body = "identical\n"

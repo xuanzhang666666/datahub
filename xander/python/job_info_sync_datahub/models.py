@@ -44,7 +44,7 @@ class RuntimeContext:
 
     job_display_name: str
     gitlab_name: str  # e.g. "analysis-jobs"
-    project_path: str  # e.g. "data/analysis-jobs"
+    project_path: str  # e.g. "data/analysis-jobs"；空串表示仅 localfolder（无 GitLab 映射）
     job_path: str  # e.g. "pdw_opc_flag/pdw_opc_flag_contact"
     job_type: str  # "job" | "python"
     job_file_name: str  # e.g. "pdw_opc_flag_pdw_opc_flag_contact.job"

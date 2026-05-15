@@ -9,6 +9,9 @@
 环境变量：
   BLF_ETL_LOCAL_ROOT       默认 /localfolder（neo4j2 项目镜像根）
   BLF_ETL_LOCAL_DISABLE=1  关闭本地源，仅 GitLab
+
+未在 ``GITLAB_NAME_TO_PROJECT_PATH`` 中配置的 ``gitlab_name``：若 ``BLF_ETL_LOCAL_ROOT/<gitlab_name>/``
+目录存在，则 ``resolve_project_path`` 返回空串，ETL 仅从 localfolder 解析，不访问 GitLab 项目 API。
 """
 
 from __future__ import annotations
@@ -162,7 +165,10 @@ def resolve_etl_file(
     read_gitlab_at_path: Optional[ReadGitFn] = None,
     read_local_at_path: Optional[ReadLocalFn] = None,
 ) -> Tuple[str, str, str]:
-    """双源解析 ETL 文件，返回 (display_path, content, source_tag)。"""
+    """双源解析 ETL 文件，返回 (display_path, content, source_tag)。
+
+    ``project_path`` 为空串时表示仅 localfolder（无 GitLab 项目映射），不调用 ``get_project_id``。
+    """
     from .gitlab_client import (
         _get_token,
         get_project_id,
@@ -177,15 +183,25 @@ def resolve_etl_file(
     local_enabled = root is not None
 
     pid: Optional[int] = None
-    try:
-        pid = get_project_id(project_path, token)
-    except RuntimeError as exc:
-        if not local_enabled:
-            raise
-        logger.warning(
-            "GitLab 项目不可用，仅尝试 localfolder: project=%s err=%s",
-            project_path,
-            exc,
+    if project_path.strip():
+        try:
+            pid = get_project_id(project_path, token)
+        except RuntimeError as exc:
+            if not local_enabled:
+                raise
+            logger.warning(
+                "GitLab 项目不可用，仅尝试 localfolder: project=%s err=%s",
+                project_path,
+                exc,
+            )
+    elif not local_enabled:
+        raise RuntimeError(
+            "project_path 为空（仅 localfolder 模式）但 BLF_ETL_LOCAL_ROOT 未启用或不是目录，无法解析 ETL"
+        )
+    else:
+        logger.info(
+            "仅 localfolder 解析 ETL（无 GitLab project_path）: gitlab_name=%s",
+            gitlab_name,
         )
 
     def _read_git(rel: str) -> Optional[str]:
@@ -210,7 +226,7 @@ def resolve_etl_file(
     logger.debug(
         "双源解析 ETL: gitlab_name=%s project=%s candidates=%d local=%s",
         gitlab_name,
-        project_path,
+        project_path or "(local-only)",
         len(paths_to_try),
         local_enabled,
     )
