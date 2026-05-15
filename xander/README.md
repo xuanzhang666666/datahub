@@ -12,6 +12,8 @@
 - **环境变量示例**：`PREFIX`、`CONCURRENCY`、`LINEAGE_PYTHON` 等（见脚本内注释）
 - **ETL 脚本双源**（neo4j2）：`BLF_ETL_LOCAL_ROOT=/localfolder`（默认）；目录名为 `shell_command` 中的 `gitlab_name`（如 `analysis-jobs`）。GitLab 与 local 均命中时内容相同用 GitLab，不同用 local。`BLF_ETL_LOCAL_DISABLE=1` 可仅走 GitLab。
 - **Structured Properties**：`blf.data.schedule.execute_shell`（Execute Shell，富文本）须在 GMS 预建；仅当作业解析到表级血缘且 `write_upstream_lineage` 为真时写入 DMP 完整 `shell_command`。
+- **表名别名**：LLM 若解析到 `not_verified_<真实表名>`，写入前会去掉 `not_verified_` 前缀再校验并写血缘（与 HMS ingest 排除 `not_verified_.*` 一致）。
+- **shell 解析**：`w-run-task.sh` 后的单字母调度参数（如 `D`）与 `| ...` 管道不会进入 `.job` 文件名（见 `runtime_parser.extract_job_path_and_type`）。
 
 ### 2）Hive 表清单 xlsx → 切分 → 串行 ingest
 

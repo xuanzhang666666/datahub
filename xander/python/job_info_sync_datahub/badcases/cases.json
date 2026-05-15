@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-05-15T16:00",
+  "updated_at": "2026-05-15T18:00",
   "cases": [
     {
       "id": "shell_pipe_echo_ignore_check",
       "discovered_at": "2026-05-15",
-      "status": "open",
+      "status": "fixed",
       "component": "runtime_parser.extract_job_path_and_type",
       "related_modules": [
         "gitlab_client.download_etl_file",
@@ -21,7 +21,23 @@
       "root_cause": "extract_job_path_and_type 仅对 || 截断，未对管道符 | 截断，把 | echo ignore check 并入 job_path / job_file_name",
       "scheduling_behavior": "在真实 shell 中管道左侧 w-run-task.sh 仍会执行；| echo ignore check 常用于让整条命令退出码为 0（未设 pipefail 时）",
       "frequency": "少见",
-      "fix_hint": "在解析 runner 行参数时，于首个未引用的 | 处截断（注意保留现有 || 处理）；截断后再生成 candidate_gitlab_paths"
+      "fix_hint": "runtime_parser._trim_runner_line_for_job_path：|| 后于首个 | 截断"
+    },
+    {
+      "id": "shell_trailing_partition_letter_d",
+      "discovered_at": "2026-05-15",
+      "status": "fixed",
+      "component": "runtime_parser.extract_job_path_and_type",
+      "related_modules": [
+        "gitlab_client.download_etl_file",
+        "batch_sync.sync_one"
+      ],
+      "symptom": "batch FAIL；GitLab 404；job_file_name 含尾部 D",
+      "shell_command_example": "/home/w/thrall/bin/w-run-task.sh dim_store/date_tag_di D",
+      "expected_gitlab_file": "dim_store_date_tag_di.job",
+      "parsed_job_file_wrong": "dim_store_date_tag_di D.job",
+      "root_cause": "runner 尾部单字母调度参数 D 未从 job_path 剥离",
+      "fix_hint": "runtime_parser._is_runtime_tail_token：len(tok)==1 and tok.isalpha()"
     },
     {
       "id": "gitlab_stale_project_need_alternate_etl_source",

@@ -118,11 +118,42 @@ def extract_gitlab_name(shell: str) -> str:
     return seg
 
 
+def _trim_runner_line_for_job_path(line: str) -> str:
+    """去掉 runner 行上的 ``||`` 降级与 shell 管道 ``|`` 右侧，避免污染 job_path。"""
+    line = re.split(r"\s*\|\|", line)[0].strip()
+    if "|" in line:
+        line = line.split("|", 1)[0].strip()
+    return line
+
+
+def _is_runtime_tail_token(tok: str) -> bool:
+    """runner 参数中 job_path 之后的调度/环境 token。"""
+    if tok in ("prod", "before", "after"):
+        return True
+    if tok.isdigit():
+        return True
+    if tok.startswith("--"):
+        return True
+    if re.match(r"^date\b", tok):
+        return True
+    if len(tok) == 1 and tok.isalpha():
+        return True
+    return False
+
+
+def _cut_rest_at_runtime_tokens(rest: str) -> str:
+    cut = len(rest)
+    for tok in rest.split():
+        if _is_runtime_tail_token(tok):
+            p = rest.find(tok)
+            if 0 <= p < cut:
+                cut = p
+    return rest[:cut].strip()
+
+
 def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
     """返回 (job_path, kind)，kind 为 'job' 或 'python'。"""
-    line = _last_runner_line(shell)
-    # 去掉 `|| echo "..."` 等尾部降级处理
-    line = re.split(r"\s*\|\|", line)[0].strip()
+    line = _trim_runner_line_for_job_path(_last_runner_line(shell))
 
     m = _RUNNER_RE.search(line)
     if not m:
@@ -141,12 +172,7 @@ def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
             p = rest.find(em)
             if 0 <= p < cut:
                 cut = p
-        for tok in rest.split():
-            if tok.startswith("--"):
-                p = rest.find(tok)
-                if 0 <= p < cut:
-                    cut = p
-        return rest[:cut].strip(), "python"
+        return _cut_rest_at_runtime_tokens(rest[:cut].strip()), "python"
 
     rest = tail
     # 截断反引号命令（如 `date -d "-0 day"`）及 $(...) 展开
@@ -157,13 +183,7 @@ def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
             rest = rest[:pos]
     rest = rest.strip()
 
-    cut = len(rest)
-    for tok in rest.split():
-        if tok in ("prod", "before", "after") or tok.isdigit() or tok.startswith("--") or re.match(r"^date\b", tok):
-            p = rest.find(tok)
-            if 0 <= p < cut:
-                cut = p
-    return rest[:cut].strip(), "job"
+    return _cut_rest_at_runtime_tokens(rest), "job"
 
 
 def extract_runtime_params(shell: str) -> Dict[str, str]:

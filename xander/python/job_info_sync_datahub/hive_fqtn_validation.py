@@ -10,6 +10,9 @@
    ``dw_v1`` 仅 1 个 ``_`` 不合法）。
 
 不通过则对应 fqtn 不写入（由 ``filter_table_lineages_by_hive_fqtn_rules`` 过滤）。
+
+LLM 解析阶段（``lineage_write_policy.llm_row_to_fqtn``）会将表名 ``not_verified_*`` 别名解析为
+去掉前缀后的真实 Hive 表名，再进入本模块校验。
 """
 
 from __future__ import annotations

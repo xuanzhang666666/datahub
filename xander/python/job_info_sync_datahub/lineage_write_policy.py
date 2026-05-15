@@ -30,6 +30,22 @@ from .models import TableLineage
 # LLM payload 解析（无 sqlglot 依赖）
 # --------------------------------------------------------------------------
 
+_NOT_VERIFIED_PREFIX = "not_verified_"
+
+
+def resolve_not_verified_table_alias(fqtn: str) -> str:
+    """``db.not_verified_<real_table>`` → ``db.<real_table>``；其它 fqtn 原样返回（小写）。"""
+    s = fqtn.strip().lower()
+    if s.count(".") != 1:
+        return s
+    db, tbl = s.split(".", 1)
+    if not db or not tbl:
+        return s
+    if tbl.startswith(_NOT_VERIFIED_PREFIX):
+        tbl = tbl[len(_NOT_VERIFIED_PREFIX) :]
+    return f"{db}.{tbl}" if tbl else ""
+
+
 def llm_row_to_fqtn(row: Any) -> Optional[str]:
     """将 LLM JSON 中的 ``{db, table}`` 转为小写 ``db.table``。
 
@@ -37,6 +53,7 @@ def llm_row_to_fqtn(row: Any) -> Optional[str]:
     - 若库名为空且 ``table`` 为单段 ``schema.table``，则拆成库、表。
     - 若已给出库名而 ``table`` 仍含 ``.``，视为不确定，返回 ``None``。
     - ``table`` 中含多个 ``.`` 且库名为空时，返回 ``None``。
+    - 表名以 ``not_verified_`` 开头时去掉该前缀（ETL 别名 → 真实 Hive 表名）。
     """
     if not isinstance(row, dict):
         return None
@@ -55,7 +72,10 @@ def llm_row_to_fqtn(row: Any) -> Optional[str]:
         db_raw, tbl_raw = a, b
     if not db_raw:
         db_raw = "default"
-    return f"{db_raw}.{tbl_raw}"
+    resolved = resolve_not_verified_table_alias(f"{db_raw}.{tbl_raw}")
+    if not resolved or resolved.endswith("."):
+        return None
+    return resolved
 
 
 def _tables_from_llm_payload(payload: Dict[str, Any]) -> Tuple[Set[str], Set[str]]:
