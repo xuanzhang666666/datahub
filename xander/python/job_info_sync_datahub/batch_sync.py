@@ -54,7 +54,7 @@ from .schedule_client import (
     fetch_all_job_metadata,
     fetch_job_metadata,
 )
-from .structured_properties import DEFAULT_EXTRACTORS, run_all_extractors
+from .structured_properties import collect_structured_properties_for_sync
 
 logger = get_logger("batch")
 
@@ -237,7 +237,14 @@ def sync_one(
         ctx.sql_blocks = []
         ctx.table_lineages = table_lineages
         ctx.field_lineages = field_lineages
-        props = run_all_extractors(ctx, DEFAULT_EXTRACTORS)
+        write_lineage = (
+            lineage_decision is not None and lineage_decision.write_upstream_lineage
+        )
+        props = collect_structured_properties_for_sync(
+            ctx,
+            table_lineages=table_lineages,
+            write_upstream_lineage=write_lineage,
+        )
         ctx.structured_properties = props
 
         # 5. 写入 DataHub

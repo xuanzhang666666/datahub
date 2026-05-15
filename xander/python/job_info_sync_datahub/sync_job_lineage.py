@@ -58,7 +58,7 @@ from .runtime_parser import (
     resolve_project_path,
 )
 from .schedule_client import fetch_job_metadata
-from .structured_properties import DEFAULT_EXTRACTORS, run_all_extractors
+from .structured_properties import collect_structured_properties_for_sync
 
 logger = get_logger("main")
 
@@ -322,7 +322,12 @@ def run(
 
     # ---- 4. 运行结构化属性 extractor ----
     logger.info("=== 阶段 4/5：结构化属性 extractors ===")
-    props = run_all_extractors(ctx, DEFAULT_EXTRACTORS)
+    write_lineage = lineage_decision is not None and lineage_decision.write_upstream_lineage
+    props = collect_structured_properties_for_sync(
+        ctx,
+        table_lineages=table_lineages,
+        write_upstream_lineage=write_lineage,
+    )
     ctx.structured_properties = props
     logger.info("结构化属性收集完成: %d 条", len(props))
 
