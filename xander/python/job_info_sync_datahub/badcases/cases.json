@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-05-15T13:56",
+  "cases": [
+    {
+      "id": "shell_pipe_echo_ignore_check",
+      "discovered_at": "2026-05-15",
+      "status": "open",
+      "component": "runtime_parser.extract_job_path_and_type",
+      "related_modules": [
+        "gitlab_client.download_etl_file",
+        "batch_sync.sync_one"
+      ],
+      "job_display_name": "pdw_bach_affair_baseinfo_sku_convert_particular_di",
+      "symptom": "batch FAIL；GitLab 404；fail_category 通常为 GITLAB_NOT_FOUND",
+      "log_snippet": "候选路径未命中，尝试全文搜索: file=pdw_bach_affair_baseinfo_sku_convert_particular_di | echo ignore check.job；err=所有候选路径均未找到文件: HTTP Error 404: Not Found",
+      "shell_command_pattern": "w-run-task.sh <job_path> | echo ignore check",
+      "shell_command_example": "/path/to/<gitlab_name>/bin/w-run-task.sh jobs/<dir>/pdw_bach_affair_baseinfo_sku_convert_particular_di | echo ignore check",
+      "expected_gitlab_file": "pdw_bach_affair_baseinfo_sku_convert_particular_di.job",
+      "parsed_job_file_wrong": "pdw_bach_affair_baseinfo_sku_convert_particular_di | echo ignore check.job",
+      "root_cause": "extract_job_path_and_type 仅对 || 截断，未对管道符 | 截断，把 | echo ignore check 并入 job_path / job_file_name",
+      "scheduling_behavior": "在真实 shell 中管道左侧 w-run-task.sh 仍会执行；| echo ignore check 常用于让整条命令退出码为 0（未设 pipefail 时）",
+      "frequency": "少见",
+      "fix_hint": "在解析 runner 行参数时，于首个未引用的 | 处截断（注意保留现有 || 处理）；截断后再生成 candidate_gitlab_paths"
+    },
+    {
+      "id": "gitlab_stale_project_need_alternate_etl_source",
+      "discovered_at": "2026-05-15",
+      "status": "open",
+      "component": "gitlab_client.download_etl_file",
+      "related_modules": [
+        "runtime_parser.resolve_project_path",
+        "batch_sync.sync_one"
+      ],
+      "category": "etl_source_unavailable_on_gitlab",
+      "symptom": "batch FAIL；候选路径 + GitLab 全文搜索均 404；fail_category 通常为 GITLAB_NOT_FOUND",
+      "log_snippet": "候选路径未命中，尝试全文搜索: file=<job>.job；err=所有候选路径均未找到文件: HTTP Error 404: Not Found",
+      "example_jobs": [
+        {
+          "job_display_name": "pdw_dt_gis_vi_recruit_candidate_v1_da",
+          "status": "FAIL",
+          "log_at": "2026-05-15T13:56:27"
+        },
+        {
+          "job_display_name": "pdw_dt_gis_vi_work_class_v1_da",
+          "job_file_searched": "pdw_dt_gis_vi_work_class_v1_da.job",
+          "log_at": "2026-05-15T13:56:28"
+        }
+      ],
+      "root_cause": "shell_command 指向的 GitLab 仓库/项目已不再维护或文件已迁出，当前仅走 GitLab API 拉取 ETL，仓库中无对应 .job 文件（解析文件名正确时仍 404）",
+      "distinction_from_shell_pipe_case": "本类 case 的 job_file_name 通常正确（如 pdw_dt_gis_vi_work_class_v1_da.job），与 shell_pipe_echo_ignore_check（文件名被 | 污染）不同",
+      "frequency": "部分 gis / 历史项目，批量中偶发",
+      "fix_hint": "待补充：从备用系统获取 ETL 脚本（非 GitLab）；需在 gitlab_client 或 batch_sync 增加第二数据源 fallback，具体接入方式由业务方后续说明",
+      "alternate_source": {
+        "system": "TBD",
+        "notes": "用户确认：部分 gitlab 项目不更新，需换另一系统取脚本；实现方案待定"
+      }
+    }
+  ]
+}

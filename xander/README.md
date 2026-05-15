@@ -21,6 +21,7 @@
   - `ingest_hive_table_list_to_datahub.sh`
   - `render_hive_ingest_recipe.py`（生成临时 recipe，**不依赖**手写 yml 模板即可跑）
 - **参考 recipe**（可选，与生成结果对照）：[`recipes/hive_ingest_one_database.yml`](recipes/hive_ingest_one_database.yml)
+- **表清单 xlsx（本地副本）**：[`in/`](in/)（如 [`in/20260512-hive-tables.xlsx`](in/20260512-hive-tables.xlsx)，对应线上 `HIVE_XLSX_IN`）
 
 ## 目录一览（精简后）
 
@@ -29,6 +30,7 @@
 | `python/scripts/` | `run_batch_lineage_sync.sh` |
 | `python/job_info_sync_datahub/` | 批量血缘 Python 包 |
 | `run/` | 上表 xlsx 串行 ingest 链路的 shell/py |
+| `in/` | Hive 表清单 **xlsx 输入**（与线上 `/data/datahub/in/` 对应，见 [`in/README.md`](in/README.md)） |
 | `recipes/` | 参考用 Hive ingest YAML |
 | `archive/` | 已下线脚本、旧文档、gms-es 实验、迁出的单测等（见 [`archive/README.md`](archive/README.md)） |
 
