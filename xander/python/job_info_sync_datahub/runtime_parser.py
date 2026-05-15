@@ -134,6 +134,9 @@ def _is_runtime_tail_token(tok: str) -> bool:
         return True
     if tok.startswith("--"):
         return True
+    # shell 变量（如 ``$DATABASE``），调度在执行前展开，不参与 job 路径与 .py/.job 文件名
+    if tok.startswith("$"):
+        return True
     if re.match(r"^date\b", tok):
         return True
     if len(tok) == 1 and tok.isalpha():
@@ -175,7 +178,7 @@ def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
         return _cut_rest_at_runtime_tokens(rest[:cut].strip()), "python"
 
     rest = tail
-    # 截断反引号命令（如 `date -d "-0 day"`）及 $(...) 展开
+    # 截断反引号命令（如 `date -d "-0 day"`）及 $(...) 展开；裸 ``$VAR`` 由 _cut_rest_at_runtime_tokens 处理
     backtick_pos = rest.find("`")
     dollar_pos = rest.find("$(")
     for pos in (backtick_pos, dollar_pos):
@@ -203,12 +206,31 @@ def job_file_name(job_path: str, kind: str) -> str:
 
 
 def resolve_project_path(gitlab_name: str) -> str:
-    if gitlab_name not in GITLAB_NAME_TO_PROJECT_PATH:
-        raise RuntimeError(
-            f"未知 gitlab_name={gitlab_name!r}；"
-            f"请在 runtime_parser.GITLAB_NAME_TO_PROJECT_PATH 中补充映射"
+    """返回 GitLab ``group/project``；未映射时若 localfolder 下存在同名目录则返回空串（仅走本地源）。
+
+    空串表示 ``resolve_etl_file`` 不调用 GitLab API，仅在 ``BLF_ETL_LOCAL_ROOT/<gitlab_name>/`` 下解析文件。
+    """
+    if gitlab_name in GITLAB_NAME_TO_PROJECT_PATH:
+        return GITLAB_NAME_TO_PROJECT_PATH[gitlab_name]
+    from .etl_file_resolver import get_local_root
+
+    root = get_local_root()
+    if root is not None and (root / gitlab_name).is_dir():
+        logger.info(
+            "gitlab_name=%s 未在 GITLAB_NAME_TO_PROJECT_PATH 中配置；"
+            "在 %s 下发现同名目录，仅使用 localfolder 拉取 ETL",
+            gitlab_name,
+            root,
         )
-    return GITLAB_NAME_TO_PROJECT_PATH[gitlab_name]
+        return ""
+    hint = (
+        f"未知 gitlab_name={gitlab_name!r}；请在 runtime_parser.GITLAB_NAME_TO_PROJECT_PATH 中补充映射，"
+        f"或在 {root}/{gitlab_name} 部署 localfolder 镜像目录（并确保 BLF_ETL_LOCAL_ROOT 有效）。"
+        if root is not None
+        else f"未知 gitlab_name={gitlab_name!r}；请补充 GITLAB_NAME_TO_PROJECT_PATH 映射，"
+        "或启用 BLF_ETL_LOCAL_ROOT 且同步对应目录。"
+    )
+    raise RuntimeError(hint)
 
 
 def parse_runtime_context(

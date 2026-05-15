@@ -1,6 +1,6 @@
 # xander（BLF DataHub / Hive 运维扩展）
 
-与官方 DataHub 发行无关的个人或团队扩展；**当前仅维护两条 Jenkins 任务**所用文件。
+与官方 DataHub 发行无关的个人或团队扩展；**当前维护若干 Jenkins 任务**所用文件（见下文）。
 
 ## Jenkins 任务与仓库路径
 
@@ -24,12 +24,37 @@
     export CONCURRENCY=10
     sh python/scripts/run_batch_lineage_sync_job_list.sh
     ```
-- **ETL 脚本双源**（neo4j2）：`BLF_ETL_LOCAL_ROOT=/localfolder`（默认）；目录名为 `shell_command` 中的 `gitlab_name`（如 `analysis-jobs`）。GitLab 与 local 均命中时内容相同用 GitLab，不同用 local。`BLF_ETL_LOCAL_DISABLE=1` 可仅走 GitLab。
+- **ETL 脚本双源**（neo4j2）：`BLF_ETL_LOCAL_ROOT=/localfolder`（默认）；目录名为 `shell_command` 中的 `gitlab_name`（如 `analysis-jobs`）。GitLab 与 local 均命中时内容相同用 GitLab，不同用 local。`BLF_ETL_LOCAL_DISABLE=1` 可仅走 GitLab。**未在 GitLab 映射表中的 `gitlab_name`**（如 `data_dev`、`data_shop`）：只要 `/localfolder/<gitlab_name>/` 目录存在，即仅从 localfolder 拉 ETL，不再要求配置 `GITLAB_NAME_TO_PROJECT_PATH`。
 - **Structured Properties**：`blf.data.schedule.execute_shell`（Execute Shell，富文本）须在 GMS 预建；仅当作业解析到表级血缘且 `write_upstream_lineage` 为真时写入 DMP 完整 `shell_command`。
 - **表名别名**：LLM 若解析到 `not_verified_<真实表名>`，写入前会去掉 `not_verified_` 前缀再校验并写血缘（与 HMS ingest 排除 `not_verified_.`* 一致）。
 - **shell 解析**：`w-run-task.sh` 后的单字母调度参数（如 `D`）与 `| ...` 管道不会进入 `.job` 文件名（见 `runtime_parser.extract_job_path_and_type`）。
 - **fqtn 表名**：仅字母/数字/下划线，且不能以数字开头（LLM 误解析的 `${date}`、`001_...` 等会被过滤）。
 - **本地调试**：`[python/scripts/debug_job_lineage.py](python/scripts/debug_job_lineage.py)`（或 `job_info_sync_datahub.debug_lineage`）分阶段输出 DMP / ETL / LLM / fqtn / Hive / URN，支持 `--format json`、多作业、`--llm-raw` 复用。
+
+### 1b）手动追加一条 Hive 表级上游血缘（Jenkins 参数）
+
+- **入口脚本**：`[python/scripts/run_add_manual_upstream_lineage.sh](python/scripts/run_add_manual_upstream_lineage.sh)`（服务器常见路径：`/data/datahub/scripts/run_add_manual_upstream_lineage.sh`，与批量任务同目录）
+- **Jenkins**：与 `run_batch_lineage_sync.sh` 一样用 **Execute shell** 里 `export` + `sh`；**不要**再写 `cd xander/python` / `PYTHONPATH=. python3 -m ...`。
+- **Jenkins 参数（建议「Choice」或「String」注入为环境变量）**：`TABLE_NAME`（下游）、`UPSTREAM_NAME`（上游）。**两者都必须为 `库.表`**（至少含一个 `.`），否则脚本直接报错退出；不支持仅表名、也不支持用环境变量补默认库。`DATAHUB_GMS_URL` / `DATAHUB_GMS_TOKEN` 可与批量任务相同：写在脚本同目录的 `lineage.env`（或 `LINEAGE_ENV_FILE` 指向的文件），本脚本会自动 `source`。
+- **表名格式**：`db.table`，多段库名可用 `catalog.db.table`。非法示例：`dw_order_v1`、`.tbl`、`db.`。
+- **行为**：默认**合并**已有 `upstreamLineage`（按 dataset URN 去重），并尽量保留 `fineGrainedLineages`。若该上游已存在则跳过。`REPLACE=1` 时等价 `--replace`（**仅保留本条上游**，清空其余表级与字段级血缘，慎用）。
+- **依赖**：`acryl-datahub`（含 `DataHubGraph`），与批量血缘相同；推荐 `export LINEAGE_PYTHON=/opt/anaconda3/bin/python`。
+
+**Jenkins Execute shell 示例**（对齐 `PREFIX` / `LINEAGE_PYTHON` 写法）：
+
+```bash
+export TABLE_NAME=dw.dw_order_v1
+export UPSTREAM_NAME=dw.dw_order_v1_archive
+# export DRY_RUN=1              # 试跑不写 GMS
+
+export LINEAGE_PYTHON=/opt/anaconda3/bin/python
+
+sh /data/datahub/scripts/run_add_manual_upstream_lineage.sh
+```
+
+若参数来自 Jenkins「参数化构建」，可写成：`export TABLE_NAME="${TABLE_NAME}"` 等。
+
+**本地 / 排障**（仍需 `PYTHONPATH` 时）：`cd xander/python && PYTHONPATH=. python3 -m job_info_sync_datahub.manual_upstream_lineage --table-name 库.表 --upstream-name 库.表`
 
 ### 2）Hive 表清单 xlsx → 切分 → 串行 ingest
 
@@ -48,7 +73,7 @@
 
 | 路径                              | 用途                                                                                |
 | ------------------------------- | --------------------------------------------------------------------------------- |
-| `python/scripts/`               | `run_batch_lineage_sync.sh`、`run_batch_lineage_sync_job_list.sh`                 |
+| `python/scripts/`               | `run_batch_lineage_sync.sh`、`run_batch_lineage_sync_job_list.sh`、`run_add_manual_upstream_lineage.sh` |
 | `python/job_info_sync_datahub/` | 批量血缘 Python 包                                                                     |
 | `run/`                          | 上表 xlsx 串行 ingest 链路的 shell/py                                                    |
 | `in/`                           | Hive 表清单 **xlsx 输入**（与线上 `/data/datahub/in/` 对应，见 `[in/README.md](in/README.md)`） |

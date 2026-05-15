@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
 from job_info_sync_datahub.runtime_parser import (
     candidate_gitlab_paths,
     extract_gitlab_name,
@@ -38,6 +43,27 @@ def test_extract_job_path_python_type() -> None:
     path, kind = extract_job_path_and_type(shell)
     assert path == "some/py_job"
     assert kind == "python"
+
+
+def test_extract_job_path_python_stops_at_shell_var() -> None:
+    """runner 行末尾 ``$DATABASE`` 等变量不参与路径，避免拼成错误的 .py 文件名。"""
+    shell = (
+        "/home/w/thrall/bin/w-run-task.sh python "
+        "dw_ordering/financial_calculation/base_index_fluc_di $DATABASE"
+    )
+    path, kind = extract_job_path_and_type(shell)
+    assert path == "dw_ordering/financial_calculation/base_index_fluc_di"
+    assert kind == "python"
+    assert job_file_name(path, kind) == (
+        "dw_ordering_financial_calculation_base_index_fluc_di.py"
+    )
+
+
+def test_extract_job_path_job_stops_at_shell_var() -> None:
+    shell = "/home/w/thrall/bin/w-run-task.sh dw_ordering/financial_calculation/base_index_fluc_di $DATABASE"
+    path, kind = extract_job_path_and_type(shell)
+    assert path == "dw_ordering/financial_calculation/base_index_fluc_di"
+    assert kind == "job"
 
 
 def test_extract_job_path_stops_at_flag() -> None:
@@ -84,6 +110,25 @@ def test_job_file_name_python() -> None:
 
 def test_resolve_known_gitlab_name() -> None:
     assert resolve_project_path("analysis-jobs") == "data/analysis-jobs"
+
+
+def test_resolve_unknown_gitlab_name_when_local_dir_exists_returns_empty() -> None:
+    """未映射的 gitlab_name：若 BLF_ETL_LOCAL_ROOT/<name> 为目录，则返回空 project_path（仅 local）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "data_dev").mkdir()
+        with patch.dict(os.environ, {"BLF_ETL_LOCAL_ROOT": str(tmp), "BLF_ETL_LOCAL_DISABLE": ""}):
+            assert resolve_project_path("data_dev") == ""
+
+
+def test_resolve_unknown_gitlab_name_raises_when_no_local_mirror() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.dict(os.environ, {"BLF_ETL_LOCAL_ROOT": str(tmp), "BLF_ETL_LOCAL_DISABLE": ""}):
+            try:
+                resolve_project_path("data_shop")
+                raise AssertionError("expected RuntimeError")
+            except RuntimeError as exc:
+                assert "data_shop" in str(exc)
 
 
 def test_candidate_paths_dedup() -> None:
