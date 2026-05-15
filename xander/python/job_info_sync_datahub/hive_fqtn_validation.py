@@ -8,6 +8,7 @@
    ``dwa`` / ``dwd`` / ``dim`` 之一开头；较长前缀优先匹配（如 ``dwa`` 先于 ``dw``）。
 4. **表名下划线**：表名中 ``_`` 出现次数 **≥ 2**（如 ``dw_order_v1``、``dw_order_ha_v1`` 合法；
    ``dw_v1`` 仅 1 个 ``_`` 不合法）。
+5. **表名标识符**：仅含字母、数字、下划线，且**不能以数字开头**（如含 ``${date}`` 或以 ``001_`` 开头不合法）。
 
 不通过则对应 fqtn 不写入（由 ``filter_table_lineages_by_hive_fqtn_rules`` 过滤）。
 
@@ -17,6 +18,7 @@ LLM 解析阶段（``lineage_write_policy.llm_row_to_fqtn``）会将表名 ``not
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from typing import Any, Dict, List, Tuple
 
@@ -93,6 +95,20 @@ _LAYER_PREFIXES_SORTED: Tuple[str, ...] = tuple(
     sorted(_LAYER_PREFIXES, key=lambda p: (-len(p), p))
 )
 
+_TABLE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _table_identifier_valid(table_name: str) -> Tuple[bool, str]:
+    """表名仅允许字母/数字/下划线，且不能以数字开头。"""
+    t = table_name.strip()
+    if not t:
+        return False, "empty"
+    if t[0].isdigit():
+        return False, "table_starts_with_digit"
+    if not _TABLE_IDENTIFIER_RE.match(t):
+        return False, "table_invalid_identifier"
+    return True, ""
+
 
 def _table_matches_layer_prefix(table_name: str) -> bool:
     t = table_name.strip().lower()
@@ -115,6 +131,9 @@ def is_valid_hive_fqtn(full_name: str) -> Tuple[bool, str]:
         return False, "empty_segment"
     if db not in _ALLOWED_HIVE_DATABASES:
         return False, "db_not_in_allowlist"
+    ok_id, id_code = _table_identifier_valid(tbl)
+    if not ok_id:
+        return False, id_code
     if not _table_matches_layer_prefix(tbl):
         return False, "table_not_layer_prefix"
     if tbl.count("_") < 2:

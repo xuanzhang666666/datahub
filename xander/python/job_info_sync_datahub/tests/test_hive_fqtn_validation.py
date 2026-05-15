@@ -25,6 +25,20 @@ def test_is_valid_rejects_tmp_table() -> None:
     assert is_valid_hive_fqtn("default.tmp_330") == (False, "table_not_layer_prefix")
 
 
+def test_rejects_table_with_shell_placeholder() -> None:
+    assert is_valid_hive_fqtn("default.tmp_product_sku_component_${date}") == (
+        False,
+        "table_invalid_identifier",
+    )
+
+
+def test_rejects_table_starting_with_digit() -> None:
+    assert is_valid_hive_fqtn("default.001_product_sku_component_") == (
+        False,
+        "table_starts_with_digit",
+    )
+
+
 def test_is_valid_rejects_dw_v1_one_underscore() -> None:
     assert is_valid_hive_fqtn("default.dw_v1") == (False, "table_underscore_lt2")
 

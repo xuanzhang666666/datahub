@@ -14,6 +14,7 @@
 - **Structured Properties**：`blf.data.schedule.execute_shell`（Execute Shell，富文本）须在 GMS 预建；仅当作业解析到表级血缘且 `write_upstream_lineage` 为真时写入 DMP 完整 `shell_command`。
 - **表名别名**：LLM 若解析到 `not_verified_<真实表名>`，写入前会去掉 `not_verified_` 前缀再校验并写血缘（与 HMS ingest 排除 `not_verified_.*` 一致）。
 - **shell 解析**：`w-run-task.sh` 后的单字母调度参数（如 `D`）与 `| ...` 管道不会进入 `.job` 文件名（见 `runtime_parser.extract_job_path_and_type`）。
+- **fqtn 表名**：仅字母/数字/下划线，且不能以数字开头（LLM 误解析的 `${date}`、``001_...`` 等会被过滤）。
 
 ### 2）Hive 表清单 xlsx → 切分 → 串行 ingest
 
