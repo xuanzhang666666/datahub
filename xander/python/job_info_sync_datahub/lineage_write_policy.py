@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .hive_fqtn_validation import filter_table_lineages_by_hive_fqtn_rules
+from .hive_table_existence import (
+    filter_lineages_require_full_hive_presence,
+    should_skip_hive_existence_check,
+)
 from .lineage_vote import full_names_to_refs
 from .models import TableLineage
 
@@ -24,6 +29,34 @@ from .models import TableLineage
 # --------------------------------------------------------------------------
 # LLM payload 解析（无 sqlglot 依赖）
 # --------------------------------------------------------------------------
+
+def llm_row_to_fqtn(row: Any) -> Optional[str]:
+    """将 LLM JSON 中的 ``{db, table}`` 转为小写 ``db.table``。
+
+    - 未给出库名或为空时，使用 ``default``。
+    - 若库名为空且 ``table`` 为单段 ``schema.table``，则拆成库、表。
+    - 若已给出库名而 ``table`` 仍含 ``.``，视为不确定，返回 ``None``。
+    - ``table`` 中含多个 ``.`` 且库名为空时，返回 ``None``。
+    """
+    if not isinstance(row, dict):
+        return None
+    db_raw = str(row.get("db") or "").strip().lower()
+    tbl_raw = str(row.get("table") or "").strip().lower()
+    if not tbl_raw:
+        return None
+    if "." in tbl_raw:
+        if db_raw:
+            return None
+        if tbl_raw.count(".") != 1:
+            return None
+        a, b = tbl_raw.split(".", 1)
+        if not a or not b:
+            return None
+        db_raw, tbl_raw = a, b
+    if not db_raw:
+        db_raw = "default"
+    return f"{db_raw}.{tbl_raw}"
+
 
 def _tables_from_llm_payload(payload: Dict[str, Any]) -> Tuple[Set[str], Set[str]]:
     """从 LLM JSON 得到 full_name 集合（无 sqlglot 依赖）。"""
@@ -34,13 +67,9 @@ def _tables_from_llm_payload(payload: Dict[str, Any]) -> Tuple[Set[str], Set[str
         if not isinstance(rows, list):
             return
         for row in rows:
-            if not isinstance(row, dict):
-                continue
-            db = str(row.get("db") or "default").strip() or "default"
-            tbl = str(row.get("table") or "").strip()
-            if not tbl:
-                continue
-            bucket.add(f"{db.lower()}.{tbl.lower()}")
+            fq = llm_row_to_fqtn(row)
+            if fq:
+                bucket.add(fq)
 
     _add(targets, payload.get("target_tables"))
     _add(ups, payload.get("upstream_tables"))
@@ -107,9 +136,11 @@ class LineageWriteDecision:
     sqlglot_upstreams: Set[str] = field(default_factory=set)
     deepseek_targets: Set[str] = field(default_factory=set)
     deepseek_upstreams: Set[str] = field(default_factory=set)
+    fqtn_validation: Optional[Dict[str, Any]] = None
+    hive_existence: Optional[Dict[str, Any]] = None
 
     def to_audit_dict(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "lineage_status": self.status,
             "lineage_reason": self.reason,
             "trust_score": self.trust_score,
@@ -122,6 +153,11 @@ class LineageWriteDecision:
             "targets_chosen": sorted(self.selected_targets),
             "sources_chosen": sorted(self.selected_upstreams),
         }
+        if self.fqtn_validation is not None:
+            out["fqtn_validation"] = self.fqtn_validation
+        if self.hive_existence is not None:
+            out["hive_existence"] = self.hive_existence
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -292,13 +328,6 @@ def _parse_lineage_array(raw: Dict[str, Any]) -> List[TableLineage]:
 
     支持新格式（lineage 数组）和旧格式（target_tables + upstream_tables 扁平列表）兜底。
     """
-    def _norm_name(row: Any) -> Optional[str]:
-        if not isinstance(row, dict):
-            return None
-        db = str(row.get("db") or "default").strip().lower() or "default"
-        tbl = str(row.get("table") or "").strip().lower()
-        return f"{db}.{tbl}" if tbl else None
-
     lineage_items = raw.get("lineage")
     if isinstance(lineage_items, list) and lineage_items:
         result: List[TableLineage] = []
@@ -306,12 +335,12 @@ def _parse_lineage_array(raw: Dict[str, Any]) -> List[TableLineage]:
         for item in lineage_items:
             if not isinstance(item, dict):
                 continue
-            tgt_name = _norm_name(item.get("target"))
+            tgt_name = llm_row_to_fqtn(item.get("target"))
             if not tgt_name:
                 continue
             up_names: Set[str] = set()
             for row in (item.get("upstreams") or []):
-                u = _norm_name(row)
+                u = llm_row_to_fqtn(row)
                 if u:
                     up_names.add(u)
             tgt_refs = full_names_to_refs({tgt_name})
@@ -354,15 +383,17 @@ def evaluate_llm_only(
     """仅用 LLM 提取表级血缘（不依赖 sqlglot）。
 
     LLM 返回 per-target lineage 数组，每个目标表有独立的上游表列表。
+    依次应用 fqtn 规则校验与 Hive 表存在性校验（可通过环境变量跳过存在性校验）。
     返回 (table_lineages, decision, raw_payload)。
     """
     from .lineage_llm_compare import call_llm_extract
 
     raw = call_llm_extract(etl_script, timeout_sec=timeout_sec, job_file_name=job_file_name)
-    table_lineages = _parse_lineage_array(raw)
+    parsed = _parse_lineage_array(raw)
+    ds_targets = {tl.target.full_name.lower() for tl in parsed}
+    ds_upstreams = {u.full_name.lower() for tl in parsed for u in tl.upstreams}
 
-    if not table_lineages:
-        # 汇总用于 decision 字段
+    if not parsed:
         _, du = _tables_from_llm_payload(raw)
         du = _norm(du)
         decision = LineageWriteDecision(
@@ -377,17 +408,91 @@ def evaluate_llm_only(
         )
         return [], decision, raw
 
+    table_lineages, fqtn_meta = filter_table_lineages_by_hive_fqtn_rules(parsed)
+    if not table_lineages:
+        decision = LineageWriteDecision(
+            write_upstream_lineage=False,
+            status="SKIP_INVALID_FQTN",
+            reason="LLM 表名未通过 fqtn 规则校验（库白名单/表层级前缀/下划线数量等），未写入血缘",
+            trust_score=0,
+            selected_targets=set(),
+            selected_upstreams=set(),
+            deepseek_targets=set(ds_targets),
+            deepseek_upstreams=set(ds_upstreams),
+            fqtn_validation=fqtn_meta,
+        )
+        return [], decision, raw
+
+    hive_exist_meta: Dict[str, Any]
+    if should_skip_hive_existence_check():
+        hive_exist_meta = {
+            "skipped": True,
+            "reason": "BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK",
+            "checked": False,
+        }
+    else:
+        table_lineages, hive_exist_meta = filter_lineages_require_full_hive_presence(table_lineages)
+
+    if not table_lineages:
+        if hive_exist_meta.get("error"):
+            decision = LineageWriteDecision(
+                write_upstream_lineage=False,
+                status="SKIP_HIVE_EXISTENCE_CHECK_FAILED",
+                reason="Hive 表存在性校验失败（Trino/元数据异常），未写入血缘",
+                trust_score=0,
+                selected_targets=set(),
+                selected_upstreams=set(),
+                deepseek_targets=set(ds_targets),
+                deepseek_upstreams=set(ds_upstreams),
+                fqtn_validation=fqtn_meta,
+                hive_existence=hive_exist_meta,
+            )
+        else:
+            decision = LineageWriteDecision(
+                write_upstream_lineage=False,
+                status="SKIP_HIVE_TABLE_NOT_FOUND",
+                reason="目标或上游在 Hive 中不存在（information_schema），未写入血缘",
+                trust_score=0,
+                selected_targets=set(),
+                selected_upstreams=set(),
+                deepseek_targets=set(ds_targets),
+                deepseek_upstreams=set(ds_upstreams),
+                fqtn_validation=fqtn_meta,
+                hive_existence=hive_exist_meta,
+            )
+        return [], decision, raw
+
     all_targets = {tl.target.full_name for tl in table_lineages}
     all_upstreams = {u.full_name for tl in table_lineages for u in tl.upstreams}
+    had_fqtn_filter = bool(
+        fqtn_meta.get("rejected_invalid_targets")
+        or fqtn_meta.get("dropped_targets_no_valid_upstream")
+        or fqtn_meta.get("stripped_invalid_upstreams")
+    )
+    had_hive_drop = bool(hive_exist_meta.get("removed_lineages"))
+    trust = 90
+    if had_fqtn_filter:
+        trust = 75
+    if had_hive_drop:
+        trust = min(trust, 70)
+    reason = (
+        f"LLM 提取到 {len(table_lineages)} 个目标表（已校验库白名单、表前缀、下划线及 Hive 存在性）"
+    )
+    if had_fqtn_filter:
+        reason += "；部分 fqtn 已按命名规则过滤"
+    if had_hive_drop:
+        reason += "；部分 lineage 因 Hive 中不存在整段丢弃"
     decision = LineageWriteDecision(
         write_upstream_lineage=True,
         status="LLM_EXTRACTED",
-        reason=f"LLM 提取到 {len(table_lineages)} 个目标表",
-        trust_score=90,
+        reason=reason,
+        trust_score=trust,
         selected_targets=all_targets,
         selected_upstreams=all_upstreams,
-        deepseek_targets=all_targets,
-        deepseek_upstreams=all_upstreams,
+        deepseek_targets=set(ds_targets),
+        deepseek_upstreams=set(ds_upstreams),
+        fqtn_validation=fqtn_meta,
+        hive_existence=hive_exist_meta,
     )
     return table_lineages, decision, raw
 

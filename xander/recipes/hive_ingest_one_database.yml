@@ -1,10 +1,20 @@
-# Hive Metastore (Thrift) — 将「单个 Hive 库」下全部表/视图同步到 DataHub。
+# Hive Metastore (Thrift) — 单库全量同步到 DataHub（参考配置）。
 #
-# 运行前由脚本 export HIVE_INGEST_DATABASE=<库名>（如 data_logistics、default）。
-# 临时表名过滤: tmp_ / bak_tmp / not_verified_ 前缀的表不入库（含 not_verified_tmp）。
-# include_column_lineage 为 false：减轻 HMS/CLI 负担；列级血缘可由其它 ingestion（如血缘脚本）维护。
+# 用法 A（整库，旧流程，脚本已归档）:
+#   见 xander/archive/deprecated-run/ingest_hive_database_to_datahub.sh
 #
-# 环境: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, HIVE_INGEST_DATABASE（必填）, 可选 DATAHUB_GMS_TOKEN
+# 用法 B（7w+ 等「只同步给定表名列表」，当前 Jenkins 推荐）:
+#   从 xlsx 串行 ingest:
+#     bash xander/run/ingest_hive_table_list_serial_from_xlsx.sh
+#   或单步:
+#     export HIVE_INGEST_TABLE_LIST_FILE=/path/tables.txt
+#     bash xander/run/ingest_hive_table_list_to_datahub.sh
+#   详见 xander/run/render_hive_ingest_recipe.py
+#
+# 临时表名过滤: tmp_ / temp_ / bak_tmp / not_verified_ 前缀不入库。
+# include_column_lineage: false — 列级血缘由其它 ingestion 维护。
+#
+# 环境: HMS_THRIFT_HOST, HMS_THRIFT_PORT, DATAHUB_GMS_URL, HIVE_INGEST_DATABASE（整库模式必填）, DATAHUB_GMS_TOKEN
 #
 source:
   type: hive-metastore
@@ -13,8 +23,7 @@ source:
     host_port: "${HMS_THRIFT_HOST}:${HMS_THRIFT_PORT}"
     use_kerberos: false
 
-    # 须与 job_info_sync_datahub / datahub_writer 的 platform_instance 一致，否则与血缘写入的
-    # URN（hive,blf-prod-hive.db.table,PROD）不是同一实体，UI 按实例筛选或搜表名会对不上。
+    # 须与 job_info_sync_datahub / datahub_writer 一致，否则 URN 与血缘不是同一 Dataset。
     platform_instance: "blf-prod-hive"
 
     env: PROD
@@ -26,6 +35,7 @@ source:
     database_pattern:
       allow:
         - "^${HIVE_INGEST_DATABASE}$"
+
     table_pattern:
       allow:
         - "^${HIVE_INGEST_DATABASE}\\..*$"

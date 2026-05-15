@@ -1,2 +1,5 @@
 # Local scratch / ES bulk exports (do not commit)
 tmp_*.ndjson
+python/.pytest_cache/
+python/.env
+python/job_info_sync_datahub.tar.gz

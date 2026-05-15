@@ -186,6 +186,7 @@ def sync_one(
         skip_upstream_lineage_reason = ""
         table_lineages: list = []
         field_lineages: list = []
+        lineage_decision = None
         try:
             table_lineages, lineage_decision, _llm_raw = evaluate_llm_only(
                 etl_content,
@@ -215,7 +216,11 @@ def sync_one(
         if not table_lineages:
             result["status"] = "SKIP"
             result["fail_category"] = None
-            result["error"] = "LLM 未提取到目标表"
+            result["error"] = (
+                lineage_decision.reason
+                if lineage_decision is not None and lineage_decision.reason
+                else (result.get("lineage_reason") or "LLM 未提取到目标表")
+            )
             result["elapsed"] = round(time.time() - t0, 1)
             return result
 

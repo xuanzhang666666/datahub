@@ -1,0 +1,40 @@
+---
+description: >-
+  After editing xander DataHub/Hive helper scripts or recipes for neo4j2, sync to the
+  server via put2 + bastion get2—do not wait for the user to ask each time.
+globs: xander/run/**,xander/recipes/**,xander/python/scripts/**,xander/python/job_info_sync_datahub/**
+alwaysApply: false
+---
+
+# xander → neo4j2 自动同步
+
+当本次对话中**修改或新增**了下列路径下的文件（且用途是 neo4j2 上 `/data/datahub/` 运维脚本/recipe）时，助手应在同一轮或收尾阶段**自行完成上传**，无需用户再说「传到服务器」：
+
+- `xander/run/` 下与 **xlsx 表清单、串行 ingest** 相关的 `*.sh`、`*.py`
+- `xander/python/scripts/run_batch_lineage_sync.sh` 及 `xander/python/job_info_sync_datahub/`（批量血缘包；大变更可打 tar 上传）
+- `xander/recipes/` 下会部署到主机的 `*.yml`（参考用，如 `hive_ingest_one_database.yml`）
+
+## 约定路径（目标机 neo4j2）
+
+| 本仓库 | 服务器 |
+| --- | --- |
+| `xander/run/*.sh`, `xander/run/*.py`（xlsx 串行 ingest 链路） | `/data/datahub/scripts/` |
+| `xander/python/scripts/*.sh` | `/data/datahub/scripts/` |
+| `xander/python/job_info_sync_datahub/`（目录或 tar 解压结果） | `/data/datahub/scripts/job_info_sync_datahub/` |
+| `xander/recipes/*.yml` | `/data/datahub/recipes/` |
+
+大体积二进制（如整包 xlsx）仅在任务明确要求或用户随对话提供路径时再传；日常以脚本/recipe 为主。
+
+## 传输方式（与 BLF FTP 一致）
+
+1. **扁平文件名**再 `put2`（路径含 `/` 易 553）：在 `/tmp` 下 `cp` 成短名，例如 `expxlsx.py`、`dh_ingest.sh`。
+2. 本机：`put2 <flatname>`
+3. 堡垒机：`ssh -i ~/.ssh/agent-bastion -p 7233 -o StrictHostKeyChecking=no agent@10.253.40.11 "@neo4j2.dp.data.bj1 get2 <flatname>"`
+4. `mv` 到上表绝对路径下的**最终文件名**（与仓库一致），**每条远程命令单独一条 ssh**（避免 `&&` 链，除非环境明确支持）。
+5. 对可执行脚本：`chmod +x /data/datahub/scripts/<file>.sh`（及需执行的 `.py` 若惯例如此）。
+
+若 `put2`/ssh 失败，在回复中说明错误与已尝试步骤；不要假定已同步。
+
+## 与本规则的关系
+
+仍遵守仓库内 `AGENTS.md` / `datahub-dev` 等通用规则；本规则仅补充 **xander 运维制品 → neo4j2** 的默认动作。
