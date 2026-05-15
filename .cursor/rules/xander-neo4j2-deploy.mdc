@@ -25,6 +25,8 @@ alwaysApply: false
 
 大体积二进制（如整包 xlsx）仅在任务明确要求或用户随对话提供路径时再传；日常以脚本/recipe 为主。
 
+**打包上传 `job_info_sync_datahub` 前**：在 `xander/python` 下运行 `sh scripts/run_job_info_sync_datahub_tests.sh`（需 pytest；见包内 `TESTING.md`），**通过后再** `put2` tar。
+
 ## 传输方式（与 BLF FTP 一致）
 
 1. **扁平文件名**再 `put2`（路径含 `/` 易 553）：在 `/tmp` 下 `cp` 成短名，例如 `expxlsx.py`、`dh_ingest.sh`。

@@ -66,6 +66,53 @@ def test_extract_job_path_job_stops_at_shell_var() -> None:
     assert kind == "job"
 
 
+def test_extract_job_path_job_multiline_two_spaces_before_dollar() -> None:
+    """DMP 常见：路径与 ``$DATABASE`` 间多个空格，下一行 ``# echo``；须仍能解析 .job 基名。"""
+    shell = (
+        "/home/w/thrall/bin/w-run-task.sh dw_ordering/financial_calculation/base_index_data_da  $DATABASE\n"
+        "# echo 1 \n"
+    )
+    path, kind = extract_job_path_and_type(shell)
+    assert path == "dw_ordering/financial_calculation/base_index_data_da"
+    assert kind == "job"
+    assert job_file_name(path, kind) == "dw_ordering_financial_calculation_base_index_data_da.job"
+
+
+def test_extract_job_path_job_glued_dollar_var() -> None:
+    """路径与变量粘连（无空白）时仍截断。"""
+    shell = "/home/w/thrall/bin/w-run-task.sh dw_ordering/financial_calculation/base_index_data_da$DATABASE"
+    path, kind = extract_job_path_and_type(shell)
+    assert path == "dw_ordering/financial_calculation/base_index_data_da"
+    assert kind == "job"
+
+
+def test_extract_job_path_job_nbsp_before_dollar() -> None:
+    """非常规空白（NBSP）分隔时，``split()`` 拆不出 ``$`` token，须靠正则截断。"""
+    nbsp = "\u00a0"
+    shell = f"/home/w/thrall/bin/w-run-task.sh dw_ordering/financial_calculation/base_index_data_da{nbsp}$DATABASE"
+    path, kind = extract_job_path_and_type(shell)
+    assert path == "dw_ordering/financial_calculation/base_index_data_da"
+    assert kind == "job"
+
+
+def test_extract_job_path_python_stops_at_first_shell_var() -> None:
+    """多个 ``$VAR`` 时截断在第一个变量前。"""
+    shell = (
+        "/home/w/thrall/bin/w-run-task.sh python "
+        "dw_ordering/financial_calculation/base_index_fluc_di $DATE $DATABASE"
+    )
+    path, kind = extract_job_path_and_type(shell)
+    assert path == "dw_ordering/financial_calculation/base_index_fluc_di"
+    assert kind == "python"
+
+
+def test_extract_job_path_python_stops_at_braced_var() -> None:
+    shell = "/home/w/thrall/bin/w-run-task.sh python foo/bar_task ${DATE}"
+    path, kind = extract_job_path_and_type(shell)
+    assert path == "foo/bar_task"
+    assert kind == "python"
+
+
 def test_extract_job_path_stops_at_flag() -> None:
     shell = "/home/data/analysis-jobs/bin/w-run-task.sh some/job --hive_table_name=foo prod"
     path, kind = extract_job_path_and_type(shell)

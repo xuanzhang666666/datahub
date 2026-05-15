@@ -154,6 +154,20 @@ def _cut_rest_at_runtime_tokens(rest: str) -> str:
     return rest[:cut].strip()
 
 
+# 路径与 ``$VAR`` / ``${VAR}`` 之间可能没有空白、或仅有非常规空白，仅靠 ``str.split()`` 无法拆出独立 ``$`` token。
+_SHELL_VAR_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*\b|\$\d+\b")
+
+
+def _strip_shell_var_suffix(rest: str) -> str:
+    """去掉从首个 shell 变量（``$VAR`` / ``${VAR}`` / ``$1``）起到行尾的内容（含与路径粘连的 ``foo$DATABASE``）。"""
+    if not rest or "$" not in rest:
+        return rest.strip()
+    m = _SHELL_VAR_RE.search(rest)
+    if not m:
+        return rest.strip()
+    return rest[: m.start()].rstrip()
+
+
 def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
     """返回 (job_path, kind)，kind 为 'job' 或 'python'。"""
     line = _trim_runner_line_for_job_path(_last_runner_line(shell))
@@ -175,16 +189,19 @@ def extract_job_path_and_type(shell: str) -> Tuple[str, str]:
             p = rest.find(em)
             if 0 <= p < cut:
                 cut = p
-        return _cut_rest_at_runtime_tokens(rest[:cut].strip()), "python"
+        rest = rest[:cut].strip()
+        rest = _strip_shell_var_suffix(rest)
+        return _cut_rest_at_runtime_tokens(rest), "python"
 
     rest = tail
-    # 截断反引号命令（如 `date -d "-0 day"`）及 $(...) 展开；裸 ``$VAR`` 由 _cut_rest_at_runtime_tokens 处理
+    # 截断反引号命令（如 `date -d "-0 day"`）及 $(...) 展开；裸 ``$VAR`` 由 _strip_shell_var_suffix + _cut_rest_at_runtime_tokens 处理
     backtick_pos = rest.find("`")
     dollar_pos = rest.find("$(")
     for pos in (backtick_pos, dollar_pos):
         if pos > 0:
             rest = rest[:pos]
     rest = rest.strip()
+    rest = _strip_shell_var_suffix(rest)
 
     return _cut_rest_at_runtime_tokens(rest), "job"
 

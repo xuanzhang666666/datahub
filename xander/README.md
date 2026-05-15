@@ -8,7 +8,8 @@
 
 - **入口脚本**：`[python/scripts/run_batch_lineage_sync.sh](python/scripts/run_batch_lineage_sync.sh)`  
 服务器常见路径：`/data/datahub/scripts/run_batch_lineage_sync.sh`
-- **Python 包**：`[python/job_info_sync_datahub/](python/job_info_sync_datahub/)`（与脚本同级的 `job_info_sync_datahub/` 目录，或 `JOB_INFO_SYNC_DIR`）
+- **Python 包**：`[python/job_info_sync_datahub/](python/job_info_sync_datahub/)`（与脚本同级的 `job_info_sync_datahub/` 目录，或 `JOB_INFO_SYNC_DIR`）；逻辑与测试说明见包内 **`ARCHITECTURE.md`**、**`TESTING.md`**。
+- **修改包后、上传 neo4j2 前**：在 `xander/python` 下执行 **`sh scripts/run_job_info_sync_datahub_tests.sh`**（需 pytest；默认只跑不依赖 trino 的门禁用例，通过后再 `put2`）。
 - **环境变量示例**：`PREFIX`、`CONCURRENCY`、`LINEAGE_PYTHON` 等（见脚本内注释）
 - **按作业名单重跑**（不用 `PREFIX`，独立报告，默认强制重跑）：
   - **入口脚本**：`[python/scripts/run_batch_lineage_sync_job_list.sh](python/scripts/run_batch_lineage_sync_job_list.sh)`
@@ -27,9 +28,10 @@
 - **ETL 脚本双源**（neo4j2）：`BLF_ETL_LOCAL_ROOT=/localfolder`（默认）；目录名为 `shell_command` 中的 `gitlab_name`（如 `analysis-jobs`）。GitLab 与 local 均命中时内容相同用 GitLab，不同用 local。`BLF_ETL_LOCAL_DISABLE=1` 可仅走 GitLab。**未在 GitLab 映射表中的 `gitlab_name`**（如 `data_dev`、`data_shop`）：只要 `/localfolder/<gitlab_name>/` 目录存在，即仅从 localfolder 拉 ETL，不再要求配置 `GITLAB_NAME_TO_PROJECT_PATH`。
 - **Structured Properties**：`blf.data.schedule.execute_shell`（Execute Shell，富文本）须在 GMS 预建；仅当作业解析到表级血缘且 `write_upstream_lineage` 为真时写入 DMP 完整 `shell_command`。
 - **表名别名**：LLM 若解析到 `not_verified_<真实表名>`，写入前会去掉 `not_verified_` 前缀再校验并写血缘（与 HMS ingest 排除 `not_verified_.`* 一致）。
-- **shell 解析**：`w-run-task.sh` 后的单字母调度参数（如 `D`）与 `| ...` 管道不会进入 `.job` 文件名（见 `runtime_parser.extract_job_path_and_type`）。
+- **shell 解析**：`w-run-task.sh` 后的单字母分区、`| …` 管道、**`$VAR` / `${VAR}`**（含与路径**无空白粘连**、或**非常规空白**分隔）均不会进入 `.job`/`.py` 基名（见 `runtime_parser._strip_shell_var_suffix` 与 `extract_job_path_and_type`）。
 - **fqtn 表名**：仅字母/数字/下划线，且不能以数字开头（LLM 误解析的 `${date}`、`001_...` 等会被过滤）。
 - **本地调试**：`[python/scripts/debug_job_lineage.py](python/scripts/debug_job_lineage.py)`（或 `job_info_sync_datahub.debug_lineage`）分阶段输出 DMP / ETL / LLM / fqtn / Hive / URN，支持 `--format json`、多作业、`--llm-raw` 复用。
+- **调度 shell 批量解析作业文件名**（对照血缘逻辑）：`[python/scripts/jenkins_shell_to_jobfile_report.py](python/scripts/jenkins_shell_to_jobfile_report.py)` — 读 xlsx 第 1 列 job 名、第 2 列 `shell_command`，输出 `job_file_name` / `first_gitlab_candidate` / `status`（`ok` / `no_runner` / `parse_job_path` 等）到结果 xlsx，便于统计「本应能解析却找不到 .job/.py」的作业。
 
 ### 1b）手动追加一条 Hive 表级上游血缘（Jenkins 参数）
 
@@ -73,7 +75,7 @@ sh /data/datahub/scripts/run_add_manual_upstream_lineage.sh
 
 | 路径                              | 用途                                                                                |
 | ------------------------------- | --------------------------------------------------------------------------------- |
-| `python/scripts/`               | `run_batch_lineage_sync.sh`、`run_batch_lineage_sync_job_list.sh`、`run_add_manual_upstream_lineage.sh` |
+| `python/scripts/`               | `run_batch_lineage_sync.sh`、`run_batch_lineage_sync_job_list.sh`、`run_add_manual_upstream_lineage.sh`、`run_job_info_sync_datahub_tests.sh`（上传前跑测试） |
 | `python/job_info_sync_datahub/` | 批量血缘 Python 包                                                                     |
 | `run/`                          | 上表 xlsx 串行 ingest 链路的 shell/py                                                    |
 | `in/`                           | Hive 表清单 **xlsx 输入**（与线上 `/data/datahub/in/` 对应，见 `[in/README.md](in/README.md)`） |
@@ -87,4 +89,4 @@ sh /data/datahub/scripts/run_add_manual_upstream_lineage.sh
 
 ## neo4j2 部署约定
 
-脚本/py 拷到 `/data/datahub/scripts/`，参考 recipe 可拷到 `/data/datahub/recipes/`。内网用 **put2 → get2** 同步，详见 `.cursor/rules/xander-neo4j2-deploy.mdc`。
+脚本/py 拷到 `/data/datahub/scripts/`，参考 recipe 可拷到 `/data/datahub/recipes/`。内网用 **put2 → get2** 同步，详见 `.cursor/rules/xander-neo4j2-deploy.mdc`。**打包上传 `job_info_sync_datahub` 前**，建议在服务器或本机（含 pytest 的 Python）执行：`cd /data/datahub/scripts` 所在仓库镜像目录下的 `xander/python`，运行 `sh scripts/run_job_info_sync_datahub_tests.sh`（或设 `LINEAGE_PYTHON`），通过后再传 tar。
