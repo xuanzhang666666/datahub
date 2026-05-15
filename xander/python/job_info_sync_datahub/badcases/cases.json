@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-05-15T13:56",
+  "updated_at": "2026-05-15T16:00",
   "cases": [
     {
       "id": "shell_pipe_echo_ignore_check",
@@ -26,9 +26,10 @@
     {
       "id": "gitlab_stale_project_need_alternate_etl_source",
       "discovered_at": "2026-05-15",
-      "status": "open",
-      "component": "gitlab_client.download_etl_file",
+      "status": "fixed",
+      "component": "etl_file_resolver.resolve_etl_file",
       "related_modules": [
+        "gitlab_client.download_etl_file",
         "runtime_parser.resolve_project_path",
         "batch_sync.sync_one"
       ],
@@ -50,10 +51,11 @@
       "root_cause": "shell_command 指向的 GitLab 仓库/项目已不再维护或文件已迁出，当前仅走 GitLab API 拉取 ETL，仓库中无对应 .job 文件（解析文件名正确时仍 404）",
       "distinction_from_shell_pipe_case": "本类 case 的 job_file_name 通常正确（如 pdw_dt_gis_vi_work_class_v1_da.job），与 shell_pipe_echo_ignore_check（文件名被 | 污染）不同",
       "frequency": "部分 gis / 历史项目，批量中偶发",
-      "fix_hint": "待补充：从备用系统获取 ETL 脚本（非 GitLab）；需在 gitlab_client 或 batch_sync 增加第二数据源 fallback，具体接入方式由业务方后续说明",
+      "fix_hint": "已实现 etl_file_resolver：BLF_ETL_LOCAL_ROOT=/localfolder/{gitlab_name}/... 与 GitLab 双源合并",
       "alternate_source": {
-        "system": "TBD",
-        "notes": "用户确认：部分 gitlab 项目不更新，需换另一系统取脚本；实现方案待定"
+        "system": "localfolder",
+        "path": "/localfolder/{gitlab_name}/",
+        "notes": "neo4j2 项目镜像；与 GitLab 按 merge 规则选用"
       }
     }
   ]

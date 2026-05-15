@@ -224,7 +224,8 @@ def run(
                 job_path,
             )
         else:
-            used_path, etl_content = download_etl_file(
+            used_path, etl_content, etl_source = download_etl_file(
+                gitlab_name=gitlab_name,
                 project_path=project_path,
                 candidate_paths=candidates,
                 job_file_name=jfn,
@@ -232,7 +233,7 @@ def run(
                 explicit_path=gitlab_file_path,
                 token=gitlab_token,
             )
-            logger.info("GitLab 文件拉取成功: %s", used_path)
+            logger.info("ETL 文件拉取成功: path=%s source=%s", used_path, etl_source)
 
         ctx.runtime = parse_runtime_context(
             job_display_name=job_display_name,

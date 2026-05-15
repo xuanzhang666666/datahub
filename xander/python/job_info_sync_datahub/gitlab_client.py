@@ -1,8 +1,12 @@
-"""gitlab_client — 从 GitLab API 拉取 ETL 脚本文件。
+"""gitlab_client — GitLab API 与双源 ETL 解析入口。
+
+ETL 脚本默认经 etl_file_resolver 同时查 GitLab 与 neo4j2 localfolder（BLF_ETL_LOCAL_ROOT，默认 /localfolder）。
 
 依赖：Python 标准库 urllib（无第三方依赖）
 环境变量：
   BLF_GITLAB_PRIVATE_TOKEN  私有仓库必填
+  BLF_ETL_LOCAL_ROOT        本地项目镜像根，默认 /localfolder
+  BLF_ETL_LOCAL_DISABLE=1   仅使用 GitLab
   BLF_GITLAB_SSL_VERIFY     未设置时：若 API 为 git.corp.bianlifeng.com 则默认不校验证书（Jenkins+Anaconda 常见缺链）。
                             设为 1/true/on 强制校验；设为 0/false/off 显式关闭校验。
   BLF_GITLAB_CA_BUNDLE      企业根 CA 的 PEM；强制校验时会读 BLF_GITLAB_CA_BUNDLE / SSL_CERT_FILE / REQUESTS_CA_BUNDLE，
@@ -132,6 +136,26 @@ def get_file_content(
     return base64.b64decode(b64).decode("utf-8", errors="replace")
 
 
+def try_gitlab_file_at_path(
+    project_id: int,
+    file_path: str,
+    ref: str,
+    token: Optional[str] = None,
+) -> Optional[str]:
+    """拉取单路径文件；404 返回 None，其它 HTTP 错误向上抛出。"""
+    alt_ref = "main" if ref == "master" else "master"
+    for r in (ref, alt_ref):
+        try:
+            content = get_file_content(project_id, file_path, r, token)
+            logger.debug("GitLab 文件获取成功: path=%s ref=%s", file_path, r)
+            return content
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            raise
+    return None
+
+
 def try_file_paths(
     project_id: int,
     paths: Iterable[str],
@@ -189,38 +213,23 @@ def search_blob_paths(
 
 
 def download_etl_file(
+    gitlab_name: str,
     project_path: str,
     candidate_paths: List[str],
     job_file_name: str,
     ref: str = "master",
     explicit_path: Optional[str] = None,
     token: Optional[str] = None,
-) -> Tuple[str, str]:
-    """完整的 ETL 文件拉取逻辑，返回 (used_path, content)。
+) -> Tuple[str, str, str]:
+    """双源解析 ETL 文件（localfolder + GitLab），返回 (display_path, content, source_tag)。"""
+    from .etl_file_resolver import resolve_etl_file
 
-    流程：
-    1. 获取 project id
-    2. 使用 explicit_path 或 candidate_paths 逐一尝试
-    3. 若全部 404，尝试全文搜索兜底
-    """
-    if token is None:
-        token = _get_token()
-
-    logger.debug(
-        "开始拉取 GitLab 文件: project=%s candidates=%s ref=%s",
-        project_path,
-        candidate_paths,
-        ref,
+    return resolve_etl_file(
+        gitlab_name=gitlab_name,
+        project_path=project_path,
+        candidate_paths=candidate_paths,
+        job_file_name=job_file_name,
+        ref=ref,
+        explicit_path=explicit_path,
+        token=token,
     )
-
-    pid = get_project_id(project_path, token)
-    paths_to_try = [explicit_path] if explicit_path else candidate_paths
-
-    try:
-        return try_file_paths(pid, paths_to_try, ref, token)
-    except RuntimeError as first_err:
-        logger.warning("候选路径未命中，尝试全文搜索: file=%s", job_file_name)
-        found = search_blob_paths(pid, job_file_name, ref, token)
-        if not found:
-            raise first_err
-        return try_file_paths(pid, found, ref, token)

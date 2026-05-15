@@ -143,6 +143,8 @@ def sync_one(
         "lineage_targets_chosen": None,
         "lineage_sources_chosen": None,
         "trust_score": None,
+        "etl_file_path": None,
+        "etl_file_source": None,
     }
     t0 = time.time()
     try:
@@ -159,21 +161,26 @@ def sync_one(
         if is_inline:
             etl_content = metadata.shell_command
             used_path = "<inline>"
+            result["etl_file_path"] = used_path
+            result["etl_file_source"] = "inline"
         else:
-            # 有 runner 调用，从 GitLab 拉取文件
+            # 有 runner 调用，从 GitLab / localfolder 双源拉取
             gitlab_name = extract_gitlab_name(metadata.shell_command)
             project_path = resolve_project_path(gitlab_name)
             job_path, kind = extract_job_path_and_type(metadata.shell_command)
             jfn = job_file_name(job_path, kind)
             job_dir = get_job_dir_name(metadata.shell_command)
             candidates = candidate_gitlab_paths(job_path, jfn, job_dir)
-            used_path, etl_content = download_etl_file(
+            used_path, etl_content, etl_source = download_etl_file(
+                gitlab_name=gitlab_name,
                 project_path=project_path,
                 candidate_paths=candidates,
                 job_file_name=jfn,
                 ref="master",
                 token=gitlab_token,
             )
+            result["etl_file_path"] = used_path
+            result["etl_file_source"] = etl_source
 
         # 3. LLM 表级血缘提取
         from .lineage_write_policy import (
@@ -353,13 +360,20 @@ def run_batch(
                 tgt = res.get("target_table") or "-"
                 upc = res.get("upstream_count", 0)
                 err = (res.get("error") or "")[:120]
+                etl_src = res.get("etl_file_source")
+                etl_path = res.get("etl_file_path")
+                etl_part = ""
+                if etl_src or etl_path:
+                    etl_part = f" etl_src={etl_src or '-'} etl={etl_path or '-'}"
                 extra = ""
                 if st == "FAIL" and err:
-                    extra = f" err={err!r}"
+                    extra = f" err={err!r}{etl_part}"
                 elif ls not in (None, "-", "") and ls != "LLM_POLICY_ERROR":
-                    extra = f" lineage={ls} trust={trust_s}"
+                    extra = f" lineage={ls} trust={trust_s}{etl_part}"
                 elif ls == "LLM_POLICY_ERROR" and err:
-                    extra = f" lineage={ls} err={err!r}"
+                    extra = f" lineage={ls} err={err!r}{etl_part}"
+                elif etl_part:
+                    extra = etl_part
                 logger.info(
                     "[PROGRESS] %d/%d job=%s status=%s elapsed=%ss target=%s upstreams=%d OK=%d SKIP=%d FAIL=%d%s",
                     completed_count,
