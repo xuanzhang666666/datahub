@@ -14,8 +14,13 @@ sh scripts/run_job_info_sync_datahub_tests.sh
 cd xander/python
 export PYTHONPATH=.
 pytest job_info_sync_datahub/tests/test_runtime_parser.py \
-  job_info_sync_datahub/tests/test_manual_upstream_lineage.py -q
+  job_info_sync_datahub/tests/test_manual_upstream_lineage.py \
+  job_info_sync_datahub/tests/test_two_stage_tmp_lineage_contract.py -q
 ```
+
+### 两段 SQL + `tmp_*` 中间表（LLM 契约）
+
+先 `CREATE`/`INSERT` 临时表（如 `default.tmp_mid_*`）、再写正式分层表时，下游血缘写入前会做 **fqtn 校验**：`tmp_*` 不是合法层级前缀，会被整段丢弃或从 upstreams 剥除。DeepSeek 的 **`SYSTEM_PROMPT`**（[`lineage_llm_compare.py`](lineage_llm_compare.py)）要求模型：**target 仅最终落表**；**upstreams 不含 `tmp_*`**，并把前段 SQL 读过的持久化表与后段合并（跨段折叠）。理想 JSON 形态见单测 [`tests/test_two_stage_tmp_lineage_contract.py`](tests/test_two_stage_tmp_lineage_contract.py)。
 
 ### 默认门禁 vs 全量
 

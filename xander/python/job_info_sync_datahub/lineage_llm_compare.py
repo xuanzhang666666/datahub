@@ -110,7 +110,12 @@ SYSTEM_PROMPT = """你是数据平台工程师，擅长阅读 Hive/Spark SQL、s
 - upstreams：该目标表对应 SQL 中 FROM/JOIN/子查询读取的物理表；排除 WITH/CTE 别名；排除明显临时变量占位；全部小写。
 - 若脚本写入多个目标表，每个目标表单独列一条 lineage 条目，各自只列与该 SQL 语句相关的上游表。
 - 若同一目标表被多条 SQL 写入，合并为一条，upstreams 取并集。
-- 脚本可能已按 '-- SQL 段 N --' 标注分段，每段对应一条写入语句，请按段分别提取各自的 target 和 upstreams。"""
+- 脚本可能已按 '-- SQL 段 N --' 标注分段，每段对应一条写入语句，请按段分别提取各自的 target 和 upstreams。
+- 多段 SQL（先 CREATE/INSERT 临时表、再写正式分层表）时：以**最终持久化落表**为 target（如 mid_*、dw_*、pdw_* 等）；以 tmp_ 开头或明显作业内临时表（含 tmp_mid_*）的写入目标**不得**作为 lineage[].target。
+- upstreams 中**不得**出现以 tmp_ 开头的表名。若后段仅从临时表读取再写入最终表，须结合**同脚本更早 SQL 段**追溯该临时表在 FROM/JOIN 中实际读取的持久化表，将其并入最终 target 的 upstreams（跨段折叠、去重），不要把临时表本身列入 upstreams。
+- 前段写临时表、后段写最终表时，lineage 中**至少一条** target 为最终表，其 upstreams =（后段直接读取的物理表）∪（前段构建临时表所读取的物理表），合并去重；除仅有临时表且无最终落表、须在 notes 说明的情况外，不要仅为临时表单独留一条 lineage。
+- target 与 upstreams 中的表名须为数据分层可接受的前缀（如 dm/ods/pdw/pdim/app/dw/mid/ai/dwa/dwd/dim 等），**禁止**把 tmp_* 写入 target 或 upstreams。
+- 动态表名、${var} 等无法确定处写在 notes；拿不准的物理表宁可少写也不要编造库表名。"""
 
 
 def _build_user_message(etl_script: str, max_chars: int = 120_000, job_file_name: str = "") -> str:
