@@ -36,23 +36,23 @@ class TestEnsureUpstreamDataset(unittest.TestCase):
         self.assertFalse(ingested)
         self.assertIn("已在", msg)
 
-    def test_ingest_when_missing(self) -> None:
+    def test_minimal_register_when_missing(self) -> None:
         ref = TableRef("default", "static_mid_store_info_hd")
         with patch(
             "job_info_sync_datahub.hive_single_table_ingest.dataset_entity_exists",
-            return_value=False,
+            side_effect=[False, True],
         ):
             with patch(
-                "job_info_sync_datahub.hive_single_table_ingest.ingest_single_hive_table",
-            ) as ingest_mock:
+                "job_info_sync_datahub.hive_single_table_ingest.register_minimal_hive_dataset",
+            ) as reg_mock:
                 ingested, msg = ensure_upstream_dataset_in_datahub(
                     ref,
                     gms_url="http://127.0.0.1:8080",
                     dry_run=False,
                 )
         self.assertTrue(ingested)
-        ingest_mock.assert_called_once()
-        self.assertIn("ingest", msg)
+        reg_mock.assert_called_once()
+        self.assertIn("轻量注册", msg)
 
     def test_skip_ingest_env(self) -> None:
         ref = TableRef("default", "x")

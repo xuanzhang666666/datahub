@@ -38,11 +38,13 @@ if [[ "${FULL_TESTS:-0}" == "1" ]]; then
   echo "[INFO] FULL_TESTS=1 → 运行全部 job_info_sync_datahub/tests/"
   "$PYTHON" -m pytest job_info_sync_datahub/tests/ -q "$@"
 else
-  echo "[INFO] 默认门禁 → runtime_parser + manual_upstream + hive_single_table_ingest + two_stage_tmp"
+  echo "[INFO] 默认门禁 → runtime_parser + manual_upstream + hive ingest + two_stage_tmp"
   "$PYTHON" -m pytest \
     job_info_sync_datahub/tests/test_runtime_parser.py \
     job_info_sync_datahub/tests/test_manual_upstream_lineage.py \
     job_info_sync_datahub/tests/test_hive_single_table_ingest.py \
+    job_info_sync_datahub/tests/test_hive_jobs_table_ingest.py \
+    job_info_sync_datahub/tests/test_hive_ingest_mode.py \
     job_info_sync_datahub/tests/test_two_stage_tmp_lineage_contract.py \
     -q "$@"
 fi

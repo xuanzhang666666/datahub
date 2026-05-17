@@ -58,6 +58,22 @@ sh /data/datahub/scripts/run_add_manual_upstream_lineage.sh
 
 **本地 / 排障**（仍需 `PYTHONPATH` 时）：`cd xander/python && PYTHONPATH=. python3 -m job_info_sync_datahub.manual_upstream_lineage --table-name 库.表 --upstream-name 库.表`
 
+### 1c）Jenkins：按 JOBS 参数同步指定 Hive 表到 DataHub
+
+- **入口脚本**：`[python/scripts/run_jenkins_hive_table_ingest_from_jobs.sh](python/scripts/run_jenkins_hive_table_ingest_from_jobs.sh)`  
+  服务器路径：`/data/datahub/scripts/run_jenkins_hive_table_ingest_from_jobs.sh`
+- **Jenkins 参数**：**Multi-line String `JOBS`**，每行一张表 `库.表`（如 `data_sec_dw.dim_store_info`）；也支持仅表名（需 `HIVE_INGEST_IMPLICIT_DATABASE`）。
+- **行为**：名单中每张表若已在 DataHub → **hard delete** → 再 **批量 HMS ingest**；**不做** fqtn 层级前缀等表名校验。
+- **Execute shell 示例**：
+
+```bash
+export JOBS="${JOBS}"
+export LINEAGE_PYTHON=/opt/anaconda3/bin/python
+export DATAHUB_GMS_URL=http://localhost:8080
+# export DRY_RUN=1
+sh /data/datahub/scripts/run_jenkins_hive_table_ingest_from_jobs.sh
+```
+
 ### 2）Hive 表清单 xlsx → 切分 → 串行 ingest
 
 - **入口脚本**：`[run/ingest_hive_table_list_serial_from_xlsx.sh](run/ingest_hive_table_list_serial_from_xlsx.sh)`  
@@ -75,7 +91,7 @@ sh /data/datahub/scripts/run_add_manual_upstream_lineage.sh
 
 | 路径                              | 用途                                                                                |
 | ------------------------------- | --------------------------------------------------------------------------------- |
-| `python/scripts/`               | `run_batch_lineage_sync.sh`、`run_batch_lineage_sync_job_list.sh`、`run_add_manual_upstream_lineage.sh`、`run_job_info_sync_datahub_tests.sh`（上传前跑测试） |
+| `python/scripts/`               | `run_batch_lineage_sync.sh`、`run_batch_lineage_sync_job_list.sh`、`run_add_manual_upstream_lineage.sh`、`run_jenkins_hive_table_ingest_from_jobs.sh`、`run_job_info_sync_datahub_tests.sh` |
 | `python/job_info_sync_datahub/` | 批量血缘 Python 包                                                                     |
 | `run/`                          | 上表 xlsx 串行 ingest 链路的 shell/py                                                    |
 | `in/`                           | Hive 表清单 **xlsx 输入**（与线上 `/data/datahub/in/` 对应，见 `[in/README.md](in/README.md)`） |

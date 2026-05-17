@@ -18,9 +18,10 @@
 # BLF_DATAHUB_PLATFORM_INSTANCE / DATAHUB_ENV  与 Python 模块默认值一致时可不设
 # REPLACE=1          仅保留本条上游（清空其余表级/字段级血缘，慎用）
 # DRY_RUN=1          只打印计划，不写 GMS
-# BLF_LINEAGE_SKIP_UPSTREAM_INGEST=1  上游表不在 DataHub 时不自动 Hive ingest（默认会先 ingest 再写血缘）
-# HMS_THRIFT_HOST / HMS_THRIFT_PORT   Hive ingest 用，默认 hiveserver5.dp.data.bj1.wormpex.com:9083
-# BLF_HIVE_INGEST_TIMEOUT_SEC         单表 ingest 超时秒数，默认 600
+# BLF_LINEAGE_SKIP_UPSTREAM_INGEST=1  上游不在 DataHub 时不注册/ingest（默认会轻量注册）
+# BLF_LINEAGE_FULL_UPSTREAM_INGEST=1  改为完整 HMS ingest（慢，易超时；默认仅 MCP 轻量注册）
+# BLF_HIVE_INGEST_TIMEOUT_SEC         完整 HMS ingest 超时（本脚本在加载 lineage.env 后固定为 86400=24h）
+# HMS_THRIFT_HOST / HMS_THRIFT_PORT   仅完整 ingest 时需要
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -58,6 +59,9 @@ for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WO
   fi
 done
 
+# 完整 HMS ingest 易因 default 大库扫描很久；覆盖 lineage.env 里较小的值（如 600）
+export BLF_HIVE_INGEST_TIMEOUT_SEC=86400
+
 if ! "$PYTHON" -c "from datahub.ingestion.graph.client import DataHubGraph; from datahub.emitter.rest_emitter import DatahubRestEmitter" 2>/dev/null; then
   echo "ERROR: 需要 acryl-datahub（含 graph）。请: pip install 'acryl-datahub>=0.12' 或设置 LINEAGE_PYTHON。" >&2
   exit 1
@@ -75,6 +79,8 @@ echo " date=$(date -Iseconds)"
 echo " PYTHON=$PYTHON"
 echo " PKG_DIR=$PKG_DIR  TABLE_NAME=$TABLE_NAME  UPSTREAM_NAME=$UPSTREAM_NAME"
 echo " DRY_RUN=${DRY_RUN:-0}  REPLACE=${REPLACE:-0}"
+echo " BLF_HIVE_INGEST_TIMEOUT_SEC=${BLF_HIVE_INGEST_TIMEOUT_SEC}"
+echo " BLF_LINEAGE_FULL_UPSTREAM_INGEST=${BLF_LINEAGE_FULL_UPSTREAM_INGEST:-0}"
 echo "==================================================================="
 
 ARGS=(--table-name "$TABLE_NAME" --upstream-name "$UPSTREAM_NAME")

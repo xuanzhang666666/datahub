@@ -14,9 +14,10 @@
 默认与现有 ``upstreamLineage`` 合并（按 dataset URN 去重），并尽量保留
 ``fineGrainedLineages``。``--replace`` 则只保留本次指定的单条上游（慎用）。
 
-若上游表在 DataHub 目录中不存在（UI 无法展示血缘边），默认会先对上游表执行
-一次 Hive Metastore ingest，再写入 ``upstreamLineage``。可用
-``BLF_LINEAGE_SKIP_UPSTREAM_INGEST=1`` 或 ``--skip-upstream-ingest`` 关闭。
+若上游表在 DataHub 目录中不存在（UI 无法展示血缘边），默认会 **轻量注册**
+最小 Dataset（秒级 MCP，不跑完整 HMS ingest）。需要完整 schema 时设
+``BLF_LINEAGE_FULL_UPSTREAM_INGEST=1``（可能较慢；``run_add_manual_upstream_lineage.sh`` 默认超时 24h）。
+``BLF_LINEAGE_SKIP_UPSTREAM_INGEST=1`` 或 ``--skip-upstream-ingest`` 可跳过。
 """
 
 from __future__ import annotations
