@@ -13,6 +13,10 @@
 
 默认与现有 ``upstreamLineage`` 合并（按 dataset URN 去重），并尽量保留
 ``fineGrainedLineages``。``--replace`` 则只保留本次指定的单条上游（慎用）。
+
+若上游表在 DataHub 目录中不存在（UI 无法展示血缘边），默认会先对上游表执行
+一次 Hive Metastore ingest，再写入 ``upstreamLineage``。可用
+``BLF_LINEAGE_SKIP_UPSTREAM_INGEST=1`` 或 ``--skip-upstream-ingest`` 关闭。
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import sys
 from typing import List, Optional, Set, Tuple
 
 from .datahub_writer import make_dataset_urn_from_ref, make_hive_dataset_urn
+from .hive_single_table_ingest import ensure_upstream_dataset_in_datahub
 from .models import TableRef
 
 logger = logging.getLogger(__name__)
@@ -178,8 +183,25 @@ def parse_args() -> argparse.Namespace:
         help="丢弃已有表级上游与字段级血缘，仅写入本次一条上游（危险）",
     )
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--skip-upstream-ingest",
+        action="store_true",
+        help="不自动从 Hive ingest 缺失的上游表（默认会 ingest）",
+    )
+    p.add_argument(
+        "--python",
+        default=os.environ.get("LINEAGE_PYTHON") or os.environ.get("HIVE_INGEST_PYTHON"),
+        help="执行 datahub ingest 的解释器，默认 LINEAGE_PYTHON 或当前 python",
+    )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
+
+
+def _skip_upstream_ingest_flag(cli_skip: bool) -> bool:
+    if cli_skip:
+        return True
+    v = os.environ.get("BLF_LINEAGE_SKIP_UPSTREAM_INGEST", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def main() -> int:
@@ -201,8 +223,12 @@ def main() -> int:
         logger.error("%s", e)
         return 2
 
+    skip_ingest = _skip_upstream_ingest_flag(args.skip_upstream_ingest)
+    py_exec = args.python or sys.executable
+
     logger.info(
-        "GMS=%s downstream=%s upstream=%s platform_instance=%s env=%s replace=%s dry_run=%s",
+        "GMS=%s downstream=%s upstream=%s platform_instance=%s env=%s "
+        "replace=%s dry_run=%s skip_upstream_ingest=%s python=%s",
         args.datahub_gms,
         downstream.full_name,
         upstream.full_name,
@@ -210,6 +236,8 @@ def main() -> int:
         args.env,
         args.replace,
         args.dry_run,
+        skip_ingest,
+        py_exec,
     )
     logger.debug(
         "URN preview: downstream=%s upstream=%s",
@@ -218,6 +246,18 @@ def main() -> int:
     )
 
     try:
+        _, ingest_msg = ensure_upstream_dataset_in_datahub(
+            upstream,
+            gms_url=args.datahub_gms,
+            token=args.token,
+            platform_instance=args.platform_instance,
+            env=args.env,
+            python_executable=py_exec,
+            dry_run=args.dry_run,
+            skip_ingest=skip_ingest,
+        )
+        if ingest_msg:
+            print(ingest_msg)
         _, msg = merge_and_emit(
             args.datahub_gms,
             args.token,

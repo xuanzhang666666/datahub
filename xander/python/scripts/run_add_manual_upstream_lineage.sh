@@ -18,6 +18,9 @@
 # BLF_DATAHUB_PLATFORM_INSTANCE / DATAHUB_ENV  与 Python 模块默认值一致时可不设
 # REPLACE=1          仅保留本条上游（清空其余表级/字段级血缘，慎用）
 # DRY_RUN=1          只打印计划，不写 GMS
+# BLF_LINEAGE_SKIP_UPSTREAM_INGEST=1  上游表不在 DataHub 时不自动 Hive ingest（默认会先 ingest 再写血缘）
+# HMS_THRIFT_HOST / HMS_THRIFT_PORT   Hive ingest 用，默认 hiveserver5.dp.data.bj1.wormpex.com:9083
+# BLF_HIVE_INGEST_TIMEOUT_SEC         单表 ingest 超时秒数，默认 600
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
