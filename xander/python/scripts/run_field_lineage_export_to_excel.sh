@@ -7,8 +7,9 @@
 # TABLES               Jenkins multi-line string parameter，一行一个 库.表；为空则退出
 #
 # ── 输出 ─────────────────────────────────────────────────────────────────────
-# 默认目录：/data/datahub/out/field_lineage_export
-# 命名：{批次号}_{库.表}.xlsx
+# 默认根目录：/data/datahub/out/field_lineage_export
+# 每次运行写入子目录：{根目录}/{批次号}/（不存在则自动创建）
+# 文件命名：{批次号}_{库.表}.xlsx，例如 .../202605181331/202605181331_default.dim_store_info.xlsx
 #   批次号每次运行自动生成 YYYYMMDDHHmm，仅打印在日志中
 #
 # ── 并发与重试 ───────────────────────────────────────────────────────────────
@@ -97,14 +98,16 @@ _parse_tables_multiline() {
 }
 _parse_tables_multiline
 
-mkdir -p "$OUTPUT_DIR"
+BATCH_OUTPUT_DIR="$OUTPUT_DIR/$BATCH_ID"
+mkdir -p "$BATCH_OUTPUT_DIR"
 STATUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/field_lineage_export.XXXXXX")"
 # shellcheck disable=SC2064
 trap 'rm -rf "$STATUS_DIR"' EXIT
 
 echo "[INFO] field lineage export started at $(date -Iseconds)"
 echo "[INFO] batch id (auto): $BATCH_ID"
-echo "[INFO] output dir: $OUTPUT_DIR"
+echo "[INFO] output root: $OUTPUT_DIR"
+echo "[INFO] batch output dir: $BATCH_OUTPUT_DIR"
 echo "[INFO] concurrency: $CONCURRENCY"
 echo "[INFO] retry on failure: $RETRY_COUNT"
 echo "[INFO] table count: ${#TABLE_LIST[@]}"
@@ -199,7 +202,7 @@ for ((_i = 0; _i < CONCURRENCY; _i++)); do echo >&7; done
 
 _pids=()
 for TABLE_NAME in "${TABLE_LIST[@]}"; do
-  OUTPUT_FILE="$OUTPUT_DIR/${BATCH_ID}_${TABLE_NAME}.xlsx"
+  OUTPUT_FILE="$BATCH_OUTPUT_DIR/${BATCH_ID}_${TABLE_NAME}.xlsx"
   STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.status"
 
   read -r -u 7

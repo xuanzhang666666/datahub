@@ -8,7 +8,8 @@
 # TABLES               Jenkins multi-line string parameter，一行一个 库.表（与导出时相同）
 #
 # Excel 路径规则（与 run_field_lineage_export_to_excel.sh 一致）：
-#   /data/datahub/out/field_lineage_export/{BATCH_CODE}_{库.表}.xlsx
+#   /data/datahub/out/field_lineage_export/{BATCH_CODE}/{BATCH_CODE}_{库.表}.xlsx
+#   兼容旧版平铺路径：.../field_lineage_export/{BATCH_CODE}_{库.表}.xlsx
 #
 # ── 写入 ─────────────────────────────────────────────────────────────────────
 # 默认写入 DataHub fineGrainedLineages（--write）
@@ -111,9 +112,12 @@ if [[ ! -d "$INPUT_DIR" ]]; then
   exit 1
 fi
 
+BATCH_INPUT_DIR="$INPUT_DIR/$BATCH_CODE"
+
 echo "[INFO] field lineage import started at $(date -Iseconds)"
 echo "[INFO] batch code: $BATCH_CODE"
-echo "[INFO] input dir: $INPUT_DIR"
+echo "[INFO] input root: $INPUT_DIR"
+echo "[INFO] batch input dir: $BATCH_INPUT_DIR"
 echo "[INFO] write to datahub: $([[ "$IMPORT_WRITE" -eq 1 ]] && echo yes || echo no)"
 echo "[INFO] table count: ${#TABLE_LIST[@]}"
 echo "[INFO] tables: ${TABLE_LIST[*]}"
@@ -125,17 +129,35 @@ _run_cli() {
     "$PYTHON" -m job_info_sync_datahub.field_lineage_cli "$@"
 }
 
+_resolve_excel_file() {
+  local _table="$1"
+  local _name="${BATCH_CODE}_${_table}.xlsx"
+  if [[ -f "$BATCH_INPUT_DIR/$_name" ]]; then
+    echo "$BATCH_INPUT_DIR/$_name"
+    return 0
+  fi
+  if [[ -f "$INPUT_DIR/$_name" ]]; then
+    echo "$INPUT_DIR/$_name"
+    return 0
+  fi
+  echo "$BATCH_INPUT_DIR/$_name"
+  return 1
+}
+
 _fail=0
 for TABLE_NAME in "${TABLE_LIST[@]}"; do
-  EXCEL_FILE="$INPUT_DIR/${BATCH_CODE}_${TABLE_NAME}.xlsx"
-  PLAN_FILE="$INPUT_DIR/${BATCH_CODE}_${TABLE_NAME}_import_plan.json"
+  if ! EXCEL_FILE="$(_resolve_excel_file "$TABLE_NAME")"; then
+    EXCEL_FILE="$BATCH_INPUT_DIR/${BATCH_CODE}_${TABLE_NAME}.xlsx"
+  fi
+  _excel_dir="$(dirname "$EXCEL_FILE")"
+  PLAN_FILE="$_excel_dir/${BATCH_CODE}_${TABLE_NAME}_import_plan.json"
 
   echo "[INFO] ----------------------------------------"
   echo "[INFO] table: $TABLE_NAME"
   echo "[INFO] excel: $EXCEL_FILE"
 
   if [[ ! -f "$EXCEL_FILE" ]]; then
-    echo "[ERROR] 找不到 Excel: $EXCEL_FILE" >&2
+    echo "[ERROR] 找不到 Excel: $EXCEL_FILE（亦已检查 $INPUT_DIR/${BATCH_CODE}_${TABLE_NAME}.xlsx）" >&2
     _fail=$((_fail + 1))
     continue
   fi
