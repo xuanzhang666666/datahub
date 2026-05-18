@@ -34,7 +34,7 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
       "source_table": "来源表 db.table",
       "source_field": "来源字段",
       "transform_expression": "字段转换表达式",
-      "transform_explanation": "字段加工逻辑的中文解释，面向业务同学阅读",
+      "transform_explanation": "来源表字段 + 加工含义的中文说明（见下方格式）",
       "evidence_sql": "能证明该映射的 SQL 片段",
       "confidence": "HIGH|MEDIUM|LOW",
       "notes": "不确定点或解释"
@@ -49,8 +49,15 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
 - 只生成候选结果，宁可把不确定字段放到 unresolved_fields，也不要编造来源。
 - Python 脚本中的 SQL 字符串、临时表、多段 SQL 可综合判断，但 evidence_sql 必须回指到原始脚本片段。
 - **每条 mapping 必须填写 transform_expression**（如 `coalesce(a,b)`、`cast(x as bigint)`、或直接列名），用于 DataHub UI 展示 LOGIC。
-- **每条 mapping 必须填写 transform_explanation**，用简洁中文说明该字段如何加工，例如“优先取 bach 表地址，为空时取 hd 表地址兜底”。
-- 同一目标字段若有多来源（如 coalesce），可为每个来源各写一条 mapping，transform_expression 和 transform_explanation 填同一完整内容。
+- **每条 mapping 必须填写 transform_explanation**（中文，面向业务同学），固定两段信息：
+  1. **来源**：写清楚数据来自哪些表的哪些字段（用反引号标出 `库.表` 与字段名）。
+  2. **含义**：用一句话说明该目标字段的业务含义或加工逻辑（直映、类型转换、兜底、拼接等）。
+- transform_explanation 单来源直映示例：
+  `取 pdw.bach_baseinfo_shop_shop 表中的 store_code 字段，表示将店铺编码作为 CVS 编码。`
+- transform_explanation 多来源（coalesce）示例（同一目标字段的多条 mapping 可共用同一段说明）：
+  `优先取 ods.bach_store 表中的 store_address 字段，为空时取 ods.hd_store 表中的 store_address 字段，表示门店地址按优先级兜底合并。`
+- 禁止只写“直映”“同名字段”等过短描述；必须出现具体的来源表名与来源字段名。
+- 同一目标字段若有多来源（如 coalesce），可为每个来源各写一条 mapping，transform_expression 和 transform_explanation 填同一完整内容（含全部来源表字段）。
 - review_status 不需要输出；系统会统一置为 PENDING。
 - target_table 必须是本次输入表。
 """

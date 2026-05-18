@@ -39,7 +39,7 @@ class FieldLineageCandidate:
     source_table: str
     source_field: str
     transform_expression: str = ""
-    transform_explanation: str = ""
+    transform_explanation: str = ""  # 中文：来源表/字段 + 加工含义（见 field_lineage_llm 提示词）
     evidence_sql: str = ""
     confidence: str = ""
     llm_notes: str = ""

@@ -112,7 +112,7 @@ def test_parse_field_lineage_payload_defaults_review_status_to_pending() -> None
                     "source_table": "ods.store_info",
                     "source_field": "id",
                     "transform_expression": "cast(id as bigint)",
-                    "transform_explanation": "将门店 ID 转成 bigint 类型。",
+                    "transform_explanation": "取 ods.store_info 表中的 id 字段，表示将门店 ID 转为 bigint 类型写入 store_id。",
                     "evidence_sql": "select cast(id as bigint) as store_id",
                     "confidence": "HIGH",
                     "notes": "direct mapping",
@@ -132,7 +132,7 @@ def test_parse_field_lineage_payload_defaults_review_status_to_pending() -> None
             source_table="ods.store_info",
             source_field="id",
             transform_expression="cast(id as bigint)",
-            transform_explanation="将门店 ID 转成 bigint 类型。",
+            transform_explanation="取 ods.store_info 表中的 id 字段，表示将门店 ID 转为 bigint 类型写入 store_id。",
             evidence_sql="select cast(id as bigint) as store_id",
             confidence="HIGH",
             llm_notes="direct mapping",
@@ -178,7 +178,7 @@ def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
         source_table="ods.store_info",
         source_field="id",
         transform_expression="cast(id as bigint)",
-        transform_explanation="将门店 ID 转成 bigint 类型。",
+        transform_explanation="取 ods.store_info 表中的 id 字段，表示将门店 ID 转为 bigint 类型写入 store_id。",
         evidence_sql="select cast(id as bigint) as store_id",
         confidence="HIGH",
     )
@@ -258,7 +258,11 @@ def test_group_coalesce_rows_merge_sources_and_transform() -> None:
             source_table="ods.bach_store",
             source_field="store_address",
             transform_expression="coalesce(bach.store_address, hd.store_address)",
-            transform_explanation="优先取 bach 门店地址；为空时取 hd 门店地址兜底。",
+            transform_explanation=(
+                "优先取 ods.bach_store 表中的 store_address 字段，"
+                "为空时取 ods.hd_store 表中的 store_address 字段，"
+                "表示门店地址按优先级兜底合并。"
+            ),
         ),
         FieldLineageCandidate(
             target_table="default.dim_store_info",
@@ -266,27 +270,37 @@ def test_group_coalesce_rows_merge_sources_and_transform() -> None:
             source_table="ods.hd_store",
             source_field="store_address",
             transform_expression="coalesce(bach.store_address, hd.store_address)",
-            transform_explanation="优先取 bach 门店地址；为空时取 hd 门店地址兜底。",
+            transform_explanation=(
+                "优先取 ods.bach_store 表中的 store_address 字段，"
+                "为空时取 ods.hd_store 表中的 store_address 字段，"
+                "表示门店地址按优先级兜底合并。"
+            ),
         ),
     ]
     grouped = group_approved_rows(rows)
     assert len(grouped) == 1
     assert grouped[0].target_field == "store_address"
     assert len(grouped[0].sources) == 2
+    _coalesce_explanation = (
+        "优先取 ods.bach_store 表中的 store_address 字段，"
+        "为空时取 ods.hd_store 表中的 store_address 字段，"
+        "表示门店地址按优先级兜底合并。"
+    )
     assert grouped[0].transform_operation == (
-        "/* 中文解释：优先取 bach 门店地址；为空时取 hd 门店地址兜底。 */\n"
+        f"/* 中文解释：{_coalesce_explanation} */\n"
         "coalesce(bach.store_address, hd.store_address)"
     )
-    assert grouped[0].transform_explanation == "优先取 bach 门店地址；为空时取 hd 门店地址兜底。"
+    assert grouped[0].transform_explanation == _coalesce_explanation
 
 
 def test_build_transform_operation_for_ui() -> None:
     assert (
         build_transform_operation_for_ui(
             "coalesce(a, b)",
-            "优先取 a，为空时取 b",
+            "优先取 ods.a 表中的 x 字段，为空时取 ods.b 表中的 y 字段，表示按优先级兜底。",
         )
-        == "/* 中文解释：优先取 a，为空时取 b */\ncoalesce(a, b)"
+        == "/* 中文解释：优先取 ods.a 表中的 x 字段，为空时取 ods.b 表中的 y 字段，表示按优先级兜底。 */\n"
+        "coalesce(a, b)"
     )
 
 
@@ -303,12 +317,15 @@ def test_build_fine_grained_sets_transform_operation() -> None:
                 source_table="ods.store_info",
                 source_field="id",
                 transform_expression="cast(id as bigint)",
-                transform_explanation="将门店 ID 转成 bigint 类型。",
+                transform_explanation="取 ods.store_info 表中的 id 字段，表示将门店 ID 转为 bigint 类型写入 store_id。",
             )
         ]
     )[0]
     fg = build_fine_grained_lineage_class(group)
-    assert fg.transformOperation == "/* 中文解释：将门店 ID 转成 bigint 类型。 */\ncast(id as bigint)"
+    assert fg.transformOperation == (
+        "/* 中文解释：取 ods.store_info 表中的 id 字段，表示将门店 ID 转为 bigint 类型写入 store_id。 */\n"
+        "cast(id as bigint)"
+    )
     assert len(fg.upstreams) == 1
 
 
