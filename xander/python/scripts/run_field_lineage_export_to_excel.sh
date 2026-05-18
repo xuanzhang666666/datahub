@@ -142,8 +142,9 @@ _export_one_table() {
   local STATUS_FILE="$3"
   local max_attempts=$((RETRY_COUNT + 1))
   local attempt=1
+  local _cli_out _cli_rc _skip_reason
 
-  rm -f "$OUTPUT_FILE"
+  rm -f "$OUTPUT_FILE" "${STATUS_FILE}.skip_reason"
   while [[ "$attempt" -le "$max_attempts" ]]; do
     if [[ "$attempt" -gt 1 ]]; then
       _warn "$TABLE_NAME" "LLM/export 失败，第 ${attempt}/${max_attempts} 次重试 ..."
@@ -152,17 +153,35 @@ _export_one_table() {
       _log "$TABLE_NAME" "export started -> $OUTPUT_FILE"
     fi
 
-    if _run_cli export \
+    _cli_out="$(mktemp "${TMPDIR:-/tmp}/field_lineage_cli.XXXXXX")"
+    set +e
+    _run_cli export \
       --table "$TABLE_NAME" \
       --output "$OUTPUT_FILE" \
       --gms-url "$GMS_URL" \
       --llm-timeout-sec "$LLM_TIMEOUT" \
-      --preview-chars "$PREVIEW_CHARS"; then
+      --preview-chars "$PREVIEW_CHARS" >"$_cli_out" 2>&1
+    _cli_rc=$?
+    set -e
+    cat "$_cli_out"
+
+    if [[ "$_cli_rc" -eq 0 ]]; then
+      rm -f "$_cli_out"
       _log "$TABLE_NAME" "export ok: $OUTPUT_FILE"
       echo 0 >"$STATUS_FILE"
       return 0
     fi
 
+    if [[ "$_cli_rc" -eq 3 ]]; then
+      _skip_reason="$(grep '^FIELD_LINEAGE_SKIP_REASON=' "$_cli_out" | tail -1 | sed 's/^FIELD_LINEAGE_SKIP_REASON=//')"
+      rm -f "$_cli_out" "$OUTPUT_FILE"
+      _warn "$TABLE_NAME" "${_skip_reason:-structured property 无内容，已跳过}"
+      echo "${_skip_reason:-structured property 无内容}" >"${STATUS_FILE}.skip_reason"
+      echo 2 >"$STATUS_FILE"
+      return 0
+    fi
+
+    rm -f "$_cli_out"
     attempt=$((attempt + 1))
   done
 
@@ -191,7 +210,6 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
   _pids+=("$!")
 done
 
-_fail=0
 for _pid in "${_pids[@]}"; do
   if ! wait "$_pid"; then
     : # 单表失败已在 STATUS_FILE 记录
@@ -199,17 +217,41 @@ for _pid in "${_pids[@]}"; do
 done
 exec 7>&-
 
+_ok=0
+_skip=0
+_fail=0
+_skipped_tables=()
 for TABLE_NAME in "${TABLE_LIST[@]}"; do
   STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.status"
-  if [[ ! -f "$STATUS_FILE" ]] || [[ "$(cat "$STATUS_FILE")" != "0" ]]; then
+  if [[ ! -f "$STATUS_FILE" ]]; then
     _fail=$((_fail + 1))
+    continue
   fi
+  case "$(cat "$STATUS_FILE")" in
+    0) _ok=$((_ok + 1)) ;;
+    2)
+      _skip=$((_skip + 1))
+      _reason=""
+      if [[ -f "${STATUS_FILE}.skip_reason" ]]; then
+        _reason="$(cat "${STATUS_FILE}.skip_reason")"
+      fi
+      _skipped_tables+=("${TABLE_NAME}: ${_reason:-structured property 无内容}")
+      ;;
+    *) _fail=$((_fail + 1)) ;;
+  esac
 done
 
-_ok=$((${#TABLE_LIST[@]} - _fail))
 echo "[INFO] field lineage export finished at $(date -Iseconds)"
 echo "[INFO] batch id (auto): $BATCH_ID"
-echo "[INFO] succeeded: ${_ok}/${#TABLE_LIST[@]}"
+echo "[INFO] succeeded: ${_ok}/${#TABLE_LIST[@]}, skipped: ${_skip}, failed: ${_fail}"
+
+if [[ "$_skip" -gt 0 ]]; then
+  echo "[WARN] ========== 以下表已跳过字段血缘解析（structured property 无内容）=========="
+  for _entry in "${_skipped_tables[@]}"; do
+    echo "[WARN]   ${_entry}"
+  done
+  echo "[WARN] 请先在 DataHub 补全 Etl Script (blf.data.warehouse.etl_script) 后重新导出。"
+fi
 
 if [[ "$_fail" -gt 0 ]]; then
   exit 1

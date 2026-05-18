@@ -15,7 +15,15 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).parent.parent))
     __package__ = "job_info_sync_datahub"
 
-from .field_lineage_datahub_reader import make_hive_dataset_urn, read_field_lineage_input
+from .field_lineage_datahub_reader import (
+    extract_field_lineage_input,
+    fetch_structured_properties,
+    make_hive_dataset_urn,
+    missing_field_lineage_source_reason,
+)
+
+# 无 Etl Script / structured property 内容时跳过 LLM（shell 脚本据此汇总）
+EXIT_SKIP_NO_SOURCE = 3
 from .field_lineage_excel import load_approved_review_rows, write_candidate_workbook
 from .field_lineage_llm import call_llm_extract_field_lineage
 from .field_lineage_writer import write_approved_field_lineages
@@ -44,13 +52,17 @@ def _cmd_export(args: argparse.Namespace) -> int:
     _log(f"output={args.output}")
     _log(f"llm_timeout_sec={args.llm_timeout_sec}")
     _log("reading DataHub structuredProperties ...")
-    source_input = read_field_lineage_input(
+    payload = fetch_structured_properties(
         args.gms_url,
-        args.table,
+        dataset_urn,
         token=args.gms_token,
-        platform_instance=args.platform_instance,
-        env=args.env,
     )
+    skip_reason = missing_field_lineage_source_reason(payload)
+    if skip_reason:
+        _log(f"SKIP: {skip_reason}")
+        print(f"FIELD_LINEAGE_SKIP_REASON={skip_reason}", flush=True)
+        return EXIT_SKIP_NO_SOURCE
+    source_input = extract_field_lineage_input(dataset_urn, args.table, payload)
     _log("structuredProperties loaded")
     _log(f"etl_script_chars={len(source_input.etl_script)}")
     _log(f"execute_shell_chars={len(source_input.execute_shell)}")

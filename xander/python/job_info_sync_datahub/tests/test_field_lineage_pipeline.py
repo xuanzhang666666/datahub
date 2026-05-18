@@ -10,6 +10,7 @@ from openpyxl import load_workbook
 from job_info_sync_datahub.field_lineage_datahub_reader import (
     extract_field_lineage_input,
     make_hive_dataset_urn,
+    missing_field_lineage_source_reason,
     strip_markdown_code_fence,
 )
 from job_info_sync_datahub.field_lineage_cli import main as field_lineage_cli_main
@@ -83,6 +84,22 @@ def test_extract_field_lineage_input_from_structured_properties() -> None:
         etl_script="insert overwrite table default.dim_store_info select 1;",
         execute_shell="sh run_dim_store_info.sh",
     )
+
+
+def test_missing_field_lineage_source_reason_when_etl_empty() -> None:
+    payload = _structured_properties_payload(etl_script="", execute_shell="")
+    reason = missing_field_lineage_source_reason(payload)
+    assert reason is not None
+    assert "Etl Script" in reason
+    assert "Execute Shell" in reason
+
+
+def test_missing_field_lineage_source_reason_none_when_etl_present() -> None:
+    payload = _structured_properties_payload(
+        etl_script="select 1",
+        execute_shell="",
+    )
+    assert missing_field_lineage_source_reason(payload) is None
 
 
 def test_parse_field_lineage_payload_defaults_review_status_to_pending() -> None:
