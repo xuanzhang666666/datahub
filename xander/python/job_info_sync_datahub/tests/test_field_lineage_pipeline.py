@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
+import pytest
 from openpyxl import load_workbook
 
 from job_info_sync_datahub.field_lineage_datahub_reader import (
@@ -15,7 +17,10 @@ from job_info_sync_datahub.field_lineage_excel import (
     load_approved_review_rows,
     write_candidate_workbook,
 )
-from job_info_sync_datahub.field_lineage_llm import parse_field_lineage_payload
+from job_info_sync_datahub.field_lineage_llm import (
+    build_field_lineage_request_debug_info,
+    parse_field_lineage_payload,
+)
 from job_info_sync_datahub.field_lineage_models import (
     FieldLineageCandidate,
     FieldLineageInput,
@@ -23,6 +28,7 @@ from job_info_sync_datahub.field_lineage_models import (
 )
 from job_info_sync_datahub.field_lineage_writer import (
     build_fine_grained_lineage_class,
+    build_transform_operation_for_ui,
     group_approved_rows,
 )
 from job_info_sync_datahub.structured_properties import URN_ETL_SCRIPT, URN_EXECUTE_SHELL
@@ -89,6 +95,7 @@ def test_parse_field_lineage_payload_defaults_review_status_to_pending() -> None
                     "source_table": "ods.store_info",
                     "source_field": "id",
                     "transform_expression": "cast(id as bigint)",
+                    "transform_explanation": "将门店 ID 转成 bigint 类型。",
                     "evidence_sql": "select cast(id as bigint) as store_id",
                     "confidence": "HIGH",
                     "notes": "direct mapping",
@@ -108,6 +115,7 @@ def test_parse_field_lineage_payload_defaults_review_status_to_pending() -> None
             source_table="ods.store_info",
             source_field="id",
             transform_expression="cast(id as bigint)",
+            transform_explanation="将门店 ID 转成 bigint 类型。",
             evidence_sql="select cast(id as bigint) as store_id",
             confidence="HIGH",
             llm_notes="direct mapping",
@@ -115,6 +123,28 @@ def test_parse_field_lineage_payload_defaults_review_status_to_pending() -> None
         )
     ]
     assert parsed.unresolved_fields[0].target_field == "store_name"
+
+
+def test_build_field_lineage_request_debug_info_counts_prompt_size() -> None:
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select store_id from ods.store_info",
+        execute_shell="sh dim_store_info",
+    )
+
+    debug = build_field_lineage_request_debug_info(
+        source_input=source,
+        base_v1="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        timeout_sec=90,
+    )
+
+    assert debug["llm_base"] == "https://api.deepseek.com/v1"
+    assert debug["llm_model"] == "deepseek-chat"
+    assert debug["timeout_sec"] == 90
+    assert debug["user_message_chars"] > len(source.etl_script)
+    assert debug["system_prompt_chars"] > 0
 
 
 def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
@@ -131,6 +161,7 @@ def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
         source_table="ods.store_info",
         source_field="id",
         transform_expression="cast(id as bigint)",
+        transform_explanation="将门店 ID 转成 bigint 类型。",
         evidence_sql="select cast(id as bigint) as store_id",
         confidence="HIGH",
     )
@@ -154,6 +185,7 @@ def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
         "source_table",
         "source_field",
     ]
+    assert "transform_explanation" in headers
     assert ws["A2"].value == "PENDING"
     assert ws["B2"].value == "default.dim_store_info"
 
@@ -209,6 +241,7 @@ def test_group_coalesce_rows_merge_sources_and_transform() -> None:
             source_table="ods.bach_store",
             source_field="store_address",
             transform_expression="coalesce(bach.store_address, hd.store_address)",
+            transform_explanation="优先取 bach 门店地址；为空时取 hd 门店地址兜底。",
         ),
         FieldLineageCandidate(
             target_table="default.dim_store_info",
@@ -216,15 +249,34 @@ def test_group_coalesce_rows_merge_sources_and_transform() -> None:
             source_table="ods.hd_store",
             source_field="store_address",
             transform_expression="coalesce(bach.store_address, hd.store_address)",
+            transform_explanation="优先取 bach 门店地址；为空时取 hd 门店地址兜底。",
         ),
     ]
     grouped = group_approved_rows(rows)
     assert len(grouped) == 1
     assert grouped[0].target_field == "store_address"
     assert len(grouped[0].sources) == 2
-    assert grouped[0].transform_operation == "coalesce(bach.store_address, hd.store_address)"
+    assert grouped[0].transform_operation == (
+        "/* 中文解释：优先取 bach 门店地址；为空时取 hd 门店地址兜底。 */\n"
+        "coalesce(bach.store_address, hd.store_address)"
+    )
+    assert grouped[0].transform_explanation == "优先取 bach 门店地址；为空时取 hd 门店地址兜底。"
 
 
+def test_build_transform_operation_for_ui() -> None:
+    assert (
+        build_transform_operation_for_ui(
+            "coalesce(a, b)",
+            "优先取 a，为空时取 b",
+        )
+        == "/* 中文解释：优先取 a，为空时取 b */\ncoalesce(a, b)"
+    )
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("datahub") is None,
+    reason="acryl-datahub not installed",
+)
 def test_build_fine_grained_sets_transform_operation() -> None:
     group = group_approved_rows(
         [
@@ -234,11 +286,12 @@ def test_build_fine_grained_sets_transform_operation() -> None:
                 source_table="ods.store_info",
                 source_field="id",
                 transform_expression="cast(id as bigint)",
+                transform_explanation="将门店 ID 转成 bigint 类型。",
             )
         ]
     )[0]
     fg = build_fine_grained_lineage_class(group)
-    assert fg.transformOperation == "cast(id as bigint)"
+    assert fg.transformOperation == "/* 中文解释：将门店 ID 转成 bigint 类型。 */\ncast(id as bigint)"
     assert len(fg.upstreams) == 1
 
 

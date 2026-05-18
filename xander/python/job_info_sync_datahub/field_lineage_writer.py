@@ -33,6 +33,7 @@ class GroupedFieldLineage:
     target_field: str
     sources: Tuple[Tuple[str, str], ...]
     transform_operation: str
+    transform_explanation: str
     confidence: str
 
 
@@ -48,7 +49,7 @@ def _confidence_score(confidence: str) -> float:
     return mapping.get((confidence or "").upper(), 0.7)
 
 
-def _pick_transform_operation(rows: List[FieldLineageCandidate]) -> str:
+def _pick_transform_expression(rows: List[FieldLineageCandidate]) -> str:
     exprs = [r.transform_expression.strip() for r in rows if r.transform_expression.strip()]
     if not exprs:
         return ""
@@ -56,6 +57,27 @@ def _pick_transform_operation(rows: List[FieldLineageCandidate]) -> str:
     if len(unique) == 1:
         return unique[0]
     return max(unique, key=len)
+
+
+def _pick_transform_explanation(rows: List[FieldLineageCandidate]) -> str:
+    explanations = [r.transform_explanation.strip() for r in rows if r.transform_explanation.strip()]
+    if not explanations:
+        return ""
+    unique = list(dict.fromkeys(explanations))
+    if len(unique) == 1:
+        return unique[0]
+    return max(unique, key=len)
+
+
+def build_transform_operation_for_ui(transform_expression: str, transform_explanation: str) -> str:
+    """Combine Chinese explanation and SQL expression for DataHub LOGIC display."""
+    expression = transform_expression.strip()
+    explanation = transform_explanation.strip()
+    if explanation and expression:
+        return f"/* 中文解释：{explanation} */\n{expression}"
+    if explanation:
+        return f"/* 中文解释：{explanation} */"
+    return expression
 
 
 def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldLineage]:
@@ -85,7 +107,11 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
                 target_table=target_table,
                 target_field=target_field,
                 sources=tuple(sources),
-                transform_operation=_pick_transform_operation(items),
+                transform_operation=build_transform_operation_for_ui(
+                    _pick_transform_expression(items),
+                    _pick_transform_explanation(items),
+                ),
+                transform_explanation=_pick_transform_explanation(items),
                 confidence=confidences[0] if confidences else "HIGH",
             )
         )
@@ -159,7 +185,7 @@ def write_approved_field_lineages(
     dry_run: bool = False,
 ) -> Dict[str, object]:
     """将审核通过的 Excel 行写入各目标表的 fineGrainedLineages。"""
-    if not _SDK_AVAILABLE:
+    if not dry_run and not _SDK_AVAILABLE:
         raise RuntimeError("需要安装 acryl-datahub 才能写入字段血缘")
 
     grouped_all = group_approved_rows(approved_rows)
@@ -180,6 +206,7 @@ def write_approved_field_lineages(
                     "target_field": g.target_field,
                     "source_count": len(g.sources),
                     "transform_operation": g.transform_operation,
+                    "transform_explanation": g.transform_explanation,
                     "sources": list(g.sources),
                 }
                 for g in groups

@@ -96,10 +96,20 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
         for r in approved
         if not r.transform_expression.strip()
     ]
+    missing_explanation = [
+        f"{r.target_table}.{r.target_field}"
+        for r in approved
+        if not r.transform_explanation.strip()
+    ]
     if missing_expr:
         _log(
-            "warning: 以下字段未填写 transform_expression，UI 侧栏将无 LOGIC 表达式: "
+            "warning: 以下字段未填写 transform_expression，UI 侧栏将无 SQL 表达式: "
             + ", ".join(missing_expr[:20])
+        )
+    if missing_explanation:
+        _log(
+            "warning: 以下字段未填写 transform_explanation，UI 侧栏将无中文解释: "
+            + ", ".join(missing_explanation[:20])
         )
 
     result = write_approved_field_lineages(
@@ -121,6 +131,7 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
                 "source_table": row.source_table,
                 "source_field": row.source_field,
                 "transform_expression": row.transform_expression,
+                "transform_explanation": row.transform_explanation,
                 "confidence": row.confidence,
             }
             for row in approved

@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# run_field_lineage_export_to_excel.sh — Jenkins / neo4j2：按表列表批量导出字段级血缘 Excel
+#
+# 部署路径：/data/datahub/scripts/run_field_lineage_export_to_excel.sh
+#
+# ── 必填 ─────────────────────────────────────────────────────────────────────
+# TABLES               Jenkins multi-line string parameter，一行一个 库.表；为空则退出
+#
+# ── 输出 ─────────────────────────────────────────────────────────────────────
+# 默认目录：/data/datahub/out/field_lineage_export
+# 命名：{批次号}_{库.表}.xlsx
+#   批次号每次运行自动生成 YYYYMMDDHHmm，仅打印在日志中
+#
+# ── 并发与重试 ───────────────────────────────────────────────────────────────
+# FIELD_LINEAGE_CONCURRENCY  并发请求 LLM 数，默认 10
+# FIELD_LINEAGE_RETRY_COUNT    失败后额外重试次数，默认 1（共最多 2 次）
+#
+# ── 可选 ─────────────────────────────────────────────────────────────────────
+# DATAHUB_GMS_URL / LINEAGE_PYTHON / FIELD_LINEAGE_PREVIEW_CHARS / FIELD_LINEAGE_LLM_TIMEOUT_SEC
+#
+# Jenkins：TABLES 使用 Multi-line String Parameter，Execute shell 直接引用 $TABLES 即可
+#   sh /data/datahub/scripts/run_field_lineage_export_to_excel.sh
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -d "${JOB_INFO_SYNC_DIR:-$SCRIPT_DIR/job_info_sync_datahub}" ]]; then
+  PKG_DIR="${JOB_INFO_SYNC_DIR:-$SCRIPT_DIR/job_info_sync_datahub}"
+  PYTHONPATH_ROOT="$(cd "$(dirname "$PKG_DIR")" && pwd)"
+elif [[ -d "$SCRIPT_DIR/../job_info_sync_datahub" ]]; then
+  PKG_DIR="$(cd "$SCRIPT_DIR/../job_info_sync_datahub" && pwd)"
+  PYTHONPATH_ROOT="$(dirname "$PKG_DIR")"
+else
+  echo "ERROR: 找不到 job_info_sync_datahub，请设置 JOB_INFO_SYNC_DIR。" >&2
+  exit 2
+fi
+
+if [[ -n "${LINEAGE_PYTHON:-}" ]]; then
+  PYTHON="$LINEAGE_PYTHON"
+elif [[ -x /opt/anaconda3/bin/python ]]; then
+  PYTHON=/opt/anaconda3/bin/python
+else
+  PYTHON=python3
+fi
+
+OUTPUT_DIR="${FIELD_LINEAGE_OUTPUT_DIR:-/data/datahub/out/field_lineage_export}"
+BATCH_ID="$(date +%Y%m%d%H%M)"
+GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
+PREVIEW_CHARS="${FIELD_LINEAGE_PREVIEW_CHARS:-8000}"
+LLM_TIMEOUT="${FIELD_LINEAGE_LLM_TIMEOUT_SEC:-240}"
+CONCURRENCY="${FIELD_LINEAGE_CONCURRENCY:-10}"
+RETRY_COUNT="${FIELD_LINEAGE_RETRY_COUNT:-1}"
+
+if ! [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: FIELD_LINEAGE_CONCURRENCY 必须为正整数: $CONCURRENCY" >&2
+  exit 2
+fi
+if ! [[ "$RETRY_COUNT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: FIELD_LINEAGE_RETRY_COUNT 必须为非负整数: $RETRY_COUNT" >&2
+  exit 2
+fi
+
+for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
+  [[ -z "$_cand" ]] && continue
+  if [[ -r "$_cand" ]]; then
+    # shellcheck disable=SC1090
+    set -a
+    source "$_cand"
+    set +a
+    echo "[INFO] loaded env: $_cand"
+    break
+  fi
+done
+
+# Jenkins multi-line string parameter：一行一个 库.表
+_parse_tables_multiline() {
+  TABLE_LIST=()
+  local _raw="${TABLES:-}"
+  if [[ -z "${_raw//[[:space:]]/}" ]]; then
+    echo "ERROR: TABLES 为空，请在 Jenkins Multi-line String Parameter 中填写表名（一行一个 库.表）。" >&2
+    exit 2
+  fi
+  _raw="${_raw//$'\r'/}"
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    _line="${_line#"${_line%%[![:space:]]*}"}"
+    _line="${_line%"${_line##*[![:space:]]}"}"
+    [[ -z "$_line" ]] && continue
+    if [[ "$_line" != *.* ]] || [[ "$_line" == .* ]] || [[ "$_line" == *. ]]; then
+      echo "ERROR: 表名必须为 库.表 格式（例如 default.dim_store_info），无效行: $_line" >&2
+      exit 2
+    fi
+    TABLE_LIST+=("$_line")
+  done <<< "$_raw"
+  if [[ ${#TABLE_LIST[@]} -eq 0 ]]; then
+    echo "ERROR: TABLES 未解析到有效表名（一行一个 库.表）。" >&2
+    exit 2
+  fi
+}
+_parse_tables_multiline
+
+mkdir -p "$OUTPUT_DIR"
+STATUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/field_lineage_export.XXXXXX")"
+# shellcheck disable=SC2064
+trap 'rm -rf "$STATUS_DIR"' EXIT
+
+echo "[INFO] field lineage export started at $(date -Iseconds)"
+echo "[INFO] batch id (auto): $BATCH_ID"
+echo "[INFO] output dir: $OUTPUT_DIR"
+echo "[INFO] concurrency: $CONCURRENCY"
+echo "[INFO] retry on failure: $RETRY_COUNT"
+echo "[INFO] table count: ${#TABLE_LIST[@]}"
+echo "[INFO] tables: ${TABLE_LIST[*]}"
+echo "[INFO] gms url: $GMS_URL"
+echo "[INFO] python: $PYTHON"
+echo "[INFO] pythonpath: $PYTHONPATH_ROOT"
+
+_run_cli() {
+  PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    "$PYTHON" -m job_info_sync_datahub.field_lineage_cli "$@"
+}
+
+_log() {
+  local table="$1"
+  shift
+  echo "[INFO][$table] $*"
+}
+
+_warn() {
+  local table="$1"
+  shift
+  echo "[WARN][$table] $*" >&2
+}
+
+_error() {
+  local table="$1"
+  shift
+  echo "[ERROR][$table] $*" >&2
+}
+
+_export_one_table() {
+  local TABLE_NAME="$1"
+  local OUTPUT_FILE="$2"
+  local STATUS_FILE="$3"
+  local max_attempts=$((RETRY_COUNT + 1))
+  local attempt=1
+
+  rm -f "$OUTPUT_FILE"
+  while [[ "$attempt" -le "$max_attempts" ]]; do
+    if [[ "$attempt" -gt 1 ]]; then
+      _warn "$TABLE_NAME" "LLM/export 失败，第 ${attempt}/${max_attempts} 次重试 ..."
+      rm -f "$OUTPUT_FILE"
+    else
+      _log "$TABLE_NAME" "export started -> $OUTPUT_FILE"
+    fi
+
+    if _run_cli export \
+      --table "$TABLE_NAME" \
+      --output "$OUTPUT_FILE" \
+      --gms-url "$GMS_URL" \
+      --llm-timeout-sec "$LLM_TIMEOUT" \
+      --preview-chars "$PREVIEW_CHARS"; then
+      _log "$TABLE_NAME" "export ok: $OUTPUT_FILE"
+      echo 0 >"$STATUS_FILE"
+      return 0
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  _error "$TABLE_NAME" "export failed after $max_attempts attempt(s)"
+  echo 1 >"$STATUS_FILE"
+  return 1
+}
+
+# 并发槽位（bash 3+ 可用）
+_SEM_FIFO="$STATUS_DIR/sem.fifo"
+mkfifo "$_SEM_FIFO"
+exec 7<>"$_SEM_FIFO"
+rm -f "$_SEM_FIFO"
+for ((_i = 0; _i < CONCURRENCY; _i++)); do echo >&7; done
+
+_pids=()
+for TABLE_NAME in "${TABLE_LIST[@]}"; do
+  OUTPUT_FILE="$OUTPUT_DIR/${BATCH_ID}_${TABLE_NAME}.xlsx"
+  STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.status"
+
+  read -r -u 7
+  (
+    _export_one_table "$TABLE_NAME" "$OUTPUT_FILE" "$STATUS_FILE" || true
+    echo >&7
+  ) &
+  _pids+=("$!")
+done
+
+_fail=0
+for _pid in "${_pids[@]}"; do
+  if ! wait "$_pid"; then
+    : # 单表失败已在 STATUS_FILE 记录
+  fi
+done
+exec 7>&-
+
+for TABLE_NAME in "${TABLE_LIST[@]}"; do
+  STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.status"
+  if [[ ! -f "$STATUS_FILE" ]] || [[ "$(cat "$STATUS_FILE")" != "0" ]]; then
+    _fail=$((_fail + 1))
+  fi
+done
+
+_ok=$((${#TABLE_LIST[@]} - _fail))
+echo "[INFO] field lineage export finished at $(date -Iseconds)"
+echo "[INFO] batch id (auto): $BATCH_ID"
+echo "[INFO] succeeded: ${_ok}/${#TABLE_LIST[@]}"
+
+if [[ "$_fail" -gt 0 ]]; then
+  exit 1
+fi

@@ -39,6 +39,7 @@ class FieldLineageCandidate:
     source_table: str
     source_field: str
     transform_expression: str = ""
+    transform_explanation: str = ""
     evidence_sql: str = ""
     confidence: str = ""
     llm_notes: str = ""
