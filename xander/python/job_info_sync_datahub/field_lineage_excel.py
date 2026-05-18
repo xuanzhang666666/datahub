@@ -15,6 +15,7 @@ from .field_lineage_models import (
     FieldLineageInput,
     FieldLineageReviewStatus,
     UnresolvedField,
+    review_status_from_confidence,
 )
 
 CANDIDATE_HEADERS = [
@@ -53,9 +54,15 @@ def _style_sheet(ws) -> None:
     ws.freeze_panes = "A2"
 
 
+def _effective_review_status(candidate: FieldLineageCandidate) -> FieldLineageReviewStatus:
+    if candidate.review_status != FieldLineageReviewStatus.PENDING:
+        return candidate.review_status
+    return review_status_from_confidence(candidate.confidence)
+
+
 def _candidate_to_row(candidate: FieldLineageCandidate) -> List[str]:
     return [
-        candidate.review_status.value,
+        _effective_review_status(candidate).value,
         candidate.target_table,
         candidate.target_field,
         candidate.source_table,

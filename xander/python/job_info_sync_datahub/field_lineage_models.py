@@ -20,6 +20,13 @@ class FieldLineageReviewStatus(str, Enum):
     NEEDS_FIX = "NEEDS_FIX"
 
 
+def review_status_from_confidence(confidence: str) -> FieldLineageReviewStatus:
+    """导出 Excel 时：LLM 标记为 HIGH 的候选默认视为已审核通过。"""
+    if (confidence or "").strip().upper() == "HIGH":
+        return FieldLineageReviewStatus.APPROVED
+    return FieldLineageReviewStatus.PENDING
+
+
 @dataclass(frozen=True)
 class FieldLineageInput:
     """LLM 字段血缘解析的输入。"""

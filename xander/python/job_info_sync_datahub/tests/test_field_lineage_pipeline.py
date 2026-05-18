@@ -102,7 +102,7 @@ def test_missing_field_lineage_source_reason_none_when_etl_present() -> None:
     assert missing_field_lineage_source_reason(payload) is None
 
 
-def test_parse_field_lineage_payload_defaults_review_status_to_pending() -> None:
+def test_parse_field_lineage_payload_high_confidence_is_approved() -> None:
     payload = json.dumps(
         {
             "target_table": "default.dim_store_info",
@@ -136,10 +136,31 @@ def test_parse_field_lineage_payload_defaults_review_status_to_pending() -> None
             evidence_sql="select cast(id as bigint) as store_id",
             confidence="HIGH",
             llm_notes="direct mapping",
-            review_status=FieldLineageReviewStatus.PENDING,
+            review_status=FieldLineageReviewStatus.APPROVED,
         )
     ]
     assert parsed.unresolved_fields[0].target_field == "store_name"
+
+
+def test_parse_field_lineage_payload_non_high_confidence_stays_pending() -> None:
+    payload = json.dumps(
+        {
+            "target_table": "default.dim_store_info",
+            "mappings": [
+                {
+                    "target_field": "store_id",
+                    "source_table": "ods.store_info",
+                    "source_field": "id",
+                    "confidence": "MEDIUM",
+                }
+            ],
+            "unresolved_fields": [],
+        }
+    )
+
+    parsed = parse_field_lineage_payload(payload)
+
+    assert parsed.mappings[0].review_status == FieldLineageReviewStatus.PENDING
 
 
 def test_build_field_lineage_request_debug_info_counts_prompt_size() -> None:
@@ -203,7 +224,7 @@ def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
         "source_field",
     ]
     assert "transform_explanation" in headers
-    assert ws["A2"].value == "PENDING"
+    assert ws["A2"].value == "APPROVED"
     assert ws["B2"].value == "default.dim_store_info"
 
 
@@ -228,7 +249,7 @@ def test_load_approved_review_rows_only_returns_approved(tmp_path: Path) -> None
             target_field="pending_field",
             source_table="ods.store_info",
             source_field="name",
-            confidence="HIGH",
+            confidence="MEDIUM",
         ),
     ]
     write_candidate_workbook(
@@ -367,3 +388,43 @@ def test_import_reviewed_cli_writes_approved_plan(tmp_path: Path) -> None:
     assert payload["approved_rows"] == 1
     assert payload["rows"][0]["target_field"] == "store_id"
     assert "write_result" in payload
+
+
+def test_import_reviewed_write_without_approved_exits_4(tmp_path: Path) -> None:
+    from job_info_sync_datahub.field_lineage_cli import EXIT_NO_APPROVED_ROWS
+
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+            candidates=[
+                FieldLineageCandidate(
+                    target_table="default.dim_store_info",
+                    target_field="store_id",
+                    source_table="ods.store_info",
+                    source_field="id",
+                    confidence="MEDIUM",
+                )
+            ],
+            unresolved_fields=[],
+            llm_model="deepseek-test",
+        )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "import-reviewed",
+            "--input",
+            str(workbook),
+            "--write",
+            "--gms-url",
+            "http://localhost:8080",
+        ]
+    )
+
+    assert exit_code == EXIT_NO_APPROVED_ROWS

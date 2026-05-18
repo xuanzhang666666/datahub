@@ -173,11 +173,21 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
   fi
 
   if ! _run_cli "${IMPORT_ARGS[@]}"; then
-    echo "[ERROR] import failed: $TABLE_NAME" >&2
+    echo "[ERROR] import failed: $TABLE_NAME（若为 exit 4：Excel 无 APPROVED 行，请审核后填写 review_status=APPROVED）" >&2
     _fail=$((_fail + 1))
     continue
   fi
-  echo "[INFO] import ok: $TABLE_NAME (plan: $PLAN_FILE)"
+  if [[ "$IMPORT_WRITE" -eq 1 && -f "$PLAN_FILE" ]]; then
+    _approved_count="$(PYTHONPATH="$PYTHONPATH_ROOT" "$PYTHON" -c "import json; print(json.load(open('$PLAN_FILE'))['approved_rows'])" 2>/dev/null || echo 0)"
+    if [[ "${_approved_count:-0}" -eq 0 ]]; then
+      echo "[ERROR] $TABLE_NAME: approved_rows=0，未写入 DataHub；请将 Excel 中需导入行的 review_status 改为 APPROVED" >&2
+      _fail=$((_fail + 1))
+      continue
+    fi
+    echo "[INFO] import ok: $TABLE_NAME (approved_rows=$_approved_count, plan: $PLAN_FILE)"
+  else
+    echo "[INFO] import ok: $TABLE_NAME (plan: $PLAN_FILE)"
+  fi
 done
 
 _ok=$((${#TABLE_LIST[@]} - _fail))

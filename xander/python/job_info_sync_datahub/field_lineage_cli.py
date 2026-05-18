@@ -24,6 +24,8 @@ from .field_lineage_datahub_reader import (
 
 # 无 Etl Script / structured property 内容时跳过 LLM（shell 脚本据此汇总）
 EXIT_SKIP_NO_SOURCE = 3
+# --write 时 Excel 无 APPROVED 行
+EXIT_NO_APPROVED_ROWS = 4
 from .field_lineage_excel import load_approved_review_rows, write_candidate_workbook
 from .field_lineage_llm import call_llm_extract_field_lineage
 from .field_lineage_writer import write_approved_field_lineages
@@ -101,6 +103,12 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
     _log(f"import-reviewed started: approved_rows={len(approved)} write={args.write}")
     if not approved:
         _log("no APPROVED rows, nothing to import")
+        if args.write:
+            _log(
+                "ERROR: 已指定 --write 但 Excel 的 candidate_lineage 中无 review_status=APPROVED 行；"
+                "请人工审核后将需导入行的 review_status 改为 APPROVED 后重试"
+            )
+            return EXIT_NO_APPROVED_ROWS
         return 0
 
     missing_expr = [

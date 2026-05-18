@@ -16,8 +16,8 @@ from .field_lineage_models import (
     FieldLineageCandidate,
     FieldLineageInput,
     FieldLineageParseResult,
-    FieldLineageReviewStatus,
     UnresolvedField,
+    review_status_from_confidence,
 )
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
@@ -58,7 +58,7 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
   `优先取 ods.bach_store 表中的 store_address 字段，为空时取 ods.hd_store 表中的 store_address 字段，表示门店地址按优先级兜底合并。`
 - 禁止只写“直映”“同名字段”等过短描述；必须出现具体的来源表名与来源字段名。
 - 同一目标字段若有多来源（如 coalesce），可为每个来源各写一条 mapping，transform_expression 和 transform_explanation 填同一完整内容（含全部来源表字段）。
-- review_status 不需要输出；系统会统一置为 PENDING。
+- review_status 不需要输出；导出 Excel 时 confidence=HIGH 的行会默认 APPROVED，其余为 PENDING。
 - target_table 必须是本次输入表。
 """
 
@@ -127,7 +127,9 @@ def parse_field_lineage_payload(text: str) -> FieldLineageParseResult:
                     evidence_sql=_as_str(item.get("evidence_sql")).strip(),
                     confidence=_as_str(item.get("confidence")).strip().upper(),
                     llm_notes=_as_str(item.get("notes")).strip(),
-                    review_status=FieldLineageReviewStatus.PENDING,
+                    review_status=review_status_from_confidence(
+                        _as_str(item.get("confidence"))
+                    ),
                 )
             )
 
