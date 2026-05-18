@@ -16,7 +16,7 @@ export default function SidebarQueryOperationsSection() {
         <>
             {fineGrainedOperations.map((operation: FineGrainedOperation, index) => (
                 <SidebarSection
-                    title={`Operation ${index + 1}`}
+                    title={`字段加工逻辑 ${index + 1}`}
                     /* eslint-disable-next-line react/no-array-index-key */
                     key={index}
                     content={<SidebarQueryOperation operation={operation} />}
@@ -109,7 +109,7 @@ function OperationInputsOrOutputs({ title, columns }: { title: string; columns: 
                         </tr>
                         <tr>
                             <HeaderColumn>Columns:</HeaderColumn>
-                            <TextColumn>{columns.map(([table, col]) => `${table}.${col}`).join(', ')}</TextColumn>
+                            <TextColumn>{columns.map(([, col]) => col).join(', ')}</TextColumn>
                         </tr>
                     </tbody>
                 </table>

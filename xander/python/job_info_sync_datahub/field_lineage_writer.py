@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .field_lineage_datahub_reader import make_hive_dataset_urn
 from .field_lineage_models import FieldLineageCandidate
@@ -14,15 +15,27 @@ try:
     from datahub.emitter.mcp import MetadataChangeProposalWrapper
     from datahub.emitter.rest_emitter import DatahubRestEmitter
     from datahub.metadata.schema_classes import (
+        AuditStampClass,
+        DataPlatformInstanceClass,
         FineGrainedLineageClass,
         FineGrainedLineageDownstreamTypeClass,
         FineGrainedLineageUpstreamTypeClass,
+        QueryLanguageClass,
+        QueryPropertiesClass,
+        QuerySourceClass,
+        QueryStatementClass,
+        QuerySubjectClass,
+        QuerySubjectsClass,
         UpstreamLineageClass,
     )
+    from datahub.metadata.urns import QueryUrn
 
     _SDK_AVAILABLE = True
 except ImportError:
     _SDK_AVAILABLE = False
+
+_DEFAULT_ACTOR_URN = "urn:li:corpuser:datahub"
+_HIVE_PLATFORM_URN = "urn:li:dataPlatform:hive"
 
 
 @dataclass(frozen=True)
@@ -67,6 +80,19 @@ def _pick_transform_explanation(rows: List[FieldLineageCandidate]) -> str:
     if len(unique) == 1:
         return unique[0]
     return max(unique, key=len)
+
+
+def field_lineage_query_id(group: GroupedFieldLineage) -> str:
+    """Stable query id for a grouped field lineage (DataHub UI requires query on FGL)."""
+    key = "|".join(
+        [
+            group.target_table,
+            group.target_field,
+            group.transform_operation or "",
+            *(f"{table}.{field}" for table, field in group.sources),
+        ]
+    )
+    return f"blf_field_lineage_{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
 
 
 def build_transform_operation_for_ui(transform_expression: str, transform_explanation: str) -> str:
@@ -118,6 +144,58 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
     return grouped
 
 
+def _query_subjects_for_group(
+    group: GroupedFieldLineage,
+    platform_instance: str,
+    env: str,
+) -> List[str]:
+    downstream_urn = make_hive_dataset_urn(group.target_table, platform_instance, env)
+    subjects = [builder.make_schema_field_urn(downstream_urn, group.target_field)]
+    for source_table, source_field in group.sources:
+        source_urn = make_hive_dataset_urn(source_table, platform_instance, env)
+        subjects.append(builder.make_schema_field_urn(source_urn, source_field))
+    return subjects
+
+
+def emit_field_lineage_query_entities(
+    emitter: "DatahubRestEmitter",
+    groups: Iterable[GroupedFieldLineage],
+    platform_instance: str,
+    env: str,
+) -> int:
+    """Emit Query entities so lineage UI can show transformOperation (LOGIC)."""
+    emitted = 0
+    for group in groups:
+        if not group.transform_operation:
+            continue
+        query_urn = QueryUrn(field_lineage_query_id(group)).urn()
+        audit = AuditStampClass(time=0, actor=_DEFAULT_ACTOR_URN)
+        for mcp in MetadataChangeProposalWrapper.construct_many(
+            query_urn,
+            aspects=[
+                QueryPropertiesClass(
+                    statement=QueryStatementClass(
+                        value=group.transform_operation,
+                        language=QueryLanguageClass.SQL,
+                    ),
+                    source=QuerySourceClass.MANUAL,
+                    created=audit,
+                    lastModified=audit,
+                ),
+                QuerySubjectsClass(
+                    subjects=[
+                        QuerySubjectClass(entity=subject)
+                        for subject in _query_subjects_for_group(group, platform_instance, env)
+                    ]
+                ),
+                DataPlatformInstanceClass(platform=_HIVE_PLATFORM_URN),
+            ],
+        ):
+            emitter.emit_mcp(mcp)
+        emitted += 1
+    return emitted
+
+
 def build_fine_grained_lineage_class(
     group: GroupedFieldLineage,
     platform_instance: str = "blf-prod-hive",
@@ -143,6 +221,7 @@ def build_fine_grained_lineage_class(
     }
     if group.transform_operation:
         kwargs["transformOperation"] = group.transform_operation
+        kwargs["query"] = QueryUrn(field_lineage_query_id(group)).urn()
     return FineGrainedLineageClass(**kwargs)
 
 
@@ -158,21 +237,9 @@ def _field_name_from_schema_field_urn(urn: str) -> Optional[str]:
 def merge_fine_grained_lineages(
     existing: Optional[List[FineGrainedLineageClass]],
     new_entries: List[FineGrainedLineageClass],
-    replace_target_fields: Set[str],
 ) -> List[FineGrainedLineageClass]:
-    """保留未覆盖字段的旧条目，用新条目替换同目标字段。"""
-    kept: List[FineGrainedLineageClass] = []
-    for entry in existing or []:
-        downstream_names: Set[str] = set()
-        for urn in entry.downstreams or []:
-            if isinstance(urn, str):
-                name = _field_name_from_schema_field_urn(urn)
-                if name:
-                    downstream_names.add(name)
-        if downstream_names & replace_target_fields:
-            continue
-        kept.append(entry)
-    return kept + new_entries
+    """Excel 导入以本次审核结果为准，清空目标表旧字段血缘后再写入。"""
+    return list(new_entries)
 
 
 def write_approved_field_lineages(
@@ -201,6 +268,7 @@ def write_approved_field_lineages(
             "downstream_urn": downstream_urn,
             "field_count": len(groups),
             "with_transform_operation": sum(1 for g in groups if g.transform_operation),
+            "replacement_mode": "replace_all_fine_grained_lineages_for_table",
             "fields": [
                 {
                     "target_field": g.target_field,
@@ -219,27 +287,36 @@ def write_approved_field_lineages(
         new_entries = [
             build_fine_grained_lineage_class(g, platform_instance, env) for g in groups
         ]
-        replace_fields = {g.target_field for g in groups}
 
         from datahub.ingestion.graph.client import DataHubGraph, DatahubClientConfig
+
+        emitter = DatahubRestEmitter(gms_url, token=token)
+        queries_emitted = emit_field_lineage_query_entities(
+            emitter, groups, platform_instance, env
+        )
+        table_result["queries_emitted"] = queries_emitted
 
         graph = DataHubGraph(DatahubClientConfig(server=gms_url.rstrip("/"), token=token))
         existing: Optional[UpstreamLineageClass] = graph.get_aspect(
             entity_urn=downstream_urn,
             aspect_type=UpstreamLineageClass,
         )
+        existing_fg_count = (
+            len(existing.fineGrainedLineages)
+            if existing and existing.fineGrainedLineages
+            else 0
+        )
         merged_fg = merge_fine_grained_lineages(
             list(existing.fineGrainedLineages) if existing and existing.fineGrainedLineages else None,
             new_entries,
-            replace_fields,
         )
+        table_result["cleared_existing_fine_grained_count"] = existing_fg_count
 
         aspect = UpstreamLineageClass(
             upstreams=list(existing.upstreams) if existing and existing.upstreams else [],
             fineGrainedLineages=merged_fg,
         )
         mcp = MetadataChangeProposalWrapper(entityUrn=downstream_urn, aspect=aspect)
-        emitter = DatahubRestEmitter(gms_url, token=token)
         emitter.emit_mcp(mcp)
         table_result["written"] = True
         table_result["fine_grained_count_after_merge"] = len(merged_fg)

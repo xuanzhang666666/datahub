@@ -1,9 +1,15 @@
-import React, { useCallback, useContext, useEffect, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { useOnSelectionChange, useStore } from 'reactflow';
 import styled from 'styled-components/macro';
 
 import translateFieldPath from '@app/entityV2/dataset/profile/schema/utils/translateFieldPath';
-import { LineageDisplayContext, LineageEntity, LineageNodesContext } from '@app/lineageV3/common';
+import {
+    FineGrainedOperationRef,
+    LineageDisplayContext,
+    LineageEntity,
+    LineageNodesContext,
+    parseColumnRef,
+} from '@app/lineageV3/common';
 import CompactContext from '@app/shared/CompactContext';
 import EntitySidebarContext, { FineGrainedOperation } from '@app/sharedV2/EntitySidebarContext';
 import useSidebarWidth from '@app/sharedV2/sidebar/useSidebarWidth';
@@ -26,11 +32,16 @@ const SidebarWrapper = styled.div<{ $distanceFromTop: number }>`
 `;
 
 export default function LineageSidebar() {
-    const { rootUrn } = useContext(LineageNodesContext);
+    const { rootUrn, nodes } = useContext(LineageNodesContext);
+    const { selectedColumn } = useContext(LineageDisplayContext);
     const entityRegistry = useEntityRegistry();
     const [selectedEntity, setSelectedEntity] = useSelectedNode();
     const resetSelectedElements = useStore((actions) => actions.resetSelectedElements);
-    const queryDetails = useQueryDetails(selectedEntity);
+    const sidebarEntity = useMemo(
+        () => selectedEntity || getSelectedColumnEntity(selectedColumn, nodes),
+        [selectedColumn, selectedEntity, nodes],
+    );
+    const queryDetails = useQueryDetails(sidebarEntity);
     const width = useSidebarWidth();
 
     const setSidebarClosed = useCallback(
@@ -49,7 +60,7 @@ export default function LineageSidebar() {
     }, [rootUrn]);
 
     // This manages closing, rather than isClosed
-    if (!selectedEntity) {
+    if (!sidebarEntity) {
         return null;
     }
 
@@ -60,13 +71,13 @@ export default function LineageSidebar() {
                 isClosed: false,
                 setSidebarClosed,
                 forLineage: true,
-                separateSiblings: !selectedEntity.entity?.lineageSiblingIcon,
+                separateSiblings: !sidebarEntity.entity?.lineageSiblingIcon,
                 fineGrainedOperations: queryDetails,
             }}
         >
             <SidebarWrapper $distanceFromTop={0}>
-                <CompactContext.Provider key={selectedEntity.urn} value>
-                    {entityRegistry.renderProfile(selectedEntity.type, selectedEntity.urn)}
+                <CompactContext.Provider key={sidebarEntity.urn} value>
+                    {entityRegistry.renderProfile(sidebarEntity.type, sidebarEntity.urn)}
                 </CompactContext.Provider>
             </SidebarWrapper>
         </EntitySidebarContext.Provider>
@@ -88,19 +99,54 @@ function useSelectedNode(): [LineageEntity | null, (v: LineageEntity | null) => 
     return [selectedNode, setSelectedNode];
 }
 
+function getSelectedColumnEntity(
+    selectedColumn: string | null,
+    nodes: Map<string, LineageEntity>,
+): LineageEntity | null {
+    if (!selectedColumn) {
+        return null;
+    }
+    const [columnUrn] = parseColumnRef(selectedColumn);
+    return nodes.get(columnUrn) || null;
+}
+
 function useQueryDetails(selectedNode: LineageEntity | null): FineGrainedOperation[] | undefined {
     const { nodes } = useContext(LineageNodesContext);
-    const { cllHighlightedNodes, fineGrainedOperations } = useContext(LineageDisplayContext);
+    const { cllHighlightedNodes, fineGrainedOperations, selectedColumn } = useContext(LineageDisplayContext);
 
-    if (selectedNode) {
-        return Array.from(cllHighlightedNodes.get(selectedNode.urn) || []).map((ref) => {
-            const data = fineGrainedOperations.get(ref);
-            return {
-                inputColumns: getColumnNames(nodes, data?.inputColumns),
-                outputColumns: getColumnNames(nodes, data?.outputColumns),
-                transformOperation: data?.transformOperation,
-            };
+    const operationRefs = collectOperationRefsForSidebar(
+        selectedColumn,
+        selectedNode,
+        cllHighlightedNodes,
+    );
+    if (!operationRefs.length) {
+        return undefined;
+    }
+
+    return operationRefs.map((ref) => {
+        const data = fineGrainedOperations.get(ref);
+        return {
+            inputColumns: getColumnNames(nodes, data?.inputColumns),
+            outputColumns: getColumnNames(nodes, data?.outputColumns),
+            transformOperation: data?.transformOperation,
+        };
+    });
+}
+
+function collectOperationRefsForSidebar(
+    selectedColumn: string | null,
+    selectedNode: LineageEntity | null,
+    cllHighlightedNodes: Map<string, Set<FineGrainedOperationRef> | null>,
+): FineGrainedOperationRef[] {
+    if (selectedColumn) {
+        const refs = new Set<FineGrainedOperationRef>();
+        cllHighlightedNodes.forEach((nodeRefs) => {
+            nodeRefs?.forEach((ref) => refs.add(ref));
         });
+        return Array.from(refs);
+    }
+    if (selectedNode) {
+        return Array.from(cllHighlightedNodes.get(selectedNode.urn) || []);
     }
     return [];
 }

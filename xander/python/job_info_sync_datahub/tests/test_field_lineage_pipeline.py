@@ -347,6 +347,8 @@ def test_build_fine_grained_sets_transform_operation() -> None:
         "/* 中文解释：取 ods.store_info 表中的 id 字段，表示将门店 ID 转为 bigint 类型写入 store_id。 */\n"
         "cast(id as bigint)"
     )
+    assert fg.query is not None
+    assert str(fg.query).startswith("urn:li:query:blf_field_lineage_")
     assert len(fg.upstreams) == 1
 
 
@@ -388,6 +390,8 @@ def test_import_reviewed_cli_writes_approved_plan(tmp_path: Path) -> None:
     assert payload["approved_rows"] == 1
     assert payload["rows"][0]["target_field"] == "store_id"
     assert "write_result" in payload
+    table_result = payload["write_result"]["tables"]["default.dim_store_info"]
+    assert table_result["replacement_mode"] == "replace_all_fine_grained_lineages_for_table"
 
 
 def test_import_reviewed_write_without_approved_exits_4(tmp_path: Path) -> None:
