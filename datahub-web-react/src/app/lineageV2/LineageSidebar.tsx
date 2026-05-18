@@ -126,6 +126,7 @@ function useQueryDetails(selectedNode: LineageEntity | null): FineGrainedOperati
         selectedColumn,
         selectedNode,
         cllHighlightedNodes,
+        fineGrainedOperations,
     );
     if (!operationRefs.length) {
         return undefined;
@@ -145,11 +146,22 @@ function collectOperationRefsForSidebar(
     selectedColumn: string | null,
     selectedNode: LineageEntity | null,
     cllHighlightedNodes: Map<string, Set<FineGrainedOperationRef> | null>,
+    fineGrainedOperations: Map<FineGrainedOperationRef, FineGrainedOperation>,
 ): FineGrainedOperationRef[] {
     if (selectedColumn) {
+        const [selectedColumnUrn, selectedColumnPath] = parseColumnRef(selectedColumn);
         const refs = new Set<FineGrainedOperationRef>();
         cllHighlightedNodes.forEach((nodeRefs) => {
-            nodeRefs?.forEach((ref) => refs.add(ref));
+            nodeRefs?.forEach((ref) => {
+                const operation = fineGrainedOperations.get(ref);
+                if (
+                    operation?.outputColumns?.some(
+                        ([urn, path]) => urn === selectedColumnUrn && path === selectedColumnPath,
+                    )
+                ) {
+                    refs.add(ref);
+                }
+            });
         });
         return Array.from(refs);
     }
