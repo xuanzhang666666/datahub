@@ -5,6 +5,8 @@ import styled from 'styled-components';
 import { SidebarSection } from '@app/entityV2/shared/containers/profile/sidebar/SidebarSection';
 import EntitySidebarContext, { FineGrainedOperation } from '@app/sharedV2/EntitySidebarContext';
 
+const ONE_LINE_CHINESE_EXPLANATION_COMMENT = /^(\s*)\/\*\s*(中文解释：.*?)\s*\*\/\s*$/;
+
 export default function SidebarQueryOperationsSection() {
     const { fineGrainedOperations } = useContext(EntitySidebarContext);
 
@@ -68,11 +70,28 @@ const PreviewSyntax = styled(SyntaxHighlighter)`
     max-width: 100%;
     max-height: 150px;
     overflow: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
 
     span {
         font-family: 'Roboto Mono', monospace;
     }
 `;
+
+export function formatTransformOperationForDisplay(transformOperation: string) {
+    return transformOperation
+        .split('\n')
+        .map((line) => {
+            const match = line.match(ONE_LINE_CHINESE_EXPLANATION_COMMENT);
+            if (!match) {
+                return line;
+            }
+
+            const [, indent, explanation] = match;
+            return `${indent}/*\n${indent}${explanation}\n${indent}*/`;
+        })
+        .join('\n');
+}
 
 function SidebarQueryOperation({ operation }: { operation: FineGrainedOperation }) {
     return (
@@ -80,8 +99,14 @@ function SidebarQueryOperation({ operation }: { operation: FineGrainedOperation 
             {operation.transformOperation && (
                 <Section key="logic">
                     <SectionHeader>LOGIC</SectionHeader>
-                    <PreviewSyntax language="sql" showLineNumbers wrapLines lineNumberStyle={{ display: 'none' }}>
-                        {operation.transformOperation}
+                    <PreviewSyntax
+                        language="sql"
+                        showLineNumbers
+                        wrapLines
+                        wrapLongLines
+                        lineNumberStyle={{ display: 'none' }}
+                    >
+                        {formatTransformOperationForDisplay(operation.transformOperation)}
                     </PreviewSyntax>
                 </Section>
             )}
