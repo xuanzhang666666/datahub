@@ -347,8 +347,7 @@ def test_build_fine_grained_sets_transform_operation() -> None:
         "/* 中文解释：取 ods.store_info 表中的 id 字段，表示将门店 ID 转为 bigint 类型写入 store_id。 */\n"
         "cast(id as bigint)"
     )
-    assert fg.query is not None
-    assert str(fg.query).startswith("urn:li:query:blf_field_lineage_")
+    assert fg.query is None
     assert len(fg.upstreams) == 1
 
 

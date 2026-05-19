@@ -1,6 +1,7 @@
 import { PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
 import { Plus } from '@phosphor-icons/react/dist/csr/Plus';
 import React, { useState } from 'react';
+import styled from 'styled-components';
 
 import { EMPTY_MESSAGES } from '@app/entityV2/shared/constants';
 import EmptySectionText from '@app/entityV2/shared/containers/profile/sidebar/EmptySectionText';
@@ -47,6 +48,14 @@ interface Props {
 }
 
 const MAX_STRUCTURED_PROPERTIES_TO_FETCH = 100;
+
+const ScrollableValueContent = styled.div`
+    max-height: 600px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    white-space: pre-wrap;
+    word-break: break-word;
+`;
 
 const SidebarStructuredProperties = ({ properties }: Props) => {
     const { entityData, entityType } = useEntityData();
@@ -134,7 +143,7 @@ const SidebarStructuredProperties = ({ properties }: Props) => {
                             content={
                                 <>
                                     {values ? (
-                                        <>
+                                        <ScrollableValueContent>
                                             {values.map((val) => (
                                                 <StructuredPropertyValue
                                                     value={val}
@@ -144,7 +153,7 @@ const SidebarStructuredProperties = ({ properties }: Props) => {
                                                     dataTestId={`property-${propertyName}-value-${val.value}`}
                                                 />
                                             ))}
-                                        </>
+                                        </ScrollableValueContent>
                                     ) : (
                                         <EmptySectionText message={EMPTY_MESSAGES.structuredProps.title} />
                                     )}

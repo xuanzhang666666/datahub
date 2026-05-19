@@ -86,6 +86,20 @@ export default function getFineGrainedLineage(
                     outputColumns: entry.downstreams?.map((ref) => [ref.urn, ref.path]) || undefined,
                     transformOperation: entry.transformOperation || undefined,
                 });
+            } else if (entry.transformOperation) {
+                // No query entity — create a synthetic operationRef so the sidebar can display
+                // transformOperation (LOGIC) while still drawing direct column-level edges.
+                operationRef = createFineGrainedOperationRef(
+                    `${node.urn}:::direct`,
+                    entry.upstreams,
+                    entry.downstreams,
+                );
+                fineGrainedOperations.set(operationRef, {
+                    inputColumns: entry.upstreams?.map((ref) => [ref.urn, ref.path]) || undefined,
+                    outputColumns: entry.downstreams?.map((ref) => [ref.urn, ref.path]) || undefined,
+                    transformOperation: entry.transformOperation || undefined,
+                });
+                // queryRef stays undefined → processEdge will create a direct edge (no intermediate node)
             }
             entry.upstreams?.forEach((upstream) => {
                 entry.downstreams?.forEach((downstream) => {
@@ -139,8 +153,10 @@ function addFineGrainedEdges(
         setDefault(fgl.downstream, upstreamRef, new Map()).set(queryRef, operationRef);
         setDefault(fgl.downstream, queryRef, new Map()).set(downstreamRef, null);
     } else {
-        setDefault(fgl.upstream, downstreamRef, new Map()).set(upstreamRef, null);
-        setDefault(fgl.downstream, upstreamRef, new Map()).set(downstreamRef, null);
+        // Direct edge (no intermediate query node). Carry operationRef so cllHighlightedNodes
+        // can reference the operation and the sidebar can display transformOperation (LOGIC).
+        setDefault(fgl.upstream, downstreamRef, new Map()).set(upstreamRef, operationRef ?? null);
+        setDefault(fgl.downstream, upstreamRef, new Map()).set(downstreamRef, operationRef ?? null);
     }
 }
 

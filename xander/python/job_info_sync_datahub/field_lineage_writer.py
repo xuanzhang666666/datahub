@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .field_lineage_datahub_reader import make_hive_dataset_urn
 from .field_lineage_models import FieldLineageCandidate
@@ -15,27 +14,15 @@ try:
     from datahub.emitter.mcp import MetadataChangeProposalWrapper
     from datahub.emitter.rest_emitter import DatahubRestEmitter
     from datahub.metadata.schema_classes import (
-        AuditStampClass,
-        DataPlatformInstanceClass,
         FineGrainedLineageClass,
         FineGrainedLineageDownstreamTypeClass,
         FineGrainedLineageUpstreamTypeClass,
-        QueryLanguageClass,
-        QueryPropertiesClass,
-        QuerySourceClass,
-        QueryStatementClass,
-        QuerySubjectClass,
-        QuerySubjectsClass,
         UpstreamLineageClass,
     )
-    from datahub.metadata.urns import QueryUrn
 
     _SDK_AVAILABLE = True
 except ImportError:
     _SDK_AVAILABLE = False
-
-_DEFAULT_ACTOR_URN = "urn:li:corpuser:datahub"
-_HIVE_PLATFORM_URN = "urn:li:dataPlatform:hive"
 
 
 @dataclass(frozen=True)
@@ -80,19 +67,6 @@ def _pick_transform_explanation(rows: List[FieldLineageCandidate]) -> str:
     if len(unique) == 1:
         return unique[0]
     return max(unique, key=len)
-
-
-def field_lineage_query_id(group: GroupedFieldLineage) -> str:
-    """Stable query id for a grouped field lineage (DataHub UI requires query on FGL)."""
-    key = "|".join(
-        [
-            group.target_table,
-            group.target_field,
-            group.transform_operation or "",
-            *(f"{table}.{field}" for table, field in group.sources),
-        ]
-    )
-    return f"blf_field_lineage_{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
 
 
 def build_transform_operation_for_ui(transform_expression: str, transform_explanation: str) -> str:
@@ -144,58 +118,6 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
     return grouped
 
 
-def _query_subjects_for_group(
-    group: GroupedFieldLineage,
-    platform_instance: str,
-    env: str,
-) -> List[str]:
-    downstream_urn = make_hive_dataset_urn(group.target_table, platform_instance, env)
-    subjects = [builder.make_schema_field_urn(downstream_urn, group.target_field)]
-    for source_table, source_field in group.sources:
-        source_urn = make_hive_dataset_urn(source_table, platform_instance, env)
-        subjects.append(builder.make_schema_field_urn(source_urn, source_field))
-    return subjects
-
-
-def emit_field_lineage_query_entities(
-    emitter: "DatahubRestEmitter",
-    groups: Iterable[GroupedFieldLineage],
-    platform_instance: str,
-    env: str,
-) -> int:
-    """Emit Query entities so lineage UI can show transformOperation (LOGIC)."""
-    emitted = 0
-    for group in groups:
-        if not group.transform_operation:
-            continue
-        query_urn = QueryUrn(field_lineage_query_id(group)).urn()
-        audit = AuditStampClass(time=0, actor=_DEFAULT_ACTOR_URN)
-        for mcp in MetadataChangeProposalWrapper.construct_many(
-            query_urn,
-            aspects=[
-                QueryPropertiesClass(
-                    statement=QueryStatementClass(
-                        value=group.transform_operation,
-                        language=QueryLanguageClass.SQL,
-                    ),
-                    source=QuerySourceClass.MANUAL,
-                    created=audit,
-                    lastModified=audit,
-                ),
-                QuerySubjectsClass(
-                    subjects=[
-                        QuerySubjectClass(entity=subject)
-                        for subject in _query_subjects_for_group(group, platform_instance, env)
-                    ]
-                ),
-                DataPlatformInstanceClass(platform=_HIVE_PLATFORM_URN),
-            ],
-        ):
-            emitter.emit_mcp(mcp)
-        emitted += 1
-    return emitted
-
-
 def build_fine_grained_lineage_class(
     group: GroupedFieldLineage,
     platform_instance: str = "blf-prod-hive",
@@ -204,7 +126,6 @@ def build_fine_grained_lineage_class(
     if not _SDK_AVAILABLE:
         raise RuntimeError("需要安装 acryl-datahub 才能写入字段血缘")
 
-    target_ref = _parse_table_ref(group.target_table)
     downstream_urn = make_hive_dataset_urn(group.target_table, platform_instance, env)
     upstream_field_urns = []
     for source_table, source_field in group.sources:
@@ -221,7 +142,6 @@ def build_fine_grained_lineage_class(
     }
     if group.transform_operation:
         kwargs["transformOperation"] = group.transform_operation
-        kwargs["query"] = QueryUrn(field_lineage_query_id(group)).urn()
     return FineGrainedLineageClass(**kwargs)
 
 
@@ -291,10 +211,6 @@ def write_approved_field_lineages(
         from datahub.ingestion.graph.client import DataHubGraph, DatahubClientConfig
 
         emitter = DatahubRestEmitter(gms_url, token=token)
-        queries_emitted = emit_field_lineage_query_entities(
-            emitter, groups, platform_instance, env
-        )
-        table_result["queries_emitted"] = queries_emitted
 
         graph = DataHubGraph(DatahubClientConfig(server=gms_url.rstrip("/"), token=token))
         existing: Optional[UpstreamLineageClass] = graph.get_aspect(

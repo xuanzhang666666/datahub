@@ -110,35 +110,6 @@ function SidebarQueryOperation({ operation }: { operation: FineGrainedOperation 
                     </PreviewSyntax>
                 </Section>
             )}
-            {operation.inputColumns?.length && (
-                <OperationInputsOrOutputs title="inputs" columns={operation.inputColumns} />
-            )}
-            {operation.outputColumns?.length && (
-                <OperationInputsOrOutputs title="outputs" columns={operation.outputColumns} />
-            )}
         </OperationContainer>
-    );
-}
-
-function OperationInputsOrOutputs({ title, columns }: { title: string; columns: Array<[string, string]> }) {
-    const tables = Array.from(new Set(columns.map(([name]) => name)));
-    return (
-        <Section key={title}>
-            <SectionHeader>{title.toLocaleUpperCase()}</SectionHeader>
-            <div>
-                <table cellSpacing={0} cellPadding={0}>
-                    <tbody>
-                        <tr>
-                            <HeaderColumn>Tables:</HeaderColumn>
-                            <TextColumn>{tables.join(', ')}</TextColumn>
-                        </tr>
-                        <tr>
-                            <HeaderColumn>Columns:</HeaderColumn>
-                            <TextColumn>{columns.map(([, col]) => col).join(', ')}</TextColumn>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-        </Section>
     );
 }

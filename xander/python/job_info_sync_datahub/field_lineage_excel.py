@@ -123,8 +123,32 @@ def _row_dict(headers: List[str], values: List[object]) -> Dict[str, str]:
     return out
 
 
+def _expand_multi_source_tables(rec: Dict[str, str]) -> List[Dict[str, str]]:
+    """Expand a row whose source_table contains comma-separated table names.
+
+    LLM sometimes writes multiple upstream tables in a single cell, e.g.
+    "default.table_a, default.table_b".  We fan-out each table name into its
+    own record so the importer can generate one FineGrainedLineage entry per
+    upstream table.
+    """
+    raw = rec.get("source_table", "")
+    tables = [t.strip() for t in raw.split(",") if t.strip()]
+    if len(tables) <= 1:
+        return [rec]
+    expanded = []
+    for tbl in tables:
+        copy = dict(rec)
+        copy["source_table"] = tbl
+        expanded.append(copy)
+    return expanded
+
+
 def load_approved_review_rows(path: Path) -> List[FieldLineageCandidate]:
-    """Read only APPROVED rows from a human-reviewed workbook."""
+    """Read only APPROVED rows from a human-reviewed workbook.
+
+    Rows whose ``source_table`` cell contains comma-separated table names are
+    automatically expanded into one candidate per source table.
+    """
     wb = load_workbook(path)
     if "candidate_lineage" not in wb.sheetnames:
         raise RuntimeError("Excel 缺少 candidate_lineage 工作表")
@@ -136,20 +160,21 @@ def load_approved_review_rows(path: Path) -> List[FieldLineageCandidate]:
         status = rec.get("review_status", "").upper()
         if status != FieldLineageReviewStatus.APPROVED.value:
             continue
-        approved.append(
-            FieldLineageCandidate(
-                target_table=rec.get("target_table", "").lower(),
-                target_field=rec.get("target_field", "").lower(),
-                source_table=rec.get("source_table", "").lower(),
-                source_field=rec.get("source_field", "").lower(),
-                transform_expression=rec.get("transform_expression", ""),
-                transform_explanation=rec.get("transform_explanation", ""),
-                evidence_sql=rec.get("evidence_sql", ""),
-                confidence=rec.get("confidence", "").upper(),
-                llm_notes=rec.get("llm_notes", ""),
-                reviewer_notes=rec.get("reviewer_notes", ""),
-                import_error=rec.get("import_error", ""),
-                review_status=FieldLineageReviewStatus.APPROVED,
+        for expanded_rec in _expand_multi_source_tables(rec):
+            approved.append(
+                FieldLineageCandidate(
+                    target_table=expanded_rec.get("target_table", "").lower(),
+                    target_field=expanded_rec.get("target_field", "").lower(),
+                    source_table=expanded_rec.get("source_table", "").lower(),
+                    source_field=expanded_rec.get("source_field", "").lower(),
+                    transform_expression=expanded_rec.get("transform_expression", ""),
+                    transform_explanation=expanded_rec.get("transform_explanation", ""),
+                    evidence_sql=expanded_rec.get("evidence_sql", ""),
+                    confidence=expanded_rec.get("confidence", "").upper(),
+                    llm_notes=expanded_rec.get("llm_notes", ""),
+                    reviewer_notes=expanded_rec.get("reviewer_notes", ""),
+                    import_error=expanded_rec.get("import_error", ""),
+                    review_status=FieldLineageReviewStatus.APPROVED,
+                )
             )
-        )
     return approved

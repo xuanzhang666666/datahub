@@ -1,9 +1,12 @@
+import { colors } from '@components';
+import { X } from '@phosphor-icons/react';
 import React, { useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useOnSelectionChange, useStore } from 'reactflow';
 import styled from 'styled-components/macro';
 
 import translateFieldPath from '@app/entityV2/dataset/profile/schema/utils/translateFieldPath';
+import SidebarQueryOperationsSection from '@app/entityV2/shared/containers/profile/sidebar/Query/SidebarQueryOperationsSection';
 import {
     FineGrainedOperationRef,
     LineageDisplayContext,
@@ -30,6 +33,49 @@ const SidebarWrapper = styled.div<{ $distanceFromTop: number }>`
             display: none;
         }
     }
+`;
+
+const ColumnLogicWrapper = styled.div`
+    background: #fff;
+    border-left: 1px solid ${colors.gray[100]};
+    box-shadow: -2px 0 8px rgba(0, 0, 0, 0.08);
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-width: 320px;
+    max-width: 400px;
+    overflow-y: auto;
+`;
+
+const ColumnLogicHeader = styled.div`
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid ${colors.gray[100]};
+    font-weight: 600;
+    font-size: 14px;
+    color: ${colors.gray[700]};
+    flex-shrink: 0;
+`;
+
+const CloseButton = styled.button`
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 2px;
+    display: flex;
+    align-items: center;
+    color: ${colors.gray[500]};
+    &:hover {
+        color: ${colors.gray[800]};
+    }
+`;
+
+const ColumnLogicBody = styled.div`
+    padding: 8px 4px;
+    overflow-y: auto;
+    flex: 1;
 `;
 
 interface Props {
@@ -64,11 +110,47 @@ export default function LineageSidebar({ urn }: Props) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [urn]);
 
-    // This manages closing, rather than isClosed
     if (!sidebarEntity) {
         return null;
     }
 
+    // Column click (no table node selected): show lightweight LOGIC-only panel
+    if (selectedColumn && !selectedEntity) {
+        if (!queryDetails?.length) {
+            return null;
+        }
+        return (
+            <EntitySidebarContext.Provider
+                value={{
+                    width,
+                    isClosed: false,
+                    setSidebarClosed,
+                    forLineage: true,
+                    separateSiblings: false,
+                    fineGrainedOperations: queryDetails,
+                }}
+            >
+                {createPortal(
+                    <SidebarWrapper $distanceFromTop={0}>
+                        <ColumnLogicWrapper>
+                            <ColumnLogicHeader>
+                                字段加工逻辑
+                                <CloseButton onClick={() => setSidebarClosed(true)}>
+                                    <X size={16} />
+                                </CloseButton>
+                            </ColumnLogicHeader>
+                            <ColumnLogicBody>
+                                <SidebarQueryOperationsSection />
+                            </ColumnLogicBody>
+                        </ColumnLogicWrapper>
+                    </SidebarWrapper>,
+                    document.body,
+                )}
+            </EntitySidebarContext.Provider>
+        );
+    }
+
+    // Table node selected: show full entity profile
     return (
         <EntitySidebarContext.Provider
             value={{
