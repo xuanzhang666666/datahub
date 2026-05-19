@@ -86,6 +86,14 @@ def test_extract_job_path_job_glued_dollar_var() -> None:
     assert kind == "job"
 
 
+def test_extract_job_path_ignores_inline_comment_after_path() -> None:
+    shell = "/home/w/thrall/bin/w-run-task.sh dw_ordering/nostore_spu_abc_di # $WHICH_DATA"
+    path, kind = extract_job_path_and_type(shell)
+    assert path == "dw_ordering/nostore_spu_abc_di"
+    assert kind == "job"
+    assert job_file_name(path, kind) == "dw_ordering_nostore_spu_abc_di.job"
+
+
 def test_extract_job_path_job_nbsp_before_dollar() -> None:
     """非常规空白（NBSP）分隔时，``split()`` 拆不出 ``$`` token，须靠正则截断。"""
     nbsp = "\u00a0"

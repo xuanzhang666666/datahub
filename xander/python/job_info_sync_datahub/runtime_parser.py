@@ -119,10 +119,12 @@ def extract_gitlab_name(shell: str) -> str:
 
 
 def _trim_runner_line_for_job_path(line: str) -> str:
-    """去掉 runner 行上的 ``||`` 降级与 shell 管道 ``|`` 右侧，避免污染 job_path。"""
+    """去掉 runner 行上的 shell 控制片段，避免污染 job_path。"""
     line = re.split(r"\s*\|\|", line)[0].strip()
     if "|" in line:
         line = line.split("|", 1)[0].strip()
+    if "#" in line:
+        line = line.split("#", 1)[0].strip()
     return line
 
 
