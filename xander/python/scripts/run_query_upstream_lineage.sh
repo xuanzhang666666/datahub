@@ -98,11 +98,14 @@ echo "[INFO] gms url: $GMS_URL"
 echo "[INFO] python: $PYTHON"
 echo "[INFO] ----------------------------------------"
 
-PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
-    "$PYTHON" -m job_info_sync_datahub.query_upstream_lineage \
-    "${TABLE_NAME_ARGS[@]}" \
-    --gms-url "$GMS_URL" \
-    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+(
+    cd "$PYTHONPATH_ROOT"
+    PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+        "$PYTHON" -m job_info_sync_datahub.query_upstream_lineage \
+        "${TABLE_NAME_ARGS[@]}" \
+        --gms-url "$GMS_URL" \
+        ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+)
 
 EXIT_CODE=$?
 echo "[INFO] ----------------------------------------"

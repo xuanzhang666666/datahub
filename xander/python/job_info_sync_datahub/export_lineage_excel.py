@@ -162,6 +162,8 @@ def build_rows(
                 _status_text(rep, aud),
                 _big_category(rep, aud),
                 _detail(rep, aud),
+                str(rep.get("llm_raw_export_path") or ""),
+                str(rep.get("etl_file_export_path") or ""),
             ]
         )
     return rows
@@ -179,6 +181,8 @@ HEADERS = [
     "解析状态",
     "异常原因大分类",
     "异常原因明细",
+    "DeepSeek原始响应路径",
+    "ETL脚本快照路径",
 ]
 
 

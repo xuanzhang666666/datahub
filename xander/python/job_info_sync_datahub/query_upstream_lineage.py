@@ -38,10 +38,14 @@ Jenkins 部署::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .field_lineage_datahub_reader import (
     extract_property_texts,
@@ -177,6 +181,55 @@ def check_structured_properties(
     return bool(etl_script.strip()), bool(execute_shell.strip())
 
 
+def _dataset_aspect_url(gms_url: str, dataset_urn: str, aspect_name: str) -> str:
+    encoded = urllib.parse.quote(dataset_urn, safe="")
+    return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/{aspect_name}"
+
+
+def _fetch_dataset_aspect(
+    gms_url: str,
+    dataset_urn: str,
+    aspect_name: str,
+    token: Optional[str] = None,
+    timeout_sec: int = 60,
+) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        _dataset_aspect_url(gms_url, dataset_urn, aspect_name),
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def is_view_dataset(gms_url: str, token: Optional[str], dataset_urn: str) -> bool:
+    """Return true when DataHub has a viewProperties aspect for this dataset."""
+    try:
+        payload = _fetch_dataset_aspect(gms_url, dataset_urn, "viewProperties", token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} viewProperties 失败 HTTP {exc.code}",
+            file=sys.stderr,
+        )
+        return False
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} viewProperties 失败: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+    current: Any = payload
+    for key in ("viewProperties", "value"):
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+    return isinstance(current, dict) and bool(current.get("viewLogic"))
+
+
 # ---------------------------------------------------------------------------
 # 主逻辑
 # ---------------------------------------------------------------------------
@@ -267,6 +320,7 @@ def run(
     print("[INFO] 开始检查结构化属性...")
 
     missing_props: Dict[str, List[str]] = {}
+    skipped_view_tables: List[str] = []
     for t in upstream_tables:
         urn = make_hive_dataset_urn(t, platform_instance, env)
         has_etl, has_shell = check_structured_properties(gms_url, token, urn)
@@ -276,9 +330,20 @@ def run(
         if not has_shell:
             missing.append(_LABEL_EXECUTE_SHELL)
         if missing:
+            if is_view_dataset(gms_url, token, urn):
+                skipped_view_tables.append(t)
+                continue
             missing_props[t] = missing
 
     print()
+    if skipped_view_tables:
+        print(
+            f"[INFO] 以下 {len(skipped_view_tables)} 个上游表是视图，允许 Etl Script / Execute Shell 为空:"
+        )
+        for t in sorted(skipped_view_tables):
+            print(f"  {t}")
+        print()
+
     if missing_props:
         print(f"[WARN] 以下 {len(missing_props)} 个上游表缺少结构化属性，请补充后再做字段血缘分析:")
         print()

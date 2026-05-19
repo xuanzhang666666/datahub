@@ -22,12 +22,14 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -70,6 +72,77 @@ _TRINO_HOST = os.getenv("TRINO_HOST", "10.253.7.167")
 _TRINO_PORT = int(os.getenv("TRINO_PORT", "8081"))
 _TRINO_USER = os.getenv("TRINO_USER", "xuan.zhang")
 _DMP_TABLE = "default.ods_data_platform_dmp_schedule_job_basic_info"
+
+
+def _safe_snapshot_name(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    safe = safe.strip("._")
+    return safe or "unknown"
+
+
+def export_etl_script_snapshot(
+    batch_output_dir: Optional[str],
+    job_display_name: str,
+    job_file_name: str,
+    etl_content: str,
+) -> Optional[str]:
+    """Save the ETL script used for this run under the batch report directory."""
+    if not batch_output_dir:
+        return None
+    out_dir = Path(batch_output_dir) / "etl_scripts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{_safe_snapshot_name(job_display_name)}__{_safe_snapshot_name(job_file_name)}"
+    path = out_dir / filename
+    path.write_text(etl_content, encoding="utf-8")
+    return str(path)
+
+
+def export_llm_raw_snapshot(
+    batch_output_dir: Optional[str],
+    job_display_name: str,
+    llm_raw: Dict[str, Any],
+) -> Optional[str]:
+    """Save the raw LLM lineage payload for audit/debugging."""
+    if not batch_output_dir:
+        return None
+    out_dir = Path(batch_output_dir) / "llm_raw"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{_safe_snapshot_name(job_display_name)}.json"
+    path.write_text(json.dumps(llm_raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def describe_etl_source(
+    gitlab_name: str,
+    project_path: str,
+    etl_file_path: str,
+    etl_file_source: str,
+    ref: str = "master",
+) -> str:
+    """Build a concrete, operator-facing description of the ETL file source."""
+    parts = [f"source={etl_file_source or '-'}", f"resolved={etl_file_path or '-'}"]
+    rel_path = ""
+    if etl_file_path.startswith("gitlab:"):
+        rel_path = etl_file_path.split(":", 1)[1].lstrip("/")
+    elif etl_file_path.startswith("localfolder:"):
+        local_rel = etl_file_path.split(":", 1)[1].lstrip("/")
+        prefix = f"{gitlab_name}/"
+        rel_path = local_rel[len(prefix) :] if local_rel.startswith(prefix) else local_rel
+    if project_path:
+        parts.append(f"gitlab_project={project_path}")
+        if rel_path:
+            parts.append(
+                "gitlab_url="
+                f"https://git.corp.bianlifeng.com/{project_path}/-/blob/{quote(ref)}/{rel_path}"
+            )
+    if etl_file_path.startswith("localfolder:"):
+        local_rel = etl_file_path.split(":", 1)[1].lstrip("/")
+        local_root = os.environ.get("BLF_ETL_LOCAL_ROOT", "/localfolder").strip() or "/localfolder"
+        parts.append(f"local_path={Path(local_root) / local_rel}")
+    elif etl_file_source.startswith("local") and gitlab_name and rel_path:
+        local_root = os.environ.get("BLF_ETL_LOCAL_ROOT", "/localfolder").strip() or "/localfolder"
+        parts.append(f"local_path={Path(local_root) / gitlab_name / rel_path}")
+    return " ".join(parts)
 
 
 def fetch_all_jobs(prefix: str = "pdw") -> List[str]:
@@ -145,6 +218,8 @@ def sync_one(
         "trust_score": None,
         "etl_file_path": None,
         "etl_file_source": None,
+        "etl_file_export_path": None,
+        "llm_raw_export_path": None,
     }
     t0 = time.time()
     try:
@@ -157,6 +232,8 @@ def sync_one(
         # 2. ETL 脚本
         is_inline = not has_real_w_run_task(metadata.shell_command)
         jfn = f"{job_display_name}.sh"  # inline 时的默认文件名
+        gitlab_name = ""
+        project_path = ""
 
         if is_inline:
             etl_content = metadata.shell_command
@@ -182,6 +259,24 @@ def sync_one(
             result["etl_file_path"] = used_path
             result["etl_file_source"] = etl_source
 
+        result["etl_file_export_path"] = export_etl_script_snapshot(
+            batch_output_dir=batch_output_dir,
+            job_display_name=job_display_name,
+            job_file_name=jfn,
+            etl_content=etl_content,
+        )
+        logger.info(
+            "ETL 脚本已解析: job=%s %s snapshot=%s",
+            job_display_name,
+            describe_etl_source(
+                gitlab_name=gitlab_name,
+                project_path=project_path,
+                etl_file_path=result["etl_file_path"] or "",
+                etl_file_source=result["etl_file_source"] or "",
+            ),
+            result["etl_file_export_path"] or "-",
+        )
+
         # 3. LLM 表级血缘提取
         from .lineage_write_policy import (
             append_lineage_audit_jsonl,
@@ -195,10 +290,15 @@ def sync_one(
         field_lineages: list = []
         lineage_decision = None
         try:
-            table_lineages, lineage_decision, _llm_raw = evaluate_llm_only(
+            table_lineages, lineage_decision, llm_raw = evaluate_llm_only(
                 etl_content,
                 timeout_sec=llm_timeout_sec,
                 job_file_name=jfn,
+            )
+            result["llm_raw_export_path"] = export_llm_raw_snapshot(
+                batch_output_dir=batch_output_dir,
+                job_display_name=job_display_name,
+                llm_raw=llm_raw,
             )
             skip_upstream_lineage = not lineage_decision.write_upstream_lineage
             skip_upstream_lineage_reason = lineage_decision.reason
@@ -383,9 +483,14 @@ def run_batch(
                 err = (res.get("error") or "")[:120]
                 etl_src = res.get("etl_file_source")
                 etl_path = res.get("etl_file_path")
+                etl_snapshot = res.get("etl_file_export_path")
                 etl_part = ""
-                if etl_src or etl_path:
-                    etl_part = f" etl_src={etl_src or '-'} etl={etl_path or '-'}"
+                if etl_src or etl_path or etl_snapshot:
+                    etl_part = (
+                        f" etl_src={etl_src or '-'}"
+                        f" etl={etl_path or '-'}"
+                        f" etl_snapshot={etl_snapshot or '-'}"
+                    )
                 extra = ""
                 if st == "FAIL" and err:
                     extra = f" err={err!r}{etl_part}"
