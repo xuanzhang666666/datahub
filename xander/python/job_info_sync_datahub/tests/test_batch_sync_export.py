@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from job_info_sync_datahub.batch_sync import (
+    describe_final_etl_choice,
     describe_etl_source,
+    etl_file_locations,
     export_etl_script_snapshot,
     export_llm_raw_snapshot,
 )
@@ -84,3 +86,37 @@ def test_describe_etl_source_includes_local_absolute_path(monkeypatch) -> None:
     )
 
     assert "local_path=/localfolder/thrall/jobs/dw_sku/example.job" in detail
+
+
+def test_describe_final_etl_choice_marks_local_differs_as_localfolder() -> None:
+    detail = describe_final_etl_choice(
+        gitlab_name="analysis-jobs",
+        project_path="data/analysis-jobs",
+        etl_file_path="localfolder:analysis-jobs/jobs/dw_sku/example.job",
+        etl_file_source="local_differs",
+    )
+
+    assert detail == "最终文件来源于 /localfolder/analysis-jobs/jobs/dw_sku/example.job"
+
+
+def test_etl_file_locations_include_gitlab_and_local_paths(monkeypatch) -> None:
+    monkeypatch.setenv("BLF_ETL_LOCAL_ROOT", "/localfolder")
+
+    locations = etl_file_locations(
+        gitlab_name="analysis-jobs",
+        project_path="data/analysis-jobs",
+        etl_file_path="localfolder:analysis-jobs/jobs/dw_sku/dw_sku_store_sku_inventory_history_v1.job",
+    )
+
+    assert locations == {
+        "file_name": "dw_sku_store_sku_inventory_history_v1.job",
+        "gitlab_project": "data/analysis-jobs",
+        "gitlab_full_path": (
+            "https://git.corp.bianlifeng.com/data/analysis-jobs/-/blob/master/"
+            "jobs/dw_sku/dw_sku_store_sku_inventory_history_v1.job"
+        ),
+        "local_full_path": (
+            "/localfolder/analysis-jobs/jobs/dw_sku/"
+            "dw_sku_store_sku_inventory_history_v1.job"
+        ),
+    }

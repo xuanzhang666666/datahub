@@ -145,6 +145,56 @@ def describe_etl_source(
     return " ".join(parts)
 
 
+def _etl_relative_path(gitlab_name: str, etl_file_path: str) -> str:
+    if etl_file_path.startswith("gitlab:"):
+        return etl_file_path.split(":", 1)[1].lstrip("/")
+    if etl_file_path.startswith("localfolder:"):
+        local_rel = etl_file_path.split(":", 1)[1].lstrip("/")
+        prefix = f"{gitlab_name}/"
+        return local_rel[len(prefix) :] if local_rel.startswith(prefix) else local_rel
+    return ""
+
+
+def etl_file_locations(
+    gitlab_name: str,
+    project_path: str,
+    etl_file_path: str,
+    ref: str = "master",
+) -> Dict[str, str]:
+    """Return concrete GitLab and local file locations for operator logs."""
+    rel_path = _etl_relative_path(gitlab_name, etl_file_path)
+    file_name = Path(rel_path).name if rel_path else Path(etl_file_path).name
+    local_root = os.environ.get("BLF_ETL_LOCAL_ROOT", "/localfolder").strip() or "/localfolder"
+    gitlab_full_path = (
+        f"https://git.corp.bianlifeng.com/{project_path}/-/blob/{quote(ref)}/{rel_path}"
+        if project_path and rel_path
+        else "-"
+    )
+    local_full_path = str(Path(local_root) / gitlab_name / rel_path) if gitlab_name and rel_path else "-"
+    return {
+        "file_name": file_name or "-",
+        "gitlab_project": project_path or "-",
+        "gitlab_full_path": gitlab_full_path,
+        "local_full_path": local_full_path,
+    }
+
+
+def describe_final_etl_choice(
+    gitlab_name: str,
+    project_path: str,
+    etl_file_path: str,
+    etl_file_source: str,
+    ref: str = "master",
+) -> str:
+    """Describe which ETL file is actually fed into lineage parsing."""
+    locations = etl_file_locations(gitlab_name, project_path, etl_file_path, ref=ref)
+    if etl_file_source.startswith("local"):
+        return f"最终文件来源于 {locations['local_full_path']}"
+    if etl_file_source.startswith("gitlab"):
+        return f"最终文件来源于 {locations['gitlab_full_path']}"
+    return f"最终文件来源于 {etl_file_path or '-'}"
+
+
 def fetch_all_jobs(prefix: str = "pdw") -> List[str]:
     """从 DMP 查询指定前缀的所有作业名。"""
     conn = trino.dbapi.connect(
@@ -269,6 +319,35 @@ def sync_one(
             "ETL 脚本已解析: job=%s %s snapshot=%s",
             job_display_name,
             describe_etl_source(
+                gitlab_name=gitlab_name,
+                project_path=project_path,
+                etl_file_path=result["etl_file_path"] or "",
+                etl_file_source=result["etl_file_source"] or "",
+            ),
+            result["etl_file_export_path"] or "-",
+        )
+        locations = etl_file_locations(
+            gitlab_name=gitlab_name,
+            project_path=project_path,
+            etl_file_path=result["etl_file_path"] or "",
+        )
+        logger.info(
+            "GitLab ETL 文件: job=%s file_name=%s project=%s full_path=%s",
+            job_display_name,
+            locations["file_name"],
+            locations["gitlab_project"],
+            locations["gitlab_full_path"],
+        )
+        logger.info(
+            "local_path ETL 文件: job=%s file_name=%s full_path=%s",
+            job_display_name,
+            locations["file_name"],
+            locations["local_full_path"],
+        )
+        logger.info(
+            "最终采用 ETL 文件: job=%s %s snapshot=%s",
+            job_display_name,
+            describe_final_etl_choice(
                 gitlab_name=gitlab_name,
                 project_path=project_path,
                 etl_file_path=result["etl_file_path"] or "",
