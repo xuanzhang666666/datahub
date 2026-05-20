@@ -3,8 +3,7 @@
 
 列：作业名、信任度分数、最终目标表list、最终来源表list、
     deepseek目标表list、deepseek来源表list、
-    sqlglot目标表list、sqlglot来源表list、
-    解析状态、异常原因大分类、异常原因明细
+    解析状态、异常原因大分类、异常原因明细、DeepSeek 原始响应内容
 
 依赖：pip install openpyxl
 """
@@ -75,8 +74,6 @@ def _big_category(report: Dict[str, Any], audit: Dict[str, Any]) -> str:
         return "异常-分歧(DeepSeek为准)"
     if ls == "ABNORMAL_SINGLE_DEEPSEEK":
         return "异常-仅DeepSeek有结果"
-    if ls == "ABNORMAL_SINGLE_SQLGLOT":
-        return "异常-仅sqlglot有结果"
     if ls == "SKIP_NO_TABLES":
         return "跳过-无目标表"
     if ls == "LLM_POLICY_ERROR":
@@ -94,6 +91,19 @@ def _detail(report: Dict[str, Any], audit: Dict[str, Any]) -> str:
         if v:
             return str(v)[:200]
     return ""
+
+
+def _read_text_cell(path_value: Any) -> str:
+    if not path_value:
+        return ""
+    path = Path(str(path_value))
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    # Excel 单元格上限为 32767 字符，留少量空间标记截断。
+    if len(text) > 32000:
+        return text[:32000] + "\n...[truncated]"
+    return text
 
 
 def _status_text(report: Dict[str, Any], audit: Dict[str, Any]) -> str:
@@ -143,11 +153,7 @@ def build_rows(
             ds_t_str = _semi(ds_t_raw if isinstance(ds_t_raw, list) else [])
             ds_u_str = _semi(ds_u_raw if isinstance(ds_u_raw, list) else [])
 
-        # sqlglot 列
-        sg_t_raw = aud.get("targets_sqlglot") or rep.get("sqlglot_targets") or []
-        sg_u_raw = aud.get("sources_sqlglot") or rep.get("sqlglot_upstream") or []
-        sg_t_str = _semi(sg_t_raw if isinstance(sg_t_raw, list) else [])
-        sg_u_str = _semi(sg_u_raw if isinstance(sg_u_raw, list) else [])
+        llm_raw_path = str(rep.get("llm_raw_export_path") or "")
 
         rows.append(
             [
@@ -157,12 +163,11 @@ def build_rows(
                 _semi(final_u),
                 ds_t_str,
                 ds_u_str,
-                sg_t_str,
-                sg_u_str,
                 _status_text(rep, aud),
                 _big_category(rep, aud),
                 _detail(rep, aud),
-                str(rep.get("llm_raw_export_path") or ""),
+                _read_text_cell(llm_raw_path),
+                llm_raw_path,
                 str(rep.get("etl_file_export_path") or ""),
             ]
         )
@@ -176,11 +181,10 @@ HEADERS = [
     "最终来源表list",
     "deepseek目标表list",
     "deepseek来源表list",
-    "sqlglot目标表list",
-    "sqlglot来源表list",
     "解析状态",
     "异常原因大分类",
     "异常原因明细",
+    "DeepSeek原始响应内容",
     "DeepSeek原始响应路径",
     "ETL脚本快照路径",
 ]
@@ -223,7 +227,7 @@ def write_xlsx(path: Path, rows: List[List[str]]) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--report", required=True, type=Path, help="batch_report.jsonl 路径")
-    p.add_argument("--audit", type=Path, default=None, help="lineage_audit.jsonl 路径（含 sqlglot/deepseek 结果）")
+    p.add_argument("--audit", type=Path, default=None, help="lineage_audit.jsonl 路径（含 DeepSeek 结果）")
     p.add_argument("-o", "--output", type=Path, required=True, help="输出 .xlsx 路径")
     return p.parse_args()
 

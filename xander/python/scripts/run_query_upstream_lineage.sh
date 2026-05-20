@@ -18,10 +18,9 @@
 # NO_CHECK_PROPS      设为 1 时跳过结构化属性检查
 #
 # ── 退出码 ────────────────────────────────────────────────────────────────────
-# 0  正常，所有上游表属性均已填写
+# 0  正常；如有上游表缺少结构化属性，会按缺少项分组打印
 # 1  查询 DataHub 失败
 # 2  参数错误
-# 3  有上游表缺少 Etl Script 或 Execute Shell（Jenkins 会标 FAILURE）
 set -euo pipefail
 
 # ── 定位包目录 ────────────────────────────────────────────────────────────────
@@ -98,6 +97,7 @@ echo "[INFO] gms url: $GMS_URL"
 echo "[INFO] python: $PYTHON"
 echo "[INFO] ----------------------------------------"
 
+set +e
 (
     cd "$PYTHONPATH_ROOT"
     PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
@@ -106,8 +106,14 @@ echo "[INFO] ----------------------------------------"
         --gms-url "$GMS_URL" \
         ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 )
-
 EXIT_CODE=$?
+set -e
+
+if [[ "$EXIT_CODE" -eq 3 ]]; then
+    echo "[INFO] 检测到旧版缺少结构化属性退出码 3，本次按报告完成处理，不标记失败。"
+    EXIT_CODE=0
+fi
+
 echo "[INFO] ----------------------------------------"
 echo "[INFO] query upstream lineage finished at $(date -Iseconds)"
 exit $EXIT_CODE

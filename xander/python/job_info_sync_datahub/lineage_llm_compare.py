@@ -1,4 +1,4 @@
-"""lineage_llm_compare — DeepSeek + sqlglot 表血缘对比。
+"""lineage_llm_compare — DeepSeek 表血缘提取。
 
 从环境变量或 .env 读取密钥（不写入代码）：
 
@@ -19,7 +19,6 @@ import sys
 import ssl
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -27,13 +26,15 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = "job_info_sync_datahub"
 
-from .lineage_parser import build_lineage_summary, parse_block_lineage
 from .logging_utils import get_logger, setup_logging
-from .sql_extractor import extract_sql_blocks
 
 logger = get_logger("lineage_llm_compare")
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
+_SHELL_ASSIGNMENT_RE = re.compile(
+    r"""^\s*([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s#]+))"""
+)
+_SHELL_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def load_env_file(path: Path, override: bool = False) -> None:
@@ -112,17 +113,69 @@ SYSTEM_PROMPT = """你是数据平台工程师，擅长阅读 Hive/Spark SQL、s
 - 若同一目标表被多条 SQL 写入，合并为一条，upstreams 取并集。
 - 脚本可能已按 '-- SQL 段 N --' 标注分段，每段对应一条写入语句，请按段分别提取各自的 target 和 upstreams。
 - 多段 SQL（先 CREATE/INSERT 临时表、再写正式分层表）时：以**最终持久化落表**为 target（如 mid_*、dw_*、pdw_* 等）；以 tmp_ 开头或明显作业内临时表（含 tmp_mid_*）的写入目标**不得**作为 lineage[].target。
-- upstreams 中**不得**出现以 tmp_ 开头的表名。若后段仅从临时表读取再写入最终表，须结合**同脚本更早 SQL 段**追溯该临时表在 FROM/JOIN 中实际读取的持久化表，将其并入最终 target 的 upstreams（跨段折叠、去重），不要把临时表本身列入 upstreams。
+- upstreams 中不要输出**本脚本内创建/删除的作业内临时表**。若后段仅从这类临时表读取再写入最终表，须结合**同脚本更早 SQL 段**追溯该临时表在 FROM/JOIN 中实际读取的持久化表，将其并入最终 target 的 upstreams（跨段折叠、去重），不要把作业内临时表本身列入 upstreams。
+- 有明确库名且不是本脚本内创建的 tmp_* 表，应视为外部物理上游表并保留，例如 data_smartorder.tmp_xxx、data_smartorder.tmp_${TABLE_NAME}_xxx 这类跨作业产物可以出现在 upstreams 中；不要因为表名包含 tmp_ 就一刀切删除。
 - 前段写临时表、后段写最终表时，lineage 中**至少一条** target 为最终表，其 upstreams =（后段直接读取的物理表）∪（前段构建临时表所读取的物理表），合并去重；除仅有临时表且无最终落表、须在 notes 说明的情况外，不要仅为临时表单独留一条 lineage。
-- target 与 upstreams 中的表名须为数据分层可接受的前缀（如 dm/ods/pdw/pdim/app/dw/mid/ai/dwa/dwd/dim 等），**禁止**把 tmp_* 写入 target 或 upstreams。
+- target 表名须为数据分层可接受的前缀（如 dm/ods/pdw/pdim/app/dw/mid/ai/dwa/dwd/dim 等），**禁止**把 tmp_* 写入 target；upstreams 允许保留有明确库名的外部物理 tmp_* 上游。
+- not_verified_* 不是 tmp_*。在 BLF 作业里，NOT_VERIFIED_TABLE_NAME、not_verified_${TABLE_NAME}、not_verified_<真实表名> 是数据校验用落表别名；遇到 INSERT/OVERWRITE 写入 not_verified_<真实表名> 时，lineage[].target 必须填写去掉 not_verified_ 前缀后的真实表名，不得因为它带 not_verified_ 就丢弃目标表。
+- 若脚本定义 TABLE_NAME="pdim_xxx" 且 NOT_VERIFIED_TABLE_NAME="not_verified_${TABLE_NAME}"，则写入 $NOT_VERIFIED_TABLE_NAME 等价于写入目标表 pdim_xxx；必须提取该 lineage，并把 FROM/JOIN 中的物理表作为 upstreams。
 - 动态表名、${var} 等无法确定处写在 notes；拿不准的物理表宁可少写也不要编造库表名。"""
+
+
+def _extract_shell_assignments(etl_script: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for raw in etl_script.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _SHELL_ASSIGNMENT_RE.match(line)
+        if not m:
+            continue
+        value = next(v for v in m.groups()[1:] if v is not None)
+        out[m.group(1)] = value.strip()
+    return out
+
+
+def _expand_shell_vars(value: str, assignments: Dict[str, str]) -> str:
+    expanded = value
+    for _ in range(5):
+        new_value = _SHELL_VAR_RE.sub(
+            lambda m: assignments.get(m.group(1) or m.group(2), m.group(0)),
+            expanded,
+        )
+        if new_value == expanded:
+            break
+        expanded = new_value
+    return expanded
+
+
+def _not_verified_alias_prompt(etl_script: str) -> str:
+    assignments = _extract_shell_assignments(etl_script)
+    if not assignments:
+        return ""
+    not_verified_name = _expand_shell_vars(
+        assignments.get("NOT_VERIFIED_TABLE_NAME", ""),
+        assignments,
+    ).strip()
+    table_name = _expand_shell_vars(assignments.get("TABLE_NAME", ""), assignments).strip()
+    if not not_verified_name.startswith("not_verified_"):
+        return ""
+    real_target = not_verified_name[len("not_verified_") :].strip() or table_name
+    if not real_target:
+        return ""
+    return (
+        "检测到 BLF 校验落表变量：\n"
+        f"- TABLE_NAME={table_name or '-'}\n"
+        f"- NOT_VERIFIED_TABLE_NAME={assignments.get('NOT_VERIFIED_TABLE_NAME', '-')}\n"
+        f"- 展开后 not_verified 表名={not_verified_name}\n"
+        f"请将写入 $NOT_VERIFIED_TABLE_NAME / {not_verified_name} 的 SQL 视为写入真实 target={real_target}；"
+        "不要因为目标表带 not_verified_ 前缀而返回空 lineage。\n\n"
+    )
 
 
 def _build_user_message(etl_script: str, max_chars: int = 120_000, job_file_name: str = "") -> str:
     if job_file_name.endswith(".job"):
         segments = [s.strip() for s in etl_script.split(";") if s.strip()]
-        if len(segments) > 30:
-            segments = segments[:30]
         if segments:
             parts = [f"-- SQL 段 {i + 1} --\n{seg}" for i, seg in enumerate(segments)]
             body = "\n\n".join(parts)
@@ -132,7 +185,12 @@ def _build_user_message(etl_script: str, max_chars: int = 120_000, job_file_name
         body = etl_script
     if len(body) > max_chars:
         body = body[:max_chars] + "\n... [truncated]"
-    return "以下为 ETL 脚本全文，请按 lineage 数组格式提取每个目标表及其对应的上游表：\n\n" + body
+    alias_prompt = _not_verified_alias_prompt(etl_script)
+    return (
+        "以下为 ETL 脚本全文，请按 lineage 数组格式提取每个目标表及其对应的上游表：\n\n"
+        + alias_prompt
+        + body
+    )
 
 
 def _openai_chat_json(
@@ -244,83 +302,6 @@ def call_llm_extract(etl_script: str, timeout_sec: int = 90, job_file_name: str 
     return _openai_chat_json_with_fallback(db, dk, dm, user_msg, timeout_sec)
 
 
-def tables_from_sqlglot(etl_content: str, job_file_name: str, date_str: Optional[str]) -> Tuple[Set[str], Set[str]]:
-    blocks = extract_sql_blocks(etl_content, job_file_name, date_str=date_str)
-    for b in blocks:
-        parse_block_lineage(b, parent_logger=logger)
-    t_lineages, _ = build_lineage_summary(blocks)
-    targets: Set[str] = set()
-    ups: Set[str] = set()
-    for tl in t_lineages:
-        targets.add(tl.target.full_name.lower())
-        for u in tl.upstreams:
-            ups.add(u.full_name.lower())
-    return targets, ups
-
-
-@dataclass
-class CompareReport:
-    sqlglot_parse_ok: bool = False
-    sqlglot_targets: List[str] = field(default_factory=list)
-    sqlglot_upstream: List[str] = field(default_factory=list)
-    deepseek_raw: Optional[Dict[str, Any]] = None
-    deepseek_error: Optional[str] = None
-    verdict: str = ""
-    errors: List[str] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "sqlglot_parse_ok": self.sqlglot_parse_ok,
-            "sqlglot_targets": self.sqlglot_targets,
-            "sqlglot_upstream": self.sqlglot_upstream,
-            "deepseek_raw": self.deepseek_raw,
-            "deepseek_error": self.deepseek_error,
-            "verdict": self.verdict,
-            "errors": self.errors,
-        }
-
-
-def run_compare(
-    etl_script: str,
-    job_file_name: str,
-    date_str: Optional[str],
-    timeout_sec: int = 90,
-) -> CompareReport:
-    rep = CompareReport()
-    try:
-        st, su = tables_from_sqlglot(etl_script, job_file_name, date_str)
-    except Exception as e:
-        rep.errors.append(f"sqlglot pipeline: {e}")
-        st, su = set(), set()
-
-    rep.sqlglot_targets = sorted(st)
-    rep.sqlglot_upstream = sorted(su)
-    rep.sqlglot_parse_ok = bool(st or su)
-
-    user_msg = _build_user_message(etl_script)
-
-    try:
-        db, dk, dm = _deepseek_config()
-        rep.deepseek_raw = _openai_chat_json_with_fallback(db, dk, dm, user_msg, timeout_sec)
-    except Exception as e:
-        err_msg = str(e)
-        rep.errors.append(f"deepseek: {err_msg}")
-        rep.deepseek_error = err_msg
-        rep.deepseek_raw = None
-
-    # 简单 verdict：仅用于日志可读性，不参与策略决策
-    if rep.deepseek_raw:
-        dt, du = tables_from_llm_payload(rep.deepseek_raw)
-        t_match = {x.lower() for x in st} == {x.lower() for x in dt}
-        rep.verdict = "CONSISTENT" if t_match else "DISAGREE"
-    elif rep.errors:
-        rep.verdict = "LLM_ERROR"
-    else:
-        rep.verdict = "LLM_UNAVAILABLE"
-
-    return rep
-
-
 def _default_env_paths() -> List[Path]:
     paths: List[Path] = []
     extra = os.environ.get("BLF_LINEAGE_ENV_FILE", "").strip()
@@ -338,11 +319,10 @@ def _default_env_paths() -> List[Path]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="DeepSeek 与 sqlglot 表血缘对比")
+    parser = argparse.ArgumentParser(description="DeepSeek 表血缘提取")
     parser.add_argument("--etl-file", type=Path, help="ETL 脚本文本文件路径")
     parser.add_argument("--etl-text", type=str, default="", help="直接传入脚本内容（小脚本调试）")
-    parser.add_argument("--job-file-name", default="inline.job", help="用于 sql 提取的文件名提示，如 xxx.job / x.py")
-    parser.add_argument("--dt", default="", help="调度分区日期 YYYYMMDD，用于变量展开")
+    parser.add_argument("--job-file-name", default="inline.job", help="用于脚本分段提示，如 xxx.job / x.py")
     parser.add_argument("--env-file", type=Path, action="append", default=[], help="可多次指定 .env 路径（先于默认路径加载）")
     parser.add_argument("--out-json", type=Path, default=None, help="写入完整 JSON 报告")
     parser.add_argument("--timeout", type=int, default=90, help="DeepSeek HTTP 超时秒数")
@@ -362,14 +342,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         parser.error("请指定 --etl-file 或 --etl-text")
 
-    rep = run_compare(etl, args.job_file_name, args.dt or None, timeout_sec=args.timeout)
-    d = rep.to_dict()
+    try:
+        d = call_llm_extract(etl, timeout_sec=args.timeout, job_file_name=args.job_file_name)
+    except Exception as exc:
+        d = {"deepseek_error": str(exc)}
     print(json.dumps(d, ensure_ascii=False, indent=2))
     if args.out_json:
         args.out_json.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.info("已写入: %s", args.out_json)
 
-    return 0 if not rep.errors else 1
+    return 0 if "deepseek_error" not in d else 1
 
 
 if __name__ == "__main__":

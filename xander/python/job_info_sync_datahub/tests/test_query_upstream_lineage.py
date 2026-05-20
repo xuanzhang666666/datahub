@@ -47,11 +47,31 @@ def test_run_allows_view_upstreams_with_empty_etl_properties(monkeypatch) -> Non
     assert q.run(["target_db.target_table"], "http://gms") == 0
 
 
-def test_run_still_fails_non_view_upstreams_with_empty_etl_properties(monkeypatch) -> None:
-    upstream = q.make_hive_dataset_urn("table_db.some_table")
+def test_run_groups_missing_properties_and_returns_success(monkeypatch, capsys) -> None:
+    upstream_etl_missing = q.make_hive_dataset_urn("table_db.etl_missing")
+    upstream_shell_missing = q.make_hive_dataset_urn("table_db.shell_missing")
+    upstream_both_missing = q.make_hive_dataset_urn("table_db.both_missing")
 
-    monkeypatch.setattr(q, "fetch_all_upstream_urns", lambda *args, **kwargs: {upstream})
-    monkeypatch.setattr(q, "check_structured_properties", lambda *args, **kwargs: (False, False))
+    monkeypatch.setattr(
+        q,
+        "fetch_all_upstream_urns",
+        lambda *args, **kwargs: {
+            upstream_etl_missing,
+            upstream_shell_missing,
+            upstream_both_missing,
+        },
+    )
+
+    def _check_structured_properties(*args, **kwargs):
+        urn = args[2]
+        table_name = q.urn_to_table_name(urn)
+        if table_name == "table_db.etl_missing":
+            return False, True
+        if table_name == "table_db.shell_missing":
+            return True, False
+        return False, False
+
+    monkeypatch.setattr(q, "check_structured_properties", _check_structured_properties)
 
     def _raise_404(*args, **kwargs):
         raise urllib.error.HTTPError(
@@ -64,4 +84,12 @@ def test_run_still_fails_non_view_upstreams_with_empty_etl_properties(monkeypatc
 
     monkeypatch.setattr(urllib.request, "urlopen", _raise_404)
 
-    assert q.run(["target_db.target_table"], "http://gms") == 3
+    assert q.run(["target_db.target_table"], "http://gms") == 0
+
+    output = capsys.readouterr().out
+    assert "缺少: Etl Script 的如下：" in output
+    assert "  table_db.etl_missing" in output
+    assert "  table_db.both_missing" in output
+    assert "缺少: Execute Shell 的如下：" in output
+    assert "  table_db.shell_missing" in output
+    assert "  table_db.both_missing" in output

@@ -33,10 +33,13 @@ def test_export_etl_script_snapshot_writes_job_file(tmp_path: Path) -> None:
 def test_export_lineage_excel_rows_include_etl_snapshot_path(tmp_path: Path) -> None:
     report = tmp_path / "batch_report.jsonl"
     audit = tmp_path / "lineage_audit.jsonl"
+    raw = tmp_path / "llm_raw" / "dw_job.json"
+    raw.parent.mkdir()
+    raw.write_text('{"lineage":[],"notes":"LLM raw note"}', encoding="utf-8")
     report.write_text(
         '{"job":"dw_job","status":"SKIP","lineage_status":"SKIP_HIVE_TABLE_NOT_FOUND",'
         '"etl_file_export_path":"/workspace/lineage_reports/etl_scripts/dw_job__dw_job.job",'
-        '"llm_raw_export_path":"/workspace/lineage_reports/llm_raw/dw_job.json"}\n',
+        f'"llm_raw_export_path":"{raw}"}}\n',
         encoding="utf-8",
     )
     audit.write_text(
@@ -48,6 +51,8 @@ def test_export_lineage_excel_rows_include_etl_snapshot_path(tmp_path: Path) -> 
     rows = build_rows(report, audit)
 
     assert rows[0][-1] == "/workspace/lineage_reports/etl_scripts/dw_job__dw_job.job"
+    assert '{"lineage":[],"notes":"LLM raw note"}' in rows[0]
+    assert len(rows[0]) == 12
 
 
 def test_export_llm_raw_snapshot_writes_json(tmp_path: Path) -> None:

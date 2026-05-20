@@ -29,10 +29,9 @@ Jenkins 部署::
 
 退出码::
 
-  0  正常完成，所有上游表结构化属性均已填写
+  0  正常完成；如有上游表缺少结构化属性，会按缺少项分组打印
   1  查询 DataHub 出错
   2  参数错误
-  3  有上游表缺少 Etl Script 或 Execute Shell
 """
 
 from __future__ import annotations
@@ -59,6 +58,8 @@ _DEFAULT_ENV = "PROD"
 # 属性显示名（和 DataHub UI 一致）
 _LABEL_ETL_SCRIPT = "Etl Script"
 _LABEL_EXECUTE_SHELL = "Execute Shell"
+
+_CHECKED_STRUCTURED_PROPERTY_LABELS = (_LABEL_ETL_SCRIPT, _LABEL_EXECUTE_SHELL)
 
 
 # ---------------------------------------------------------------------------
@@ -307,10 +308,7 @@ def run(
         {urn_to_table_name(u, platform_instance) for u in all_upstream_urns}
     )
 
-    print(f"[INFO] 合并去重后共 {len(upstream_tables)} 个上游表:")
-    print()
-    for t in upstream_tables:
-        print(t)
+    print(f"[INFO] 合并去重后共 {len(upstream_tables)} 个上游表")
 
     if skip_check_props:
         return 0
@@ -345,13 +343,27 @@ def run(
         print()
 
     if missing_props:
-        print(f"[WARN] 以下 {len(missing_props)} 个上游表缺少结构化属性，请补充后再做字段血缘分析:")
+        print(f"[WARN] 以下 {len(missing_props)} 个上游表缺少结构化属性:")
         print()
-        for t in sorted(missing_props):
-            labels = "、".join(missing_props[t])
-            print(f"  {t}  ← 缺少: {labels}")
+
+        missing_by_label: Dict[str, List[str]] = {
+            label: [] for label in _CHECKED_STRUCTURED_PROPERTY_LABELS
+        }
+        for table_name, labels in missing_props.items():
+            for label in labels:
+                missing_by_label.setdefault(label, []).append(table_name)
+
+        for label in _CHECKED_STRUCTURED_PROPERTY_LABELS:
+            tables = sorted(missing_by_label.get(label, []))
+            if not tables:
+                continue
+            print(f"缺少: {label} 的如下：")
+            for t in tables:
+                print(f"  {t}")
+            print()
+
         print()
-        return 3
+        return 0
 
     print(f"[INFO] 所有 {len(upstream_tables)} 个上游表的结构化属性均已填写")
     return 0
