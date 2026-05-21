@@ -14,7 +14,6 @@
 #   default.some_table
 #   data_logistics.other_table
 # 从 xlsx 批量导出列表见: xander/run/export_hive_table_list_from_xlsx.sh
-#   或串行全流程: xander/run/ingest_hive_table_list_serial_from_xlsx.sh
 #
 # 若每行只有表名，需:
 #   export HIVE_INGEST_IMPLICIT_DATABASE=default
@@ -27,6 +26,7 @@
 #   HIVE_INGEST_RECIPE_OUT       生成的 yaml 路径；指定分库时未设置则默认
 #                                /tmp/hive_ingest_table_list.<库名>.generated.yml
 #   HIVE_INGEST_DB_NAME          与第一个参数二选一：只 ingest 该库
+#   HIVE_INGEST_SKIP_EXISTING_DATASET=1  默认 1：已存在的 DataHub Dataset 跳过，不刷新
 #   HIVE_INGEST_DEBUG=1          传给 datahub --debug（日志极大，勿在 Jenkins 开）
 #   HIVE_INGEST_QUIET=1          默认 1：ingest 加 --no-progress --no-spinner，减少 Jenkins 日志卡死
 #                                排障时设 HIVE_INGEST_QUIET=0 恢复中间进度块
@@ -73,11 +73,41 @@ CHUNK="${HIVE_INGEST_CHUNK_SIZE:-600}"
 
 export DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-http://127.0.0.1:8080}"
 export PYTHONUNBUFFERED=1
+PYTHONPATH_ROOT="$SCRIPT_DIR"
 
 if ! "$PYTHON" -c "import datahub" >/dev/null 2>&1; then
   echo "ERROR: 需要 DataHub CLI: $PYTHON" >&2
   echo "  pip install -U 'acryl-datahub[hive-metastore,presto-on-hive]'" >&2
   exit 1
+fi
+
+if [[ "${HIVE_INGEST_SKIP_EXISTING_DATASET:-1}" == "1" ]]; then
+  FILTER_SUFFIX="all"
+  if [[ -n "$SAFE_DB" ]]; then
+    FILTER_SUFFIX="$SAFE_DB"
+  fi
+  FILTERED_LIST="${LIST_FILE}.${FILTER_SUFFIX}.missing.txt"
+  EXISTING_LIST="${LIST_FILE}.${FILTER_SUFFIX}.existing.txt"
+  FILTER_ARGS=(
+    --table-list "$LIST_FILE"
+    --missing-out "$FILTERED_LIST"
+    --existing-out "$EXISTING_LIST"
+  )
+  if [[ -n "${HIVE_INGEST_IMPLICIT_DATABASE:-}" ]]; then
+    FILTER_ARGS+=(--implicit-database "$HIVE_INGEST_IMPLICIT_DATABASE")
+  fi
+  if [[ -n "$DB_FILTER" ]]; then
+    FILTER_ARGS+=(--database "$DB_FILTER")
+  fi
+  echo "[INFO] filter existing DataHub Dataset -> missing=$FILTERED_LIST existing=$EXISTING_LIST"
+  PYTHONPATH="$PYTHONPATH_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m job_info_sync_datahub.filter_existing_hive_table_list "${FILTER_ARGS[@]}"
+  if [[ ! -s "$FILTERED_LIST" ]]; then
+    echo "[INFO] 本批次所有 Dataset 已存在，跳过 datahub ingest。existing=$EXISTING_LIST"
+    echo "DH_INGEST_EXIT=0"
+    exit 0
+  fi
+  LIST_FILE="$FILTERED_LIST"
 fi
 
 RENDER_ARGS=(

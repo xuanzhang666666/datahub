@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_add_manual_upstream_lineage.sh — Jenkins / 服务器：追加一批 Hive 表级上游血缘（合并已有 upstreamLineage）
+# run_add_manual_upstream_lineage.sh — Jenkins / 服务器：追加或删除一批 Hive 表级上游血缘边
 #
 # 用法与 run_batch_lineage_sync.sh 一致：在「Execute shell」里先 export 再执行本脚本，无需手写 PYTHONPATH。
 #
@@ -19,7 +19,10 @@
 # ── 可选 ──────────────────────────────────────────────────────────────────────
 # DATAHUB_GMS_URL / DATAHUB_GMS_TOKEN  未写 lineage.env 时可在此 export
 # BLF_DATAHUB_PLATFORM_INSTANCE / DATAHUB_ENV  与 Python 模块默认值一致时可不设
-# REPLACE=1          仅保留本次指定的上游（清空其余表级/字段级血缘，慎用）
+# LINEAGE_ACTION=add|remove
+#                    add 默认：追加 TABLE_NAME -> UPSTREAM_NAMES 表级上游边（合并已有 upstreamLineage）
+#                    remove：删除 TABLE_NAME -> UPSTREAM_NAMES 表级上游边，保留其它上游
+# REPLACE=1          仅 add 模式可用：只保留本次指定的上游（清空其余表级/字段级血缘，慎用）
 # DRY_RUN=1          只打印计划，不写 GMS
 # BLF_LINEAGE_SKIP_UPSTREAM_INGEST=1  上游不在 DataHub 时不注册/ingest（默认会轻量注册）
 # BLF_LINEAGE_FULL_UPSTREAM_INGEST=1  改为完整 HMS ingest（慢，易超时；默认仅 MCP 轻量注册）
@@ -43,8 +46,17 @@ fi
 
 TABLE_NAME="${TABLE_NAME:-}"
 UPSTREAM_NAMES="${UPSTREAM_NAMES:-}"
+LINEAGE_ACTION="${LINEAGE_ACTION:-add}"
 if [[ -z "$TABLE_NAME" || -z "$UPSTREAM_NAMES" ]]; then
   echo "ERROR: 请设置 TABLE_NAME 与 UPSTREAM_NAMES（Jenkins 参数或环境变量）。" >&2
+  exit 2
+fi
+if [[ "$LINEAGE_ACTION" != "add" && "$LINEAGE_ACTION" != "remove" ]]; then
+  echo "ERROR: LINEAGE_ACTION 只能为 add 或 remove，当前为 '$LINEAGE_ACTION'。" >&2
+  exit 2
+fi
+if [[ "$LINEAGE_ACTION" == "remove" && "${REPLACE:-0}" == "1" ]]; then
+  echo "ERROR: remove 模式不支持 REPLACE=1；删除指定边时会自动保留其它上游。" >&2
   exit 2
 fi
 if [[ "$TABLE_NAME" != *.* ]]; then
@@ -96,18 +108,18 @@ if [[ ! -f "$PKG_DIR/manual_upstream_lineage.py" ]]; then
 fi
 
 echo "==================================================================="
-echo " Manual upstream lineage"
+echo " Manual upstream lineage action"
 echo " date=$(date -Iseconds)"
 echo " PYTHON=$PYTHON"
 echo " PKG_DIR=$PKG_DIR  TABLE_NAME=$TABLE_NAME"
 printf ' UPSTREAM_NAMES (%d):\n' "${#UPSTREAM_LIST[@]}"
 for _u in "${UPSTREAM_LIST[@]}"; do printf '   %s\n' "$_u"; done
-echo " DRY_RUN=${DRY_RUN:-0}  REPLACE=${REPLACE:-0}"
+echo " LINEAGE_ACTION=$LINEAGE_ACTION  DRY_RUN=${DRY_RUN:-0}  REPLACE=${REPLACE:-0}"
 echo " BLF_HIVE_INGEST_TIMEOUT_SEC=${BLF_HIVE_INGEST_TIMEOUT_SEC}"
 echo " BLF_LINEAGE_FULL_UPSTREAM_INGEST=${BLF_LINEAGE_FULL_UPSTREAM_INGEST:-0}"
 echo "==================================================================="
 
-_BASE_ARGS=()
+_BASE_ARGS=(--action "$LINEAGE_ACTION")
 [[ -n "${DATAHUB_GMS_URL:-}" ]]                    && _BASE_ARGS+=(--datahub-gms "$DATAHUB_GMS_URL")
 [[ -n "${DATAHUB_GMS_TOKEN:-}" ]]                  && _BASE_ARGS+=(--token "$DATAHUB_GMS_TOKEN")
 [[ -n "${BLF_DATAHUB_PLATFORM_INSTANCE:-}" ]]      && _BASE_ARGS+=(--platform-instance "$BLF_DATAHUB_PLATFORM_INSTANCE")
@@ -131,6 +143,6 @@ for _upstream in "${UPSTREAM_LIST[@]}"; do
 done
 
 echo "==================================================================="
-echo "[DONE] manual upstream lineage  succeeded=${_ok}  failed=${_fail}"
+echo "[DONE] manual upstream lineage action=$LINEAGE_ACTION  succeeded=${_ok}  failed=${_fail}"
 echo "==================================================================="
 [[ $_fail -eq 0 ]]

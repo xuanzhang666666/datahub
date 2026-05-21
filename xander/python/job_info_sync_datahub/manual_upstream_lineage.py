@@ -1,4 +1,4 @@
-"""为 Hive 数据集追加一条表级上游血缘（默认合并已有 upstreamLineage）。
+"""为 Hive 数据集追加或删除一条表级上游血缘（默认合并已有 upstreamLineage）。
 
 **Jenkins / 服务器**：优先用 ``python/scripts/run_add_manual_upstream_lineage.sh``，
 在 shell 里 ``export TABLE_NAME=... UPSTREAM_NAME=...`` 再 ``sh .../run_add_manual_upstream_lineage.sh``，
@@ -11,8 +11,9 @@
 
 ``--table-name`` / ``--upstream-name`` **必须**为 ``库.表``（至少一段库名 + 表名），不支持仅表名。
 
-默认与现有 ``upstreamLineage`` 合并（按 dataset URN 去重），并尽量保留
+默认 ``--action add`` 与现有 ``upstreamLineage`` 合并（按 dataset URN 去重），并尽量保留
 ``fineGrainedLineages``。``--replace`` 则只保留本次指定的单条上游（慎用）。
+``--action remove`` 只删除本次指定的表级上游边，保留其它上游。
 
 若上游表在 DataHub 目录中不存在（UI 无法展示血缘边），默认会 **轻量注册**
 最小 Dataset（秒级 MCP，不跑完整 HMS ingest）。需要完整 schema 时设
@@ -77,6 +78,11 @@ def _dataset_urn_set(upstreams: Optional[List[object]]) -> Set[str]:
     return out
 
 
+def _fine_grained_references_dataset(fine_grained: object, dataset_urn: str) -> bool:
+    upstreams = getattr(fine_grained, "upstreams", None) or []
+    return any(isinstance(u, str) and dataset_urn in u for u in upstreams)
+
+
 def merge_and_emit(
     gms_url: str,
     token: Optional[str],
@@ -87,8 +93,13 @@ def merge_and_emit(
     *,
     replace: bool,
     dry_run: bool,
+    action: str = "add",
 ) -> Tuple[bool, str]:
     """合并并写入；返回 (是否执行写入, 人类可读摘要)。"""
+    if action not in {"add", "remove"}:
+        raise ValueError("action 必须为 add 或 remove")
+    if action == "remove" and replace:
+        raise ValueError("remove 模式不支持 replace")
     try:
         from datahub.ingestion.graph.client import DataHubGraph, DatahubClientConfig
         from datahub.metadata.schema_classes import DatasetLineageTypeClass, UpstreamClass, UpstreamLineageClass
@@ -112,15 +123,42 @@ def merge_and_emit(
 
     if not replace and existing and existing.upstreams:
         existing_urns = _dataset_urn_set(existing.upstreams)
-        if upstream_urn in existing_urns:
+        if action == "add" and upstream_urn in existing_urns:
             msg = f"已存在上游，跳过: downstream={downstream.full_name} upstream={upstream.full_name}"
             logger.info(msg)
             return False, msg
+        if action == "remove" and upstream_urn not in existing_urns:
+            msg = f"不存在指定上游，跳过删除: downstream={downstream.full_name} upstream={upstream.full_name}"
+            logger.info(msg)
+            return False, msg
+    elif action == "remove":
+        msg = f"目标表无 upstreamLineage，跳过删除: downstream={downstream.full_name} upstream={upstream.full_name}"
+        logger.info(msg)
+        return False, msg
 
     merged_upstream_classes: List[UpstreamClass]
     fine_grained = None
 
-    if replace:
+    if action == "remove":
+        merged_upstream_classes = []
+        if existing and existing.upstreams:
+            for u in existing.upstreams:
+                if getattr(u, "dataset", None) != upstream_urn:
+                    merged_upstream_classes.append(u)
+        removed_fine_grained = 0
+        if existing and existing.fineGrainedLineages:
+            kept_fine_grained = []
+            for fg in existing.fineGrainedLineages:
+                if _fine_grained_references_dataset(fg, upstream_urn):
+                    removed_fine_grained += 1
+                    continue
+                kept_fine_grained.append(fg)
+            fine_grained = kept_fine_grained if kept_fine_grained else None
+        summary = (
+            f"[remove] downstream={downstream.full_name} 删除上游 {upstream.full_name} "
+            f"（剩余 {len(merged_upstream_classes)} 条表级上游，移除字段血缘 {removed_fine_grained} 条）"
+        )
+    elif replace:
         merged_upstream_classes = [
             UpstreamClass(dataset=upstream_urn, type=DatasetLineageTypeClass.TRANSFORMED)
         ]
@@ -174,6 +212,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--table-name", required=True, help="下游表：必须为 库.表（如 dw.dw_order_v1）")
     p.add_argument("--upstream-name", required=True, help="上游表：必须为 库.表")
+    p.add_argument(
+        "--action",
+        choices=["add", "remove"],
+        default=os.getenv("LINEAGE_ACTION", "add"),
+        help="add=追加/合并上游；remove=删除指定上游边",
+    )
     p.add_argument("--datahub-gms", default=os.getenv("DATAHUB_GMS_URL", "http://127.0.0.1:8080"))
     p.add_argument("--token", default=os.getenv("DATAHUB_GMS_TOKEN"))
     p.add_argument("--platform-instance", default=os.getenv("BLF_DATAHUB_PLATFORM_INSTANCE", "blf-prod-hive"))
@@ -229,12 +273,13 @@ def main() -> int:
 
     logger.info(
         "GMS=%s downstream=%s upstream=%s platform_instance=%s env=%s "
-        "replace=%s dry_run=%s skip_upstream_ingest=%s python=%s",
+        "action=%s replace=%s dry_run=%s skip_upstream_ingest=%s python=%s",
         args.datahub_gms,
         downstream.full_name,
         upstream.full_name,
         args.platform_instance,
         args.env,
+        args.action,
         args.replace,
         args.dry_run,
         skip_ingest,
@@ -247,18 +292,19 @@ def main() -> int:
     )
 
     try:
-        _, ingest_msg = ensure_upstream_dataset_in_datahub(
-            upstream,
-            gms_url=args.datahub_gms,
-            token=args.token,
-            platform_instance=args.platform_instance,
-            env=args.env,
-            python_executable=py_exec,
-            dry_run=args.dry_run,
-            skip_ingest=skip_ingest,
-        )
-        if ingest_msg:
-            print(ingest_msg)
+        if args.action == "add":
+            _, ingest_msg = ensure_upstream_dataset_in_datahub(
+                upstream,
+                gms_url=args.datahub_gms,
+                token=args.token,
+                platform_instance=args.platform_instance,
+                env=args.env,
+                python_executable=py_exec,
+                dry_run=args.dry_run,
+                skip_ingest=skip_ingest,
+            )
+            if ingest_msg:
+                print(ingest_msg)
         _, msg = merge_and_emit(
             args.datahub_gms,
             args.token,
@@ -268,6 +314,7 @@ def main() -> int:
             args.env,
             replace=args.replace,
             dry_run=args.dry_run,
+            action=args.action,
         )
     except Exception as exc:
         logger.error("失败: %s", exc)

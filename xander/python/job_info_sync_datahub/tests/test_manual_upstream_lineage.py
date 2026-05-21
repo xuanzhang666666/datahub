@@ -139,3 +139,83 @@ def test_merge_calls_emit_when_new_upstream() -> None:
     assert wrote is True
     assert "merge" in msg.lower() or "追加上游" in msg
     e_inst.emit_mcp.assert_called_once()
+
+
+@pytest.mark.skipif(not _has_datahub_sdk(), reason="acryl-datahub not installed")
+def test_remove_deletes_one_upstream_and_keeps_others() -> None:
+    from datahub.metadata.schema_classes import DatasetLineageTypeClass, UpstreamClass, UpstreamLineageClass
+
+    from job_info_sync_datahub.datahub_writer import make_dataset_urn_from_ref
+
+    down = TableRef("ods", "target")
+    remove = TableRef("ods", "remove_me")
+    keep = TableRef("ods", "keep_me")
+    remove_urn = make_dataset_urn_from_ref(remove, "blf-prod-hive", "PROD")
+    keep_urn = make_dataset_urn_from_ref(keep, "blf-prod-hive", "PROD")
+    existing = UpstreamLineageClass(
+        upstreams=[
+            UpstreamClass(dataset=remove_urn, type=DatasetLineageTypeClass.TRANSFORMED),
+            UpstreamClass(dataset=keep_urn, type=DatasetLineageTypeClass.TRANSFORMED),
+        ]
+    )
+    with patch("datahub.ingestion.graph.client.DataHubGraph") as g_cls:
+        g_inst = MagicMock()
+        g_inst.get_aspect.return_value = existing
+        g_cls.return_value = g_inst
+        with patch("datahub.emitter.rest_emitter.DatahubRestEmitter") as e_cls:
+            e_inst = MagicMock()
+            e_cls.return_value = e_inst
+            wrote, msg = merge_and_emit(
+                "http://127.0.0.1:8080",
+                None,
+                down,
+                remove,
+                "blf-prod-hive",
+                "PROD",
+                replace=False,
+                dry_run=False,
+                action="remove",
+            )
+
+    assert wrote is True
+    assert "删除上游" in msg
+    mcp = e_inst.emit_mcp.call_args.args[0]
+    kept_upstreams = [u.dataset for u in mcp.aspect.upstreams]
+    assert kept_upstreams == [keep_urn]
+
+
+@pytest.mark.skipif(not _has_datahub_sdk(), reason="acryl-datahub not installed")
+def test_remove_skips_when_upstream_not_present() -> None:
+    from datahub.metadata.schema_classes import DatasetLineageTypeClass, UpstreamClass, UpstreamLineageClass
+
+    from job_info_sync_datahub.datahub_writer import make_dataset_urn_from_ref
+
+    down = TableRef("ods", "target")
+    remove = TableRef("ods", "remove_me")
+    keep = TableRef("ods", "keep_me")
+    keep_urn = make_dataset_urn_from_ref(keep, "blf-prod-hive", "PROD")
+    existing = UpstreamLineageClass(
+        upstreams=[UpstreamClass(dataset=keep_urn, type=DatasetLineageTypeClass.TRANSFORMED)]
+    )
+    with patch("datahub.ingestion.graph.client.DataHubGraph") as g_cls:
+        g_inst = MagicMock()
+        g_inst.get_aspect.return_value = existing
+        g_cls.return_value = g_inst
+        with patch("datahub.emitter.rest_emitter.DatahubRestEmitter") as e_cls:
+            e_inst = MagicMock()
+            e_cls.return_value = e_inst
+            wrote, msg = merge_and_emit(
+                "http://127.0.0.1:8080",
+                None,
+                down,
+                remove,
+                "blf-prod-hive",
+                "PROD",
+                replace=False,
+                dry_run=False,
+                action="remove",
+            )
+
+    assert wrote is False
+    assert "不存在指定上游" in msg
+    e_inst.emit_mcp.assert_not_called()
