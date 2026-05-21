@@ -169,6 +169,11 @@ def build_rows(
                 _read_text_cell(llm_raw_path),
                 llm_raw_path,
                 str(rep.get("etl_file_export_path") or ""),
+                _semi(rep.get("expected_upstreams") if isinstance(rep.get("expected_upstreams"), list) else []),
+                _semi(rep.get("existing_upstreams") if isinstance(rep.get("existing_upstreams"), list) else []),
+                _semi(rep.get("missing_upstreams") if isinstance(rep.get("missing_upstreams"), list) else []),
+                _semi(rep.get("extra_upstreams") if isinstance(rep.get("extra_upstreams"), list) else []),
+                str(rep.get("source_property") or ""),
             ]
         )
     return rows
@@ -187,6 +192,11 @@ HEADERS = [
     "DeepSeek原始响应内容",
     "DeepSeek原始响应路径",
     "ETL脚本快照路径",
+    "检查模式-解析上游表list",
+    "检查模式-现有上游表list",
+    "检查模式-遗漏上游表list",
+    "检查模式-多余上游表list",
+    "ETL来源属性",
 ]
 
 

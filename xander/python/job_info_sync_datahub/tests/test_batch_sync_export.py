@@ -50,9 +50,28 @@ def test_export_lineage_excel_rows_include_etl_snapshot_path(tmp_path: Path) -> 
 
     rows = build_rows(report, audit)
 
-    assert rows[0][-1] == "/workspace/lineage_reports/etl_scripts/dw_job__dw_job.job"
+    assert rows[0][11] == "/workspace/lineage_reports/etl_scripts/dw_job__dw_job.job"
     assert '{"lineage":[],"notes":"LLM raw note"}' in rows[0]
-    assert len(rows[0]) == 12
+    assert len(rows[0]) == 17
+
+
+def test_export_lineage_excel_rows_include_check_mode_diff_fields(tmp_path: Path) -> None:
+    report = tmp_path / "batch_report.jsonl"
+    report.write_text(
+        '{"job":"dw_table","status":"FAIL","lineage_status":"CHECK_MISMATCH",'
+        '"expected_upstreams":["ods.expected"],"existing_upstreams":["ods.extra"],'
+        '"missing_upstreams":["ods.expected"],"extra_upstreams":["ods.extra"],'
+        '"source_property":"Etl Script"}\n',
+        encoding="utf-8",
+    )
+
+    rows = build_rows(report, None)
+
+    assert rows[0][12] == "ods.expected"
+    assert rows[0][13] == "ods.extra"
+    assert rows[0][14] == "ods.expected"
+    assert rows[0][15] == "ods.extra"
+    assert rows[0][16] == "Etl Script"
 
 
 def test_export_llm_raw_snapshot_writes_json(tmp_path: Path) -> None:

@@ -189,6 +189,7 @@ def emit_upstream_lineage(
     token: Optional[str] = None,
     *,
     emit_field_lineage: bool = False,
+    replace_existing_lineage: bool = True,
 ) -> None:
     """发送单个目标表的 upstreamLineage。默认仅表级（不写 fineGrainedLineages）。"""
     if not _SDK_AVAILABLE:
@@ -214,6 +215,28 @@ def emit_upstream_lineage(
                 downstream_urn, upstream_urn, field_lineages, table_lineage.target
             )
             fine_grained.extend(fg)
+
+    if not replace_existing_lineage:
+        from datahub.ingestion.graph.client import DataHubGraph, DatahubClientConfig
+
+        graph = DataHubGraph(DatahubClientConfig(server=gms_url.rstrip("/"), token=token))
+        existing: Optional[UpstreamLineageClass] = graph.get_aspect(
+            entity_urn=downstream_urn,
+            aspect_type=UpstreamLineageClass,
+        )
+        if existing and existing.upstreams:
+            seen = {getattr(u, "dataset", "") for u in upstream_classes}
+            merged: List[UpstreamClass] = []
+            for u in existing.upstreams:
+                u_urn = getattr(u, "dataset", None)
+                if not isinstance(u_urn, str) or u_urn in seen:
+                    continue
+                seen.add(u_urn)
+                merged.append(u)
+            merged.extend(upstream_classes)
+            upstream_classes = merged
+        if existing and existing.fineGrainedLineages:
+            fine_grained = list(existing.fineGrainedLineages) + fine_grained
 
     if not upstream_classes:
         logger.debug("目标表 %s 无上游，跳过 upstreamLineage", table_lineage.target.full_name)
@@ -290,6 +313,7 @@ class DatahubWriter:
         skip: bool = False,
         skip_reason: str = "",
         emit_field_lineage: bool = False,
+        replace_existing_lineage: bool = True,
     ) -> bool:
         """写入全部 upstreamLineage。skip=True 时不写表级血缘；emit_field_lineage 默认 False（仅表级）。"""
         _log = parent_logger or logger
@@ -318,6 +342,7 @@ class DatahubWriter:
                     self.env,
                     self.token,
                     emit_field_lineage=emit_field_lineage,
+                    replace_existing_lineage=replace_existing_lineage,
                 )
             except Exception as exc:
                 log_phase_error(
@@ -340,6 +365,7 @@ class DatahubWriter:
         skip_upstream_lineage: bool = False,
         skip_upstream_lineage_reason: str = "",
         emit_field_lineage: bool = False,
+        replace_existing_lineage: bool = True,
     ) -> bool:
         """将结构化属性写入每个目标表；upstreamLineage 在不确定时可跳过；默认不写字段级血缘。"""
         _log = parent_logger or logger
@@ -360,6 +386,7 @@ class DatahubWriter:
             skip=skip_upstream_lineage,
             skip_reason=skip_upstream_lineage_reason,
             emit_field_lineage=emit_field_lineage,
+            replace_existing_lineage=replace_existing_lineage,
         )
         if not ok:
             all_ok = False
