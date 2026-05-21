@@ -38,6 +38,35 @@ def test_job_prompt_keeps_segments_after_30_so_final_insert_is_visible() -> None
     assert "data_smartorder.dw_ordering_tad14_store_di" in msg
 
 
+def test_job_prompt_keeps_only_functions_reachable_from_job_run_entrypoint() -> None:
+    script = """
+function calculate_backup {
+  insert overwrite table default.dw_ordering_inventory_store_changes_realtime_di_v1
+  select * from data_smartorder.backup_source;
+}
+
+function calculate {
+  insert overwrite table default.dw_ordering_inventory_store_changes_realtime_teardown_di_v1
+  select * from data_smartorder.real_source;
+}
+
+function dw_ordering_inventory_store_changes_realtime_teardown_di_v1_run {
+  calculate
+}
+"""
+
+    msg = _build_user_message(
+        script,
+        job_file_name="dw_ordering_inventory_store_changes_realtime_teardown_di_v1.job",
+    )
+
+    assert "dw_ordering_inventory_store_changes_realtime_teardown_di_v1_run" in msg
+    assert "function calculate {" in msg
+    assert "data_smartorder.real_source" in msg
+    assert "calculate_backup" not in msg
+    assert "default.dw_ordering_inventory_store_changes_realtime_di_v1" not in msg
+
+
 def test_system_prompt_allows_physical_fully_qualified_tmp_upstreams() -> None:
     from job_info_sync_datahub.lineage_llm_compare import SYSTEM_PROMPT
 

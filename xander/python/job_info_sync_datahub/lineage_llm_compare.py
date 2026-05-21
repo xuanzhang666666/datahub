@@ -35,6 +35,29 @@ _SHELL_ASSIGNMENT_RE = re.compile(
     r"""^\s*([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s#]+))"""
 )
 _SHELL_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+_SHELL_FUNCTION_START_RE = re.compile(
+    r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\{"
+)
+_SHELL_SPLIT_COMMAND_RE = re.compile(r"\s*(?:;|&&|\|\|)\s*")
+
+_SHELL_NON_CALL_WORDS = {
+    "if",
+    "then",
+    "else",
+    "elif",
+    "fi",
+    "for",
+    "do",
+    "done",
+    "while",
+    "case",
+    "esac",
+    "function",
+    "local",
+    "export",
+    "return",
+    "echo",
+}
 
 
 def load_env_file(path: Path, override: bool = False) -> None:
@@ -173,19 +196,133 @@ def _not_verified_alias_prompt(etl_script: str) -> str:
     )
 
 
+def _strip_shell_strings_for_braces(line: str) -> str:
+    line = re.sub(r"\$\{[^}]*\}", "", line)
+    line = re.sub(r"'[^']*'", "''", line)
+    line = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line)
+    line = re.sub(r"`[^`]*`", "``", line)
+    return line
+
+
+def _shell_brace_delta(line: str) -> int:
+    stripped = _strip_shell_strings_for_braces(line)
+    return stripped.count("{") - stripped.count("}")
+
+
+def _extract_shell_functions(script: str) -> Dict[str, Tuple[int, int, str]]:
+    lines = script.splitlines()
+    functions: Dict[str, Tuple[int, int, str]] = {}
+    i = 0
+    while i < len(lines):
+        m = _SHELL_FUNCTION_START_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        depth = _shell_brace_delta(lines[i])
+        end = i
+        while end + 1 < len(lines) and depth > 0:
+            end += 1
+            depth += _shell_brace_delta(lines[end])
+        functions[name] = (i, end, "\n".join(lines[i : end + 1]).strip())
+        i = end + 1
+    return functions
+
+
+def _command_first_word(command: str) -> str:
+    command = command.strip()
+    command = re.sub(r"^(?:time|command|builtin|source|\.)\s+", "", command)
+    m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\b", command)
+    return m.group(1) if m else ""
+
+
+def _called_shell_functions(body: str, function_names: Set[str]) -> Set[str]:
+    calls: Set[str] = set()
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        for part in _SHELL_SPLIT_COMMAND_RE.split(line):
+            word = _command_first_word(part)
+            if word in function_names and word not in _SHELL_NON_CALL_WORDS:
+                calls.add(word)
+    return calls
+
+
+def _entrypoint_names_for_job(job_file_name: str) -> List[str]:
+    base = Path(job_file_name).name
+    if "." in base:
+        base = base.rsplit(".", 1)[0]
+    return [f"{base}_run", f"{base}run"]
+
+
+def _prune_shell_job_to_entrypoint(etl_script: str, job_file_name: str) -> str:
+    functions = _extract_shell_functions(etl_script)
+    if not functions:
+        return etl_script
+
+    entrypoint = next((name for name in _entrypoint_names_for_job(job_file_name) if name in functions), "")
+    if not entrypoint:
+        return etl_script
+
+    reachable: Set[str] = set()
+    queue = [entrypoint]
+    function_names = set(functions)
+    while queue:
+        name = queue.pop(0)
+        if name in reachable:
+            continue
+        reachable.add(name)
+        _, _, body = functions[name]
+        for called in sorted(_called_shell_functions(body, function_names)):
+            if called not in reachable:
+                queue.append(called)
+
+    function_ranges = [(start, end) for start, end, _body in functions.values()]
+    preamble_lines: List[str] = []
+    for idx, line in enumerate(etl_script.splitlines()):
+        if any(start <= idx <= end for start, end in function_ranges):
+            continue
+        if line.strip():
+            preamble_lines.append(line)
+
+    kept_functions = [
+        body
+        for name, (_start, _end, body) in functions.items()
+        if name in reachable
+    ]
+    if not kept_functions:
+        return etl_script
+
+    header = (
+        f"# DataHub lineage parser: only functions reachable from entrypoint {entrypoint} are included.\n"
+        "# Unreachable shell functions are omitted to avoid parsing backup/dead code."
+    )
+    parts = [header]
+    if preamble_lines:
+        parts.append("\n".join(preamble_lines).strip())
+    parts.extend(kept_functions)
+    return "\n\n".join(part for part in parts if part.strip())
+
+
 def _build_user_message(etl_script: str, max_chars: int = 120_000, job_file_name: str = "") -> str:
+    etl_for_prompt = (
+        _prune_shell_job_to_entrypoint(etl_script, job_file_name)
+        if job_file_name.endswith(".job")
+        else etl_script
+    )
     if job_file_name.endswith(".job"):
-        segments = [s.strip() for s in etl_script.split(";") if s.strip()]
+        segments = [s.strip() for s in etl_for_prompt.split(";") if s.strip()]
         if segments:
             parts = [f"-- SQL 段 {i + 1} --\n{seg}" for i, seg in enumerate(segments)]
             body = "\n\n".join(parts)
         else:
-            body = etl_script
+            body = etl_for_prompt
     else:
-        body = etl_script
+        body = etl_for_prompt
     if len(body) > max_chars:
         body = body[:max_chars] + "\n... [truncated]"
-    alias_prompt = _not_verified_alias_prompt(etl_script)
+    alias_prompt = _not_verified_alias_prompt(etl_for_prompt)
     return (
         "以下为 ETL 脚本全文，请按 lineage 数组格式提取每个目标表及其对应的上游表：\n\n"
         + alias_prompt
