@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from job_info_sync_datahub import hive_jobs_table_ingest
 from job_info_sync_datahub.hive_jobs_table_ingest import (
     parse_table_line,
     parse_table_list_text,
@@ -85,6 +86,26 @@ class TestSyncFlow(unittest.TestCase):
                 )
         ingest_mock.assert_called_once()
         self.assertEqual(ingest_mock.call_args.kwargs.get("ingest_mode"), "minimal")
+
+    def test_main_reads_table_names_env(self) -> None:
+        with patch.dict("os.environ", {"TABLE_NAMES": "default.t1\nods.t2\n"}, clear=False):
+            with patch(
+                "sys.argv",
+                ["hive_jobs_table_ingest.py", "--dry-run", "--ingest-mode", "minimal"],
+            ):
+                with patch(
+                    "job_info_sync_datahub.hive_jobs_table_ingest.sync_hive_tables_delete_then_ingest",
+                ) as sync_mock:
+                    sync_mock.return_value.tables = ["default.t1", "ods.t2"]
+                    sync_mock.return_value.deleted = []
+                    sync_mock.return_value.delete_skipped = []
+                    sync_mock.return_value.ingest_count = 2
+
+                    code = hive_jobs_table_ingest.main()
+
+        self.assertEqual(code, 0)
+        refs = sync_mock.call_args.args[0]
+        self.assertEqual([r.full_name for r in refs], ["default.t1", "ods.t2"])
 
 
 if __name__ == "__main__":

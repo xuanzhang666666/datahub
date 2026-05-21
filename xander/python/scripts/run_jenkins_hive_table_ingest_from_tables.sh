@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# run_jenkins_hive_table_ingest_from_jobs.sh — Jenkins：按 JOBS 参数将 Hive 表列表同步到 DataHub
+# run_jenkins_hive_table_ingest_from_tables.sh — Jenkins：按 TABLE_NAMES 参数将 Hive 表列表同步到 DataHub
 #
 # ── Jenkins 参数 ─────────────────────────────────────────────────────────────
-# JOBS              Multi-line String，每行一张表：库.表（如 data_sec_dw.dim_store_info）
+# TABLE_NAMES       Multi-line String，每行一张表：库.表（如 data_sec_dw.dim_store_info）
 #                   也支持仅表名（须设 HIVE_INGEST_IMPLICIT_DATABASE，默认 default）
 #
 # ── 行为 ───────────────────────────────────────────────────────────────────
 # 对名单中每张表：若 DataHub 中已有对应 Dataset → hard delete → 再写入 DataHub
-# 不做 fqtn 层级前缀等表名校验，严格按 JOBS 列表导入
+# 不做 fqtn 层级前缀等表名校验，严格按 TABLE_NAMES 列表导入
 #
 # ── 速度（重要）────────────────────────────────────────────────────────────
 # BLF_HIVE_INGEST_MODE=minimal   轻量 MCP 注册（秒级，适合单表/补血缘节点，无列 schema）
 # BLF_HIVE_INGEST_MODE=full      默认：datahub ingest；会对 HMS 整库 get_all_tables 再逐表拉元数据，
-#                                default 等大库即使 JOBS 只有 1 张表也可能跑很久（非 bug）
+#                                default 等大库即使 TABLE_NAMES 只有 1 张表也可能跑很久（非 bug）
 #
 # ── 常用环境变量（与批量血缘任务相同）──────────────────────────────────────
 # LINEAGE_PYTHON / HIVE_INGEST_PYTHON   推荐 /opt/anaconda3/bin/python
@@ -24,8 +24,8 @@
 # DRY_RUN=1                             只打印计划，不删不写
 #
 # ── 可选 ───────────────────────────────────────────────────────────────────
-# JOB_FILE            表名单文件（未设 JOBS 时使用）
-# TABLE_LIST_FILE     JOBS 落盘路径（默认 $REPORT_DIR/hive_tables_to_ingest.txt）
+# TABLE_FILE          表名单文件（未设 TABLE_NAMES 时使用）
+# TABLE_LIST_FILE     TABLE_NAMES 落盘路径（默认 $REPORT_DIR/hive_tables_to_ingest.txt）
 # LINEAGE_ENV_FILE / lineage.env
 set -euo pipefail
 
@@ -86,16 +86,16 @@ if [[ ! -f "$PKG_DIR/hive_jobs_table_ingest.py" ]]; then
 fi
 
 _RESOLVED_LIST=""
-if [[ -n "${JOBS:-}" ]]; then
-  printf '%s\n' "$JOBS" > "$_TABLE_SNAPSHOT"
+if [[ -n "${TABLE_NAMES:-}" ]]; then
+  printf '%s\n' "$TABLE_NAMES" > "$_TABLE_SNAPSHOT"
   _RESOLVED_LIST="$_TABLE_SNAPSHOT"
-  echo "[INFO] 从 JOBS 写入表名单: $_TABLE_SNAPSHOT"
-elif [[ -n "${JOB_FILE:-}" ]]; then
-  _RESOLVED_LIST="$JOB_FILE"
+  echo "[INFO] 从 TABLE_NAMES 写入表名单: $_TABLE_SNAPSHOT"
+elif [[ -n "${TABLE_FILE:-}" ]]; then
+  _RESOLVED_LIST="$TABLE_FILE"
 elif [[ $# -ge 1 && -f "$1" ]]; then
   _RESOLVED_LIST="$1"
 else
-  echo "ERROR: 请设置 Jenkins 参数 JOBS（Multi-line，每行 库.表），或 JOB_FILE / 传入名单文件。" >&2
+  echo "ERROR: 请设置 Jenkins 参数 TABLE_NAMES（Multi-line，每行 库.表），或 TABLE_FILE / 传入名单文件。" >&2
   exit 2
 fi
 
@@ -120,4 +120,4 @@ echo "[INFO] $PYTHON -m job_info_sync_datahub.hive_jobs_table_ingest ${ARGS[*]}"
 PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
   "$PYTHON" -m job_info_sync_datahub.hive_jobs_table_ingest "${ARGS[@]}"
 
-echo "[DONE] hive table ingest from JOBS"
+echo "[DONE] hive table ingest from TABLE_NAMES"

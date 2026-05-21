@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 from job_info_sync_datahub import table_lineage_from_dataset_props as mod
 from job_info_sync_datahub.lineage_write_policy import LineageWriteDecision
 from job_info_sync_datahub.models import TableLineage, TableRef
@@ -141,68 +139,3 @@ def test_check_mode_reports_missing_and_extra_upstreams_without_writing(monkeypa
     assert result["missing_upstreams"] == ["ods.expected"]
     assert result["extra_upstreams"] == ["ods.extra"]
     assert result["write_upstream_lineage"] is False
-
-
-def test_summarize_report_prints_only_table_name_for_check_match(capsys, tmp_path) -> None:
-    report = tmp_path / "batch_report_table_list.jsonl"
-    report.write_text(
-        json.dumps(
-            {
-                "input_table": "dw.matched",
-                "status": "OK",
-                "lineage_status": "CHECK_MATCH",
-                "target_table": "dw.matched",
-                "upstream_count": 2,
-                "source_property": "Etl Script",
-                "etl_file_export_path": "/tmp/etl.job",
-                "llm_raw_export_path": "/tmp/llm.json",
-            },
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    mod.summarize_report(str(report))
-
-    out = capsys.readouterr().out
-    assert "总计: 1  OK: 1  SKIP: 0  FAIL: 0" in out
-    assert "报告明细:" in out
-    assert "  dw.matched\n" in out
-    assert "etl_snapshot=/tmp/etl.job" not in out
-    assert "llm_raw=/tmp/llm.json" not in out
-
-
-def test_summarize_report_prints_diff_details_for_check_mismatch(capsys, tmp_path) -> None:
-    report = tmp_path / "batch_report_table_list.jsonl"
-    report.write_text(
-        json.dumps(
-            {
-                "input_table": "dw.target",
-                "status": "FAIL",
-                "fail_category": "LINEAGE_MISMATCH",
-                "lineage_status": "CHECK_MISMATCH",
-                "target_table": "dw.target",
-                "upstream_count": 2,
-                "source_property": "Etl Script",
-                "missing_upstreams": ["ods.missing"],
-                "extra_upstreams": ["ods.extra"],
-                "etl_file_export_path": "/tmp/etl.job",
-                "llm_raw_export_path": "/tmp/llm.json",
-            },
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    mod.summarize_report(str(report))
-
-    out = capsys.readouterr().out
-    assert "总计: 1  OK: 0  SKIP: 0  FAIL: 1" in out
-    assert "报告明细:" in out
-    assert "[FAIL] table=dw.target lineage=CHECK_MISMATCH target=dw.target upstreams=2 source_property=Etl Script" in out
-    assert "missing_upstreams(1): ods.missing" in out
-    assert "extra_upstreams(1): ods.extra" in out
-    assert "etl_snapshot=/tmp/etl.job" in out
-    assert "llm_raw=/tmp/llm.json" in out

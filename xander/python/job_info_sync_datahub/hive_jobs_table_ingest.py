@@ -1,6 +1,6 @@
-"""Jenkins JOBS 参数驱动的 Hive 表清单 → DataHub（存在则先删后 ingest）。
+"""Jenkins TABLE_NAMES 参数驱动的 Hive 表清单 → DataHub（存在则先删后 ingest）。
 
-**JOBS**：Multi-line 环境变量，每行 ``库.表``（或仅表名 + ``HIVE_INGEST_IMPLICIT_DATABASE``）。
+**TABLE_NAMES**：Multi-line 环境变量，每行 ``库.表``（或仅表名 + ``HIVE_INGEST_IMPLICIT_DATABASE``）。
 不做 fqtn 层级前缀等合法性校验，按用户输入生成 ingest recipe。
 
 **流程**：对每张表若 DataHub 已有则 hard delete → 写入 DataHub。
@@ -9,7 +9,7 @@
 
 - ``minimal``（推荐单表/补血缘节点）：MCP 轻量注册，秒级，无 HMS 全库扫描。
 - ``full``（默认）：``datahub ingest``；HMS 会对 ``default`` 等库 ``get_all_tables`` 并逐表拉元数据，
-  即使 JOBS 只有一张表也可能很慢。
+  即使 TABLE_NAMES 只有一张表也可能很慢。
 """
 
 from __future__ import annotations
@@ -164,12 +164,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "--table-list-file",
-        help="表名列表文件（每行 库.表）；与 --jobs-text 二选一",
+        help="表名列表文件（每行 库.表）；与 --table-names-text 二选一",
     )
     p.add_argument(
-        "--jobs-text",
-        default=os.environ.get("JOBS", ""),
-        help="Multi-line 表名（默认读环境变量 JOBS）",
+        "--table-names-text",
+        dest="table_names_text",
+        default=os.environ.get("TABLE_NAMES", ""),
+        help="Multi-line 表名（默认读环境变量 TABLE_NAMES）",
     )
     p.add_argument(
         "--implicit-database",
@@ -214,10 +215,10 @@ def main() -> int:
 
     if args.table_list_file:
         refs = load_table_list_file(Path(args.table_list_file), args.implicit_database)
-    elif args.jobs_text and args.jobs_text.strip():
-        refs = parse_table_list_text(args.jobs_text, implicit_database=args.implicit_database)
+    elif args.table_names_text and args.table_names_text.strip():
+        refs = parse_table_list_text(args.table_names_text, implicit_database=args.implicit_database)
     else:
-        logger.error("请设置 JOBS 环境变量、--jobs-text 或 --table-list-file")
+        logger.error("请设置 TABLE_NAMES 环境变量、--table-names-text 或 --table-list-file")
         return 2
 
     if not refs:

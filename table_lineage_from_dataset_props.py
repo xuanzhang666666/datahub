@@ -396,14 +396,6 @@ def append_jsonl(path: str, row: Dict[str, Any]) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _format_name_list(values: Any, limit: int = 20) -> str:
-    if not isinstance(values, list) or not values:
-        return "-"
-    shown = [str(v) for v in values[:limit]]
-    suffix = "" if len(values) <= limit else f" ... (+{len(values) - limit})"
-    return ", ".join(shown) + suffix
-
-
 def summarize_report(path: str) -> None:
     rows: List[Dict[str, Any]] = []
     p = Path(path)
@@ -420,42 +412,6 @@ def summarize_report(path: str) -> None:
     fail = [r for r in rows if r.get("status") == "FAIL"]
     print(f"\n{'=' * 60}")
     print(f"总计: {len(rows)}  OK: {len(ok)}  SKIP: {len(skip)}  FAIL: {len(fail)}")
-
-    if not rows:
-        return
-
-    print("\n报告明细:")
-    for r in rows:
-        table_name = r.get("input_table") or r.get("job") or "-"
-        lineage_status = r.get("lineage_status") or "-"
-        missing = r.get("missing_upstreams")
-        extra = r.get("extra_upstreams")
-
-        if lineage_status == "CHECK_MATCH":
-            print(f"  {table_name}")
-            continue
-
-        parts = [
-            f"[{r.get('status') or '-'}]",
-            f"table={table_name}",
-            f"lineage={lineage_status}",
-            f"target={r.get('target_table') or '-'}",
-            f"upstreams={r.get('upstream_count') or 0}",
-            f"source_property={r.get('source_property') or '-'}",
-        ]
-        print("  " + " ".join(parts))
-        if r.get("lineage_reason"):
-            print(f"      reason={str(r.get('lineage_reason'))[:200]}")
-        if r.get("error"):
-            print(f"      error={str(r.get('error'))[:200]}")
-        if isinstance(missing, list):
-            print(f"      missing_upstreams({len(missing)}): {_format_name_list(missing)}")
-        if isinstance(extra, list):
-            print(f"      extra_upstreams({len(extra)}): {_format_name_list(extra)}")
-        if r.get("etl_file_export_path"):
-            print(f"      etl_snapshot={r.get('etl_file_export_path')}")
-        if r.get("llm_raw_export_path"):
-            print(f"      llm_raw={r.get('llm_raw_export_path')}")
 
 
 def parse_args() -> argparse.Namespace:
