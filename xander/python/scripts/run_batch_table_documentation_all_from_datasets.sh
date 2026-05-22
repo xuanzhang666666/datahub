@@ -16,7 +16,11 @@
 #   LINEAGE_PYTHON    Python 解释器
 #   DATAHUB_GMS_URL   GMS 地址
 #   DATAHUB_GMS_TOKEN GMS token
-#   DATAHUB_MYSQL_*   可覆盖 MySQL 容器连接：CONTAINER/USER/PASSWORD/DATABASE
+#   DATAHUB_MYSQL_*   MySQL 连接：
+#                     - 设 DATAHUB_MYSQL_HOST（及可选 PORT）时用本机 mysql 客户端直连（Jenkins 无需 docker）
+#                     - 未设 HOST 时默认 docker exec DATAHUB_MYSQL_CONTAINER（需有 docker.sock 权限）
+#                     还可覆盖 USER/PASSWORD/DATABASE/CLIENT（如 /opt/anaconda3/bin/mysql）
+#   TABLE_PRE         表名前缀过滤，如 pdw → 只保留 *.pdw*（不含 pdw.xxx 库名前缀）（空=不过滤）
 #   TRINO_*           查询 SHOW CREATE TABLE 使用
 set -euo pipefail
 
@@ -63,6 +67,7 @@ echo " CONCURRENCY=$CONCURRENCY  DRY_RUN=$DRY_RUN"
 echo " DOC_WRITE_ACTION=$DOC_WRITE_ACTION"
 echo " LLM_TIMEOUT=$LLM_TIMEOUT"
 echo " MAX_CONSECUTIVE_LLM_FAILURES=$MAX_CONSECUTIVE_LLM_FAILURES"
+echo " TABLE_PRE=${TABLE_PRE:-}"
 echo "==================================================================="
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
@@ -93,6 +98,7 @@ echo "[INFO] discovering tables with Etl Script / Execute Shell structured prope
 DISCOVERY_ARGS="--output $_DISCOVERED_TABLES --summary $_DISCOVERY_SUMMARY"
 [[ -n "${BLF_DATAHUB_PLATFORM_INSTANCE:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --platform-instance $BLF_DATAHUB_PLATFORM_INSTANCE"
 [[ -n "${DATAHUB_ENV:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --env $DATAHUB_ENV"
+[[ -n "${TABLE_PRE:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --table-prefix $TABLE_PRE"
 cd "$PYTHONPATH_ROOT"
 PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
   "$PYTHON" -m job_info_sync_datahub.table_documentation_full_discovery $DISCOVERY_ARGS
@@ -106,8 +112,8 @@ if [[ "$TABLE_COUNT" == "0" ]]; then
   exit 0
 fi
 
-export TABLE_NAMES
-TABLE_NAMES="$(cat "$_DISCOVERED_TABLES")"
+export TABLE_LIST_FILE="$_DISCOVERED_TABLES"
+unset TABLE_NAMES
 export CONCURRENCY DRY_RUN LLM_TIMEOUT MAX_CONSECUTIVE_LLM_FAILURES DOC_WRITE_ACTION TABLE_LIST_CLEAR
 
 echo "[INFO] running existing table documentation batch script ..."

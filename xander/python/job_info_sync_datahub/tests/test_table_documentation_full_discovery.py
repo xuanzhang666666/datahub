@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
+from unittest import mock
 
 from job_info_sync_datahub.structured_properties import URN_ETL_SCRIPT, URN_EXECUTE_SHELL
 from job_info_sync_datahub.table_documentation_full_discovery import (
+    DatasetDocCandidate,
+    _mysql_base_cmd,
     discover_candidates_from_rows,
+    filter_candidates_by_table_prefix,
+    filter_table_names_by_prefix,
+    filter_table_names_file,
     is_meaningful_doc_source_text,
     parse_hive_dataset_urn,
     structured_doc_sources,
+    table_name_matches_prefix,
 )
 
 
@@ -81,6 +89,73 @@ def test_discover_candidates_filters_views_and_sorts_tables() -> None:
     assert [item.table_name for item in candidates] == ["data_a.a_table", "data_b.z_table"]
     assert candidates[0].source_properties == ("Execute Shell",)
     assert candidates[1].source_properties == ("Etl Script",)
+
+
+def test_mysql_base_cmd_uses_direct_client_when_host_is_set() -> None:
+    env = {
+        "DATAHUB_MYSQL_HOST": "127.0.0.1",
+        "DATAHUB_MYSQL_PORT": "3307",
+        "DATAHUB_MYSQL_USER": "root",
+        "DATAHUB_MYSQL_PASSWORD": "secret",
+        "DATAHUB_MYSQL_DATABASE": "datahub",
+        "DATAHUB_MYSQL_CONTAINER": "should-not-use",
+    }
+    with mock.patch.dict(os.environ, env, clear=False):
+        cmd = _mysql_base_cmd()
+    assert cmd[:6] == ["mysql", "-h127.0.0.1", "-P3307", "-uroot", "-psecret", "-D"]
+    assert "docker" not in cmd
+
+
+def test_mysql_base_cmd_uses_docker_exec_when_host_is_unset() -> None:
+    env = {
+        "DATAHUB_MYSQL_USER": "root",
+        "DATAHUB_MYSQL_PASSWORD": "datahub",
+        "DATAHUB_MYSQL_DATABASE": "datahub",
+        "DATAHUB_MYSQL_CONTAINER": "datahub-mysql-1",
+    }
+    with mock.patch.dict(os.environ, env, clear=True):
+        cmd = _mysql_base_cmd()
+    assert cmd[:4] == ["docker", "exec", "datahub-mysql-1", "mysql"]
+
+
+def test_table_name_matches_prefix_table_segment_only() -> None:
+    assert table_name_matches_prefix("ods.pdw_target", "pdw")
+    assert table_name_matches_prefix("ODS.PDW_TARGET", "pdw")
+    assert not table_name_matches_prefix("pdw.dim_store", "pdw")
+    assert not table_name_matches_prefix("data_dw.dw_target", "pdw")
+    assert not table_name_matches_prefix("pdw", "pdw")
+
+
+def test_filter_candidates_by_table_prefix() -> None:
+    candidates = [
+        DatasetDocCandidate("u1", "pdw.a", ("Etl Script",)),
+        DatasetDocCandidate("u2", "ods.pdw_b", ("Execute Shell",)),
+        DatasetDocCandidate("u3", "data_dw.c", ("Etl Script",)),
+    ]
+    filtered = filter_candidates_by_table_prefix(candidates, "pdw")
+    assert [c.table_name for c in filtered] == ["ods.pdw_b"]
+
+
+def test_filter_table_names_by_prefix() -> None:
+    assert filter_table_names_by_prefix(["pdw.x", "data_dw.y", "ods.pdw_z"], "pdw") == ["ods.pdw_z"]
+    assert filter_table_names_by_prefix(["a.b"], "") == ["a.b"]
+
+
+def test_filter_table_names_file_writes_filtered_lines(tmp_path) -> None:
+    src = tmp_path / "in.txt"
+    out = tmp_path / "out.txt"
+    src.write_text("pdw.dim_store\nods.pdw_target\ndata_dw.dw\n", encoding="utf-8")
+    count = filter_table_names_file(str(src), "pdw", str(out))
+    assert count == 1
+    assert out.read_text(encoding="utf-8") == "ods.pdw_target\n"
+
+
+def test_filter_candidates_by_table_prefix_empty_prefix_is_noop() -> None:
+    candidates = [
+        DatasetDocCandidate("u1", "pdw.a", ("Etl Script",)),
+        DatasetDocCandidate("u2", "data_dw.c", ("Etl Script",)),
+    ]
+    assert filter_candidates_by_table_prefix(candidates, "") == candidates
 
 
 def test_discover_candidates_filters_deprecated_datasets() -> None:

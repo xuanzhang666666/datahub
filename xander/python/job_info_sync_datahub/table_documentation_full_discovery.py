@@ -116,16 +116,55 @@ def discover_candidates_from_rows(
     return sorted(candidates, key=lambda item: item.table_name)
 
 
+def table_name_matches_prefix(table_name: str, prefix: str) -> bool:
+    """Match ``db.table`` only when the **table** segment starts with *prefix*.
+
+    Examples for ``TABLE_PRE=pdw``:
+
+    - ``ods.pdw_target`` — kept (table name prefix)
+    - ``pdw.dim_store`` — excluded (database prefix only)
+    """
+    p = prefix.strip().lower()
+    if not p:
+        return True
+    t = table_name.strip().lower()
+    if "." not in t:
+        return False
+    _, tbl = t.split(".", 1)
+    return tbl.startswith(p)
+
+
+def filter_candidates_by_table_prefix(
+    candidates: list[DatasetDocCandidate],
+    prefix: str,
+) -> list[DatasetDocCandidate]:
+    p = prefix.strip()
+    if not p:
+        return candidates
+    return [item for item in candidates if table_name_matches_prefix(item.table_name, p)]
+
+
+def filter_table_names_by_prefix(names: Iterable[str], prefix: str) -> list[str]:
+    p = prefix.strip()
+    if not p:
+        return sorted({n.strip().lower() for n in names if n.strip()})
+    return sorted(n.strip().lower() for n in names if n.strip() and table_name_matches_prefix(n, p))
+
+
+def filter_table_names_file(input_path: str, prefix: str, output_path: str) -> int:
+    names = Path(input_path).read_text(encoding="utf-8").splitlines()
+    filtered = filter_table_names_by_prefix(names, prefix)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(filtered) + ("\n" if filtered else ""), encoding="utf-8")
+    return len(filtered)
+
+
 def _mysql_base_cmd() -> list[str]:
-    container = os.getenv("DATAHUB_MYSQL_CONTAINER", "datahub-mysql-1")
     user = os.getenv("DATAHUB_MYSQL_USER", "root")
     password = os.getenv("DATAHUB_MYSQL_PASSWORD", "datahub")
     database = os.getenv("DATAHUB_MYSQL_DATABASE", "datahub")
-    return [
-        "docker",
-        "exec",
-        container,
-        "mysql",
+    common = [
         f"-u{user}",
         f"-p{password}",
         "-D",
@@ -134,6 +173,15 @@ def _mysql_base_cmd() -> list[str]:
         "--raw",
         "--skip-column-names",
     ]
+
+    host = os.getenv("DATAHUB_MYSQL_HOST", "").strip()
+    if host:
+        port = os.getenv("DATAHUB_MYSQL_PORT", "3306").strip() or "3306"
+        mysql_bin = os.getenv("DATAHUB_MYSQL_CLIENT", "mysql").strip() or "mysql"
+        return [mysql_bin, f"-h{host}", f"-P{port}", *common]
+
+    container = os.getenv("DATAHUB_MYSQL_CONTAINER", "datahub-mysql-1")
+    return ["docker", "exec", container, "mysql", *common]
 
 
 def _run_mysql_query(sql: str) -> str:
@@ -199,6 +247,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary", help="输出发现结果 JSON")
     parser.add_argument("--platform-instance", default=os.getenv("BLF_DATAHUB_PLATFORM_INSTANCE", "blf-prod-hive"))
     parser.add_argument("--env", default=os.getenv("DATAHUB_ENV", "PROD"))
+    parser.add_argument(
+        "--table-prefix",
+        default=os.getenv("TABLE_PRE", "").strip(),
+        help="只保留表名（点号后一段）以此前缀开头的 db.table（环境变量 TABLE_PRE）",
+    )
     return parser.parse_args()
 
 
@@ -214,6 +267,10 @@ def main() -> int:
         platform_instance=args.platform_instance,
         env=args.env,
     )
+    before_prefix = len(candidates)
+    table_prefix = (args.table_prefix or "").strip()
+    if table_prefix:
+        candidates = filter_candidates_by_table_prefix(candidates, table_prefix)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -223,6 +280,8 @@ def main() -> int:
         summary = {
             "platform_instance": args.platform_instance,
             "env": args.env,
+            "table_prefix": table_prefix or None,
+            "table_candidate_count_before_prefix": before_prefix,
             "structured_dataset_count": len(structured_rows),
             "view_dataset_count": len(view_urns),
             "deprecated_dataset_count": len(deprecated_urns),
@@ -240,9 +299,10 @@ def main() -> int:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    prefix_note = f" prefix={table_prefix!r} before={before_prefix}" if table_prefix else ""
     print(
         f"[INFO] structuredProperties datasets={len(structured_rows)} "
-        f"views={len(view_urns)} deprecated={len(deprecated_urns)} tables={len(candidates)}"
+        f"views={len(view_urns)} deprecated={len(deprecated_urns)} tables={len(candidates)}{prefix_note}"
     )
     print(f"[INFO] written sorted table list: {output}")
     return 0

@@ -14,6 +14,8 @@ if [[ -n "${LINEAGE_PYTHON:-}" ]]; then
   PYTHON="$LINEAGE_PYTHON"
 elif [[ -x /opt/anaconda3/bin/python ]]; then
   PYTHON=/opt/anaconda3/bin/python
+elif [[ -x "$HOME/anaconda3/bin/python" ]]; then
+  PYTHON="$HOME/anaconda3/bin/python"
 else
   PYTHON=python3
 fi
@@ -38,7 +40,7 @@ if [[ "${FULL_TESTS:-0}" == "1" ]]; then
   echo "[INFO] FULL_TESTS=1 → 运行全部 job_info_sync_datahub/tests/"
   "$PYTHON" -m pytest job_info_sync_datahub/tests/ -q "$@"
 else
-  echo "[INFO] 默认门禁 → runtime_parser + manual_upstream + hive ingest + two_stage_tmp + field_lineage"
+  echo "[INFO] 默认门禁 → runtime_parser + manual_upstream + hive ingest + table_doc_discovery + ..."
   "$PYTHON" -m pytest \
     job_info_sync_datahub/tests/test_runtime_parser.py \
     job_info_sync_datahub/tests/test_manual_upstream_lineage.py \
@@ -47,6 +49,7 @@ else
     job_info_sync_datahub/tests/test_hive_ingest_mode.py \
     job_info_sync_datahub/tests/test_two_stage_tmp_lineage_contract.py \
     job_info_sync_datahub/tests/test_field_lineage_pipeline.py \
+    job_info_sync_datahub/tests/test_table_documentation_full_discovery.py \
     -q "$@"
 fi
 

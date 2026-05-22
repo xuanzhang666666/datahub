@@ -2,7 +2,8 @@
 # run_batch_table_documentation_from_datasets.sh — 按 DataHub 表结构化属性生成 Documentation
 #
 # Jenkins 参数：
-#   TABLE_NAMES       Multi-line：每行一个 db.table
+#   TABLE_NAMES       Multi-line：每行一个 db.table（表很多时易触发 ARG_MAX，优先用 TABLE_LIST_FILE）
+#   TABLE_LIST_FILE   表名单文件路径（全量任务由 all 脚本传入）
 #   DOC_WRITE_ACTION  append=保留人工文档并追加/替换自动区块（默认）；overwrite=整体覆盖
 #   DRY_RUN           1=只生成报告和 Markdown 预览，不写 DataHub（默认）；0=写入 DataHub
 #   CONCURRENCY       并发数（默认 5）
@@ -11,6 +12,7 @@
 #   LINEAGE_PYTHON    Python 解释器
 #   DATAHUB_GMS_URL   GMS 地址
 #   DATAHUB_GMS_TOKEN GMS token
+#   TABLE_PRE         表名前缀过滤（pdw → 只保留 *.pdw*；空=不过滤）
 #   TRINO_*           查询 SHOW CREATE TABLE 使用
 set -euo pipefail
 
@@ -57,6 +59,7 @@ echo " CONCURRENCY=$CONCURRENCY  DRY_RUN=$DRY_RUN"
 echo " DOC_WRITE_ACTION=$DOC_WRITE_ACTION"
 echo " LLM_TIMEOUT=$LLM_TIMEOUT"
 echo " MAX_CONSECUTIVE_LLM_FAILURES=$MAX_CONSECUTIVE_LLM_FAILURES"
+echo " TABLE_PRE=${TABLE_PRE:-}"
 echo "==================================================================="
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
@@ -74,12 +77,31 @@ if [[ "$DOC_WRITE_ACTION" != "append" && "$DOC_WRITE_ACTION" != "overwrite" ]]; 
   exit 2
 fi
 
-if [[ -z "${TABLE_NAMES:-}" ]]; then
-  echo "ERROR: 请设置 Jenkins 参数 TABLE_NAMES（Multi-line，每行一个 db.table）。" >&2
+if [[ -n "${TABLE_LIST_FILE:-}" && -r "$TABLE_LIST_FILE" ]]; then
+  cp "$TABLE_LIST_FILE" "$_TABLES_SNAPSHOT"
+  echo "[INFO] 从 TABLE_LIST_FILE 复制表名单: $TABLE_LIST_FILE -> $_TABLES_SNAPSHOT"
+elif [[ -n "${TABLE_NAMES:-}" ]]; then
+  printf '%s\n' "$TABLE_NAMES" > "$_TABLES_SNAPSHOT"
+  echo "[INFO] 从 TABLE_NAMES 环境变量写入 $_TABLES_SNAPSHOT"
+else
+  echo "ERROR: 请设置 TABLE_LIST_FILE 或 Jenkins 参数 TABLE_NAMES（Multi-line，每行一个 db.table）。" >&2
   exit 2
 fi
-printf '%s\n' "$TABLE_NAMES" > "$_TABLES_SNAPSHOT"
-echo "[INFO] 从 TABLE_NAMES 环境变量写入 $_TABLES_SNAPSHOT"
+
+if [[ -n "${TABLE_PRE:-}" ]]; then
+  _TABLES_FILTERED="$REPORT_DIR/table_names_to_document.${TABLE_PRE}.txt"
+  cd "$PYTHONPATH_ROOT"
+  _BEFORE_COUNT="$(grep -cve '^[[:space:]]*$' "$_TABLES_SNAPSHOT" || true)"
+  PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    "$PYTHON" -c "from job_info_sync_datahub.table_documentation_full_discovery import filter_table_names_file; import sys; sys.exit(0 if filter_table_names_file('$_TABLES_SNAPSHOT', '$TABLE_PRE', '$_TABLES_FILTERED') else 0)"
+  _AFTER_COUNT="$(grep -cve '^[[:space:]]*$' "$_TABLES_FILTERED" || true)"
+  mv "$_TABLES_FILTERED" "$_TABLES_SNAPSHOT"
+  echo "[INFO] TABLE_PRE=$TABLE_PRE 过滤表名单: $_BEFORE_COUNT -> $_AFTER_COUNT"
+  if [[ "$_AFTER_COUNT" == "0" ]]; then
+    echo "[DONE] 前缀 $TABLE_PRE 未匹配到任何表。" >&2
+    exit 0
+  fi
+fi
 
 if ! "$PYTHON" -c "from datahub.emitter.rest_emitter import DatahubRestEmitter; from datahub.ingestion.graph.client import DataHubGraph" 2>/dev/null; then
   echo "ERROR: 依赖 import 失败（解释器: $PYTHON，用户: $(id -un)）。" >&2
