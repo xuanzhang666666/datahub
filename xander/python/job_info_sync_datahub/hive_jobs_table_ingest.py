@@ -156,11 +156,11 @@ def sync_hive_tables_delete_then_ingest(
     for ref in refs:
         try:
             exists = dataset_entity_exists(
+                gms_url,
                 ref,
-                gms_url=gms_url,
-                token=token,
-                platform_instance=platform_instance,
-                env=env,
+                platform_instance,
+                env,
+                token,
             )
             if exists and existing_action == "skip":
                 logger.info("DataHub 中已存在，默认跳过不删除不重建: %s", ref.full_name)

@@ -99,6 +99,8 @@ if [[ -n "${TABLE_NAMES:-}" ]]; then
   echo "[INFO] 从 TABLE_NAMES 写入表名单: $_TABLE_SNAPSHOT"
 elif [[ -n "${TABLE_FILE:-}" ]]; then
   _RESOLVED_LIST="$TABLE_FILE"
+elif [[ -n "${TABLE_LIST_FILE:-}" ]]; then
+  _RESOLVED_LIST="$TABLE_LIST_FILE"
 elif [[ $# -ge 1 && -f "$1" ]]; then
   _RESOLVED_LIST="$1"
 else
