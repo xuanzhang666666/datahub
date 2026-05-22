@@ -12,6 +12,7 @@ from job_info_sync_datahub.table_documentation_from_dataset_props import (
     AUTO_DOC_END,
     AUTO_DOC_START,
     build_llm_user_message,
+    decode_trino_ddl_unicode_comments,
     merge_documentation,
     prune_python_script_to_entrypoint,
     sync_one_table_documentation,
@@ -115,6 +116,22 @@ def test_build_llm_user_message_contains_ddl_and_upstream_field_table_contract()
     assert "### 5. 使用到的上游表字段" in msg
     assert "| 上游表 | 字段 | 在本表加工中的用途 | 相关逻辑/表达式 |" in msg
     assert "无法确认字段时填“未明确”" in msg
+
+
+def test_decode_trino_ddl_unicode_comments_to_readable_utf8() -> None:
+    ddl = (
+        "CREATE TABLE default.t (\n"
+        "  id bigint COMMENT U&'\\8BA2\\5355ID',\n"
+        "  name string COMMENT U&'\\5546\\54C1\\540D\\79F0'\n"
+        ") COMMENT U&'\\8868\\6CE8\\91CA'"
+    )
+
+    decoded = decode_trino_ddl_unicode_comments(ddl)
+
+    assert "COMMENT '订单ID'" in decoded
+    assert "COMMENT '商品名称'" in decoded
+    assert "COMMENT '表注释'" in decoded
+    assert "U&'" not in decoded
 
 
 def test_sync_one_table_documentation_dry_run_exports_markdown_and_does_not_write(tmp_path: Path) -> None:

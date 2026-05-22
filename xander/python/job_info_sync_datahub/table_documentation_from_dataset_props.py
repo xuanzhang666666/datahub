@@ -38,6 +38,8 @@ FAIL_DATAHUB_READ = "DATAHUB_READ"
 FAIL_DDL = "DDL_ERROR"
 FAIL_LLM = "LLM_ERROR"
 FAIL_WRITE = "DATAHUB_WRITE"
+_TRINO_U_ESCAPE_RE = re.compile(r"\\([0-9A-Fa-f]{4})")
+_TRINO_COMMENT_U_AMP_RE = re.compile(r"COMMENT\s+U&'((?:[^'\\]|\\.)*?)'", re.IGNORECASE | re.DOTALL)
 
 SYSTEM_PROMPT = """你是便利蜂数据仓库专家，擅长阅读 Hive SQL、Spark SQL、Python 和 shell 调度脚本。
 你会收到一个 Hive 表的 Execute Shell、Etl Script 和完整 DDL。请直接输出 Markdown 文档，不要输出 JSON，不要使用额外解释。
@@ -305,6 +307,21 @@ def markdown_from_llm_payload(payload: Dict[str, Any]) -> str:
     return markdown.strip()
 
 
+def decode_trino_u_string(body: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 16))
+
+    return _TRINO_U_ESCAPE_RE.sub(repl, body)
+
+
+def decode_trino_ddl_unicode_comments(ddl: str) -> str:
+    def sub_comment(match: re.Match[str]) -> str:
+        decoded = decode_trino_u_string(match.group(1))
+        return "COMMENT '" + decoded.replace("'", "''") + "'"
+
+    return _TRINO_COMMENT_U_AMP_RE.sub(sub_comment, ddl)
+
+
 def fetch_table_ddl(table_name: str) -> str:
     try:
         import trino
@@ -329,7 +346,9 @@ def fetch_table_ddl(table_name: str) -> str:
     if not rows:
         return ""
     value = rows[0][0]
-    return value if isinstance(value, str) else str(value)
+    ddl = value if isinstance(value, str) else str(value)
+    return decode_trino_ddl_unicode_comments(ddl)
+
 
 
 def _export_text(output_dir: Optional[str], subdir: str, table_name: str, suffix: str, content: str) -> Optional[str]:
@@ -545,10 +564,18 @@ def _write_jsonl(path: str, row: Dict[str, Any]) -> None:
 def run_batch(args: argparse.Namespace) -> int:
     setup_logging()
     tables = load_table_names(args.table_file)
-    logger.info("待处理表: %d dry_run=%s action=%s", len(tables), args.dry_run, args.action)
+    logger.info(
+        "待处理表: %d dry_run=%s action=%s max_consecutive_llm_failures=%d",
+        len(tables),
+        args.dry_run,
+        args.action,
+        args.max_consecutive_llm_failures,
+    )
     output_dir = str(Path(args.report).parent)
 
     ok = skip = fail = 0
+    consecutive_llm_failures = 0
+    aborted_reason: Optional[str] = None
     rows: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max(args.concurrency, 1)) as pool:
         futures = {
@@ -577,8 +604,12 @@ def run_batch(args: argparse.Namespace) -> int:
                 skip += 1
             else:
                 fail += 1
+            if row.get("fail_category") == FAIL_LLM:
+                consecutive_llm_failures += 1
+            else:
+                consecutive_llm_failures = 0
             logger.info(
-                "[PROGRESS] %d/%d table=%s status=%s doc=%s write=%s OK=%d SKIP=%d FAIL=%d markdown=%s",
+                "[PROGRESS] %d/%d table=%s status=%s doc=%s write=%s OK=%d SKIP=%d FAIL=%d llm_fail_streak=%d markdown=%s",
                 idx,
                 len(tables),
                 row.get("table"),
@@ -588,11 +619,26 @@ def run_batch(args: argparse.Namespace) -> int:
                 ok,
                 skip,
                 fail,
+                consecutive_llm_failures,
                 row.get("markdown_export_path") or "-",
             )
+            if (
+                args.max_consecutive_llm_failures > 0
+                and consecutive_llm_failures >= args.max_consecutive_llm_failures
+            ):
+                aborted_reason = (
+                    f"连续 {consecutive_llm_failures} 个表调用 LLM 失败，停止后续 Documentation 生成"
+                )
+                logger.error(aborted_reason)
+                for pending in futures:
+                    if not pending.done():
+                        pending.cancel()
+                break
 
     print(f"\n{'=' * 60}")
     print(f"总计: {len(rows)}  OK: {ok}  SKIP: {skip}  FAIL: {fail}")
+    if aborted_reason:
+        print(f"ABORTED: {aborted_reason}")
     for row in rows:
         print(
             f"  [{row.get('status')}] table={row.get('table')} "
@@ -602,6 +648,8 @@ def run_batch(args: argparse.Namespace) -> int:
             print(f"      error={row.get('error')}")
         if row.get("ddl_error"):
             print(f"      ddl_error={row.get('ddl_error')}")
+    if aborted_reason:
+        return 2
     return 0 if fail == 0 else 1
 
 
@@ -613,6 +661,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--action", choices=["append", "overwrite"], default=os.getenv("DOC_WRITE_ACTION", "append"))
     p.add_argument("--llm-timeout", type=int, default=int(os.getenv("LLM_TIMEOUT", "90")))
+    p.add_argument(
+        "--max-consecutive-llm-failures",
+        type=int,
+        default=int(os.getenv("MAX_CONSECUTIVE_LLM_FAILURES", "3")),
+        help="连续多少个 LLM_ERROR 后停止；<=0 表示不启用",
+    )
     p.add_argument("--datahub-gms", default=os.getenv("DATAHUB_GMS_URL", "http://localhost:8080"))
     p.add_argument("--token", default=os.getenv("DATAHUB_GMS_TOKEN"))
     p.add_argument("--platform-instance", default=os.getenv("BLF_DATAHUB_PLATFORM_INSTANCE", "blf-prod-hive"))

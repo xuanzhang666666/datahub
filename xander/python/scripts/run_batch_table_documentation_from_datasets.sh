@@ -7,6 +7,7 @@
 #   DRY_RUN           1=只生成报告和 Markdown 预览，不写 DataHub（默认）；0=写入 DataHub
 #   CONCURRENCY       并发数（默认 5）
 #   LLM_TIMEOUT       LLM 超时秒数（默认 300）
+#   MAX_CONSECUTIVE_LLM_FAILURES  连续多少个 LLM_ERROR 后停止（默认 3；<=0 不启用）
 #   LINEAGE_PYTHON    Python 解释器
 #   DATAHUB_GMS_URL   GMS 地址
 #   DATAHUB_GMS_TOKEN GMS token
@@ -16,6 +17,7 @@ set -euo pipefail
 CONCURRENCY="${CONCURRENCY:-5}"
 DRY_RUN="${DRY_RUN:-1}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-300}"
+MAX_CONSECUTIVE_LLM_FAILURES="${MAX_CONSECUTIVE_LLM_FAILURES:-3}"
 DOC_WRITE_ACTION="${DOC_WRITE_ACTION:-append}"
 TABLE_LIST_CLEAR="${TABLE_LIST_CLEAR:-1}"
 
@@ -54,6 +56,7 @@ echo " REPORT_DIR=$REPORT_DIR"
 echo " CONCURRENCY=$CONCURRENCY  DRY_RUN=$DRY_RUN"
 echo " DOC_WRITE_ACTION=$DOC_WRITE_ACTION"
 echo " LLM_TIMEOUT=$LLM_TIMEOUT"
+echo " MAX_CONSECUTIVE_LLM_FAILURES=$MAX_CONSECUTIVE_LLM_FAILURES"
 echo "==================================================================="
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
@@ -107,6 +110,7 @@ ARGS="--report $_REPORT"
 ARGS="$ARGS --table-file $_TABLES_SNAPSHOT"
 ARGS="$ARGS --concurrency $CONCURRENCY"
 ARGS="$ARGS --llm-timeout $LLM_TIMEOUT"
+ARGS="$ARGS --max-consecutive-llm-failures $MAX_CONSECUTIVE_LLM_FAILURES"
 ARGS="$ARGS --action $DOC_WRITE_ACTION"
 [[ "$DRY_RUN" == "1" ]] && ARGS="$ARGS --dry-run"
 [[ -n "${DATAHUB_GMS_URL:-}" ]] && ARGS="$ARGS --datahub-gms $DATAHUB_GMS_URL"
