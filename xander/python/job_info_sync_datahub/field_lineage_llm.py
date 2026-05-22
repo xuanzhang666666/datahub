@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import ssl
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from .field_lineage_models import (
     FieldLineageCandidate,
@@ -18,6 +14,11 @@ from .field_lineage_models import (
     FieldLineageParseResult,
     UnresolvedField,
     review_status_from_confidence,
+)
+from .llm_client import (
+    call_openai_compatible_chat_json,
+    get_llm_config,
+    normalize_openai_v1_base,
 )
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
@@ -64,29 +65,13 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
 
 
 def _deepseek_config() -> Tuple[str, str, str]:
-    base = os.environ.get("DEEPSEEK_OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    if not base.endswith("/v1"):
-        base = f"{base}/v1"
-    key = os.environ.get("DEEPSEEK_API_KEY", "")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
-    if not key:
-        raise RuntimeError("缺少 DeepSeek API Key：请设置 DEEPSEEK_API_KEY")
-    return base, key, model
+    cfg = get_llm_config()
+    return cfg.base_v1, cfg.api_key, cfg.model
 
 
 def _log(message: str) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[FIELD_LINEAGE_LLM][{now}] {message}", flush=True)
-
-
-def _llm_ssl_context() -> Optional[ssl.SSLContext]:
-    verify = os.environ.get("BLF_LLM_SSL_VERIFY", "").strip().lower()
-    if verify in ("0", "false", "no"):
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-    return None
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:
@@ -184,10 +169,11 @@ def call_llm_extract_field_lineage(
     timeout_sec: int = 180,
 ) -> Tuple[FieldLineageParseResult, str]:
     """Call an OpenAI-compatible LLM and parse field-lineage candidates."""
-    base, api_key, model = _deepseek_config()
+    cfg = get_llm_config()
+    base = normalize_openai_v1_base(cfg.base_v1)
     user_message = build_field_lineage_user_message(source_input)
     payload: Dict[str, Any] = {
-        "model": model,
+        "model": cfg.model,
         "messages": [
             {"role": "system", "content": FIELD_LINEAGE_SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
@@ -199,12 +185,12 @@ def call_llm_extract_field_lineage(
     debug_info = build_field_lineage_request_debug_info(
         source_input=source_input,
         base_v1=base,
-        model=model,
+        model=cfg.model,
         timeout_sec=timeout_sec,
     )
     _log(
         "request prepared: "
-        f"base={debug_info['llm_base']} model={debug_info['llm_model']} "
+        f"provider={cfg.provider} base={debug_info['llm_base']} model={debug_info['llm_model']} "
         f"timeout_sec={debug_info['timeout_sec']} "
         f"system_prompt_chars={debug_info['system_prompt_chars']} "
         f"user_message_chars={debug_info['user_message_chars']} "
@@ -212,45 +198,24 @@ def call_llm_extract_field_lineage(
         f"execute_shell_chars={debug_info['execute_shell_chars']} "
         f"request_bytes={len(data)}"
     )
-    req = urllib.request.Request(
-        base.rstrip("/") + "/chat/completions",
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
     start = time.perf_counter()
-    _log("HTTP request started")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec, context=_llm_ssl_context()) as resp:
-            raw = resp.read().decode("utf-8")
-            elapsed_sec = time.perf_counter() - start
-            _log(
-                "HTTP response received: "
-                f"status={resp.status} elapsed_sec={elapsed_sec:.1f} "
-                f"response_chars={len(raw)}"
-            )
-            outer = json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        elapsed_sec = time.perf_counter() - start
-        detail = exc.read().decode("utf-8", errors="replace")[:2000]
-        _log(f"HTTP error: code={exc.code} elapsed_sec={elapsed_sec:.1f}")
-        raise RuntimeError(f"字段血缘 LLM 调用失败 HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        elapsed_sec = time.perf_counter() - start
-        _log(f"URL error: elapsed_sec={elapsed_sec:.1f} reason={exc.reason}")
-        raise
-
-    content = outer["choices"][0]["message"]["content"]
-    if not isinstance(content, str):
-        raise RuntimeError("字段血缘 LLM 返回 content 不是字符串")
-    _log(f"message content received: content_chars={len(content)}")
+    _log(f"HTTP request started: provider={cfg.provider} model={cfg.model}")
+    raw_payload = call_openai_compatible_chat_json(
+        cfg,
+        system_prompt=FIELD_LINEAGE_SYSTEM_PROMPT,
+        user_message=user_message,
+        timeout_sec=timeout_sec,
+    )
+    elapsed_sec = time.perf_counter() - start
+    content = json.dumps(raw_payload, ensure_ascii=False)
+    _log(
+        "HTTP response parsed: "
+        f"elapsed_sec={elapsed_sec:.1f} content_chars={len(content)}"
+    )
     parsed = parse_field_lineage_payload(content)
     _log(
         "message parsed: "
         f"candidate_count={len(parsed.mappings)} "
         f"unresolved_field_count={len(parsed.unresolved_fields)}"
     )
-    return parsed, model
+    return parsed, cfg.model

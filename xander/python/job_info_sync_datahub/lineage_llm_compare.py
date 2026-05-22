@@ -1,6 +1,12 @@
-"""lineage_llm_compare — DeepSeek 表血缘提取。
+"""lineage_llm_compare — LLM 表血缘提取。
 
 从环境变量或 .env 读取密钥（不写入代码）：
+
+  BLF_LLM_BASE_URL=http://token-pool.vip.blibee.com/v1  # 可选，优先级高
+  BLF_LLM_API_KEY=...
+  BLF_LLM_MODEL=gpt-5.5
+
+兼容旧 DeepSeek 配置：
 
   DEEPSEEK_OPENAI_BASE_URL=https://api.deepseek.com/v1  # 可选，有默认值
   DEEPSEEK_API_KEY=...
@@ -16,9 +22,6 @@ import json
 import os
 import re
 import sys
-import ssl
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -27,10 +30,15 @@ if __name__ == "__main__" and __package__ is None:
     __package__ = "job_info_sync_datahub"
 
 from .logging_utils import get_logger, setup_logging
+from .llm_client import (
+    LlmConfig,
+    call_openai_compatible_chat_json,
+    get_llm_config,
+    normalize_openai_v1_base,
+)
 
 logger = get_logger("lineage_llm_compare")
 
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
 _SHELL_ASSIGNMENT_RE = re.compile(
     r"""^\s*([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s#]+))"""
 )
@@ -87,34 +95,13 @@ def load_env_file(path: Path, override: bool = False) -> None:
     logger.info("已加载 env 文件: %s (override=%s)", path, override)
 
 
-def _llm_ssl_context() -> Optional[ssl.SSLContext]:
-    """返回 LLM 请求所用的 SSL context。
-    BLF_LLM_SSL_VERIFY=0 时跳过证书验证（应对企业内网中间人证书问题）。
-    """
-    val = os.environ.get("BLF_LLM_SSL_VERIFY", "").strip().lower()
-    if val in ("0", "false", "no"):
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-    return None
-
-
 def _normalize_openai_v1_base(url: str) -> str:
-    u = url.strip().rstrip("/")
-    if not u.endswith("/v1"):
-        u = f"{u}/v1"
-    return u
+    return normalize_openai_v1_base(url)
 
 
 def _deepseek_config() -> Tuple[str, str, str]:
-    base = os.environ.get("DEEPSEEK_OPENAI_BASE_URL", "https://api.deepseek.com")
-    key = os.environ.get("DEEPSEEK_API_KEY", "")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
-    base = _normalize_openai_v1_base(base)
-    if not key:
-        raise RuntimeError("缺少 DeepSeek API Key：请设置 DEEPSEEK_API_KEY")
-    return base, key, model
+    cfg = get_llm_config()
+    return cfg.base_v1, cfg.api_key, cfg.model
 
 
 SYSTEM_PROMPT = """你是数据平台工程师，擅长阅读 Hive/Spark SQL、shell 与 Python 中的 SQL 片段。
@@ -337,53 +324,17 @@ def _openai_chat_json(
     user_message: str,
     timeout_sec: int = 90,
 ) -> Dict[str, Any]:
-    url = base_v1.rstrip("/") + "/chat/completions"
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+    return call_openai_compatible_chat_json(
+        LlmConfig(
+            base_v1=base_v1,
+            api_key=api_key,
+            model=model,
+            provider="legacy",
+        ),
+        system_prompt=SYSTEM_PROMPT,
+        user_message=user_message,
+        timeout_sec=timeout_sec,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec, context=_llm_ssl_context()) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")[:2000]
-        raise RuntimeError(f"HTTP {e.code} {url}: {err_body}") from e
-
-    outer = json.loads(raw)
-    try:
-        content = outer["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        raise RuntimeError(f"Unexpected API response: {raw[:1500]}") from e
-
-    if isinstance(content, str):
-        return parse_llm_json_object(content)
-    if isinstance(content, dict):
-        return content  # type: ignore[return-value]
-    raise RuntimeError(f"Unexpected message content type: {type(content)}")
-
-
-def parse_llm_json_object(text: str) -> Dict[str, Any]:
-    """从模型输出中解析 JSON 对象（支持裸 JSON 或 ```json 围栏）。"""
-    text = text.strip()
-    m = _JSON_FENCE_RE.search(text)
-    if m:
-        text = m.group(1).strip()
-    return json.loads(text)
 
 
 def _openai_chat_json_with_fallback(
@@ -393,36 +344,7 @@ def _openai_chat_json_with_fallback(
     user_message: str,
     timeout_sec: int = 90,
 ) -> Dict[str, Any]:
-    try:
-        return _openai_chat_json(base_v1, api_key, model, user_message, timeout_sec)
-    except (RuntimeError, json.JSONDecodeError, urllib.error.URLError) as first:
-        logger.warning("首次调用（含 response_format）失败，重试无 json_object: %s", first)
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT + "\n只输出 JSON，不要用 markdown。"},
-            {"role": "user", "content": user_message},
-        ],
-        "temperature": 0.1,
-    }
-    url = base_v1.rstrip("/") + "/chat/completions"
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout_sec, context=_llm_ssl_context()) as resp:
-        raw = resp.read().decode("utf-8")
-    outer = json.loads(raw)
-    content = outer["choices"][0]["message"]["content"]
-    if not isinstance(content, str):
-        raise RuntimeError("unexpected content")
-    return parse_llm_json_object(content)
+    return _openai_chat_json(base_v1, api_key, model, user_message, timeout_sec)
 
 
 def tables_from_llm_payload(payload: Dict[str, Any]) -> Tuple[Set[str], Set[str]]:
@@ -433,10 +355,16 @@ def tables_from_llm_payload(payload: Dict[str, Any]) -> Tuple[Set[str], Set[str]
 
 
 def call_llm_extract(etl_script: str, timeout_sec: int = 90, job_file_name: str = "") -> Dict[str, Any]:
-    """调用 DeepSeek 提取目标/上游表，返回 LLM 原始 JSON payload。失败时抛出异常。"""
-    db, dk, dm = _deepseek_config()
+    """调用 LLM 提取目标/上游表，返回 LLM 原始 JSON payload。失败时抛出异常。"""
+    cfg = get_llm_config()
+    logger.info("LLM 配置: provider=%s base=%s model=%s", cfg.provider, cfg.base_v1, cfg.model)
     user_msg = _build_user_message(etl_script, job_file_name=job_file_name)
-    return _openai_chat_json_with_fallback(db, dk, dm, user_msg, timeout_sec)
+    return call_openai_compatible_chat_json(
+        cfg,
+        system_prompt=SYSTEM_PROMPT,
+        user_message=user_msg,
+        timeout_sec=timeout_sec,
+    )
 
 
 def _default_env_paths() -> List[Path]:
@@ -456,13 +384,13 @@ def _default_env_paths() -> List[Path]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="DeepSeek 表血缘提取")
+    parser = argparse.ArgumentParser(description="LLM 表血缘提取")
     parser.add_argument("--etl-file", type=Path, help="ETL 脚本文本文件路径")
     parser.add_argument("--etl-text", type=str, default="", help="直接传入脚本内容（小脚本调试）")
     parser.add_argument("--job-file-name", default="inline.job", help="用于脚本分段提示，如 xxx.job / x.py")
     parser.add_argument("--env-file", type=Path, action="append", default=[], help="可多次指定 .env 路径（先于默认路径加载）")
     parser.add_argument("--out-json", type=Path, default=None, help="写入完整 JSON 报告")
-    parser.add_argument("--timeout", type=int, default=90, help="DeepSeek HTTP 超时秒数")
+    parser.add_argument("--timeout", type=int, default=90, help="LLM HTTP 超时秒数")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args(argv)
 
