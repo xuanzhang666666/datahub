@@ -50,6 +50,7 @@ else
     job_info_sync_datahub/tests/test_two_stage_tmp_lineage_contract.py \
     job_info_sync_datahub/tests/test_field_lineage_pipeline.py \
     job_info_sync_datahub/tests/test_table_documentation_full_discovery.py \
+    job_info_sync_datahub/tests/test_table_documentation_batch_resume.py \
     -q "$@"
 fi
 

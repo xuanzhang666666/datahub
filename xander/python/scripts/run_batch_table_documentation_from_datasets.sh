@@ -13,6 +13,7 @@
 #   DATAHUB_GMS_URL   GMS 地址
 #   DATAHUB_GMS_TOKEN GMS token
 #   TABLE_PRE         表名前缀过滤（pdw → 只保留 *.pdw*；空=不过滤）
+#   RESUME            1=断点续跑：不清空 jsonl，跳过报告中 OK/SKIP 的表，只处理未完成/失败项
 #   TRINO_*           查询 SHOW CREATE TABLE 使用
 set -euo pipefail
 
@@ -21,7 +22,12 @@ DRY_RUN="${DRY_RUN:-1}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-300}"
 MAX_CONSECUTIVE_LLM_FAILURES="${MAX_CONSECUTIVE_LLM_FAILURES:-3}"
 DOC_WRITE_ACTION="${DOC_WRITE_ACTION:-append}"
-TABLE_LIST_CLEAR="${TABLE_LIST_CLEAR:-1}"
+RESUME="${RESUME:-0}"
+if [[ "$RESUME" == "1" ]]; then
+  TABLE_LIST_CLEAR=0
+else
+  TABLE_LIST_CLEAR="${TABLE_LIST_CLEAR:-1}"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="${JOB_INFO_SYNC_DIR:-$SCRIPT_DIR/job_info_sync_datahub}"
@@ -60,6 +66,7 @@ echo " DOC_WRITE_ACTION=$DOC_WRITE_ACTION"
 echo " LLM_TIMEOUT=$LLM_TIMEOUT"
 echo " MAX_CONSECUTIVE_LLM_FAILURES=$MAX_CONSECUTIVE_LLM_FAILURES"
 echo " TABLE_PRE=${TABLE_PRE:-}"
+echo " RESUME=$RESUME"
 echo "==================================================================="
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
@@ -126,6 +133,9 @@ if [[ "$TABLE_LIST_CLEAR" == "1" ]]; then
     : > "$_REPORT"
   fi
   find "$PKG_DIR" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+elif [[ "$RESUME" == "1" && -f "$_REPORT" ]]; then
+  _DONE_COUNT="$(wc -l < "$_REPORT" | tr -d ' ')"
+  echo "[INFO] RESUME=1: 保留已有报告 $_REPORT（已有 $_DONE_COUNT 行，将跳过 OK/SKIP 的表）"
 fi
 
 ARGS="--report $_REPORT"
@@ -139,6 +149,7 @@ ARGS="$ARGS --action $DOC_WRITE_ACTION"
 [[ -n "${DATAHUB_GMS_TOKEN:-}" ]] && ARGS="$ARGS --token $DATAHUB_GMS_TOKEN"
 [[ -n "${BLF_DATAHUB_PLATFORM_INSTANCE:-}" ]] && ARGS="$ARGS --platform-instance $BLF_DATAHUB_PLATFORM_INSTANCE"
 [[ -n "${DATAHUB_ENV:-}" ]] && ARGS="$ARGS --env $DATAHUB_ENV"
+[[ "$RESUME" == "1" ]] && ARGS="$ARGS --resume"
 
 echo "[INFO] running: $PYTHON -m job_info_sync_datahub.table_documentation_from_dataset_props $ARGS"
 cd "$PYTHONPATH_ROOT"

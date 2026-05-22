@@ -21,6 +21,8 @@
 #                     - 未设 HOST 时默认 docker exec DATAHUB_MYSQL_CONTAINER（需有 docker.sock 权限）
 #                     还可覆盖 USER/PASSWORD/DATABASE/CLIENT（如 /opt/anaconda3/bin/mysql）
 #   TABLE_PRE         表名前缀过滤，如 pdw → 只保留 *.pdw*（不含 pdw.xxx 库名前缀）（空=不过滤）
+#   RESUME            1=断点续跑：复用已有表清单与 jsonl 报告，跳过 OK/SKIP 的表
+#   FORCE_REDISCOVER  RESUME=1 时仍重新从 MySQL 发现表（默认 0，复用 table_names_all_document.txt）
 #   TRINO_*           查询 SHOW CREATE TABLE 使用
 set -euo pipefail
 
@@ -29,7 +31,13 @@ DRY_RUN="${DRY_RUN:-1}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-300}"
 MAX_CONSECUTIVE_LLM_FAILURES="${MAX_CONSECUTIVE_LLM_FAILURES:-3}"
 DOC_WRITE_ACTION="${DOC_WRITE_ACTION:-append}"
-TABLE_LIST_CLEAR="${TABLE_LIST_CLEAR:-1}"
+RESUME="${RESUME:-0}"
+FORCE_REDISCOVER="${FORCE_REDISCOVER:-0}"
+if [[ "$RESUME" == "1" ]]; then
+  TABLE_LIST_CLEAR=0
+else
+  TABLE_LIST_CLEAR="${TABLE_LIST_CLEAR:-1}"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="${JOB_INFO_SYNC_DIR:-$SCRIPT_DIR/job_info_sync_datahub}"
@@ -68,6 +76,7 @@ echo " DOC_WRITE_ACTION=$DOC_WRITE_ACTION"
 echo " LLM_TIMEOUT=$LLM_TIMEOUT"
 echo " MAX_CONSECUTIVE_LLM_FAILURES=$MAX_CONSECUTIVE_LLM_FAILURES"
 echo " TABLE_PRE=${TABLE_PRE:-}"
+echo " RESUME=$RESUME  FORCE_REDISCOVER=$FORCE_REDISCOVER"
 echo "==================================================================="
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
@@ -94,14 +103,18 @@ if [[ ! -f "$SCRIPT_DIR/run_batch_table_documentation_from_datasets.sh" ]]; then
   exit 1
 fi
 
-echo "[INFO] discovering tables with Etl Script / Execute Shell structured properties ..."
-DISCOVERY_ARGS="--output $_DISCOVERED_TABLES --summary $_DISCOVERY_SUMMARY"
-[[ -n "${BLF_DATAHUB_PLATFORM_INSTANCE:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --platform-instance $BLF_DATAHUB_PLATFORM_INSTANCE"
-[[ -n "${DATAHUB_ENV:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --env $DATAHUB_ENV"
-[[ -n "${TABLE_PRE:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --table-prefix $TABLE_PRE"
-cd "$PYTHONPATH_ROOT"
-PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
-  "$PYTHON" -m job_info_sync_datahub.table_documentation_full_discovery $DISCOVERY_ARGS
+if [[ "$RESUME" == "1" && "$FORCE_REDISCOVER" != "1" && -s "$_DISCOVERED_TABLES" ]]; then
+  echo "[INFO] RESUME=1: 复用已有表清单 $_DISCOVERED_TABLES（设 FORCE_REDISCOVER=1 可重新发现）"
+else
+  echo "[INFO] discovering tables with Etl Script / Execute Shell structured properties ..."
+  DISCOVERY_ARGS="--output $_DISCOVERED_TABLES --summary $_DISCOVERY_SUMMARY"
+  [[ -n "${BLF_DATAHUB_PLATFORM_INSTANCE:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --platform-instance $BLF_DATAHUB_PLATFORM_INSTANCE"
+  [[ -n "${DATAHUB_ENV:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --env $DATAHUB_ENV"
+  [[ -n "${TABLE_PRE:-}" ]] && DISCOVERY_ARGS="$DISCOVERY_ARGS --table-prefix $TABLE_PRE"
+  cd "$PYTHONPATH_ROOT"
+  PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    "$PYTHON" -m job_info_sync_datahub.table_documentation_full_discovery $DISCOVERY_ARGS
+fi
 
 TABLE_COUNT="$(grep -cve '^[[:space:]]*$' "$_DISCOVERED_TABLES" || true)"
 echo "[INFO] discovered table count: $TABLE_COUNT"
@@ -114,7 +127,7 @@ fi
 
 export TABLE_LIST_FILE="$_DISCOVERED_TABLES"
 unset TABLE_NAMES
-export CONCURRENCY DRY_RUN LLM_TIMEOUT MAX_CONSECUTIVE_LLM_FAILURES DOC_WRITE_ACTION TABLE_LIST_CLEAR
+export CONCURRENCY DRY_RUN LLM_TIMEOUT MAX_CONSECUTIVE_LLM_FAILURES DOC_WRITE_ACTION TABLE_LIST_CLEAR RESUME
 
 echo "[INFO] running existing table documentation batch script ..."
 sh "$SCRIPT_DIR/run_batch_table_documentation_from_datasets.sh"

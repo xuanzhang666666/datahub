@@ -109,6 +109,58 @@ def load_table_names(path: str) -> List[str]:
     return out
 
 
+_TERMINAL_BATCH_STATUSES = frozenset({"OK", "SKIP"})
+
+
+def load_table_report_state(report_path: str) -> Dict[str, Dict[str, Any]]:
+    """Load jsonl report; last row per table wins."""
+    state: Dict[str, Dict[str, Any]] = {}
+    path = Path(report_path)
+    if not path.is_file():
+        return state
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        table = row.get("table")
+        if not isinstance(table, str) or not table.strip():
+            continue
+        state[normalize_table_name(table)] = row
+    return state
+
+
+def select_tables_for_batch(
+    tables: List[str],
+    *,
+    resume: bool,
+    report_path: str,
+) -> tuple[List[str], Dict[str, int]]:
+    """Return tables still to process. On resume, skip OK/SKIP (incl. DRY_RUN / WRITTEN)."""
+    normalized = [normalize_table_name(t) for t in tables]
+    total = len(normalized)
+    if not resume:
+        return normalized, {
+            "total_in_file": total,
+            "skipped_completed": 0,
+            "pending": total,
+        }
+
+    completed = {
+        t
+        for t, row in load_table_report_state(report_path).items()
+        if row.get("status") in _TERMINAL_BATCH_STATUSES
+    }
+    pending = [t for t in normalized if t not in completed]
+    return pending, {
+        "total_in_file": total,
+        "skipped_completed": len(completed),
+        "pending": len(pending),
+    }
+
+
 def merge_documentation(existing: str, generated: str, *, action: str) -> str:
     action = action.strip().lower()
     generated = generated.strip()
@@ -563,13 +615,31 @@ def _write_jsonl(path: str, row: Dict[str, Any]) -> None:
 
 def run_batch(args: argparse.Namespace) -> int:
     setup_logging()
-    tables = load_table_names(args.table_file)
+    all_tables = load_table_names(args.table_file)
+    tables, resume_stats = select_tables_for_batch(
+        all_tables,
+        resume=args.resume,
+        report_path=args.report,
+    )
+    if args.resume:
+        logger.info(
+            "断点续跑: 名单 %d 张，已完成跳过 %d 张，待处理 %d 张（报告 %s）",
+            resume_stats["total_in_file"],
+            resume_stats["skipped_completed"],
+            resume_stats["pending"],
+            args.report,
+        )
+    if not tables:
+        print("\n" + "=" * 60)
+        print("没有待处理表（断点续跑：名单内表均已在报告中为 OK/SKIP）")
+        return 0
     logger.info(
-        "待处理表: %d dry_run=%s action=%s max_consecutive_llm_failures=%d",
+        "待处理表: %d dry_run=%s action=%s max_consecutive_llm_failures=%d resume=%s",
         len(tables),
         args.dry_run,
         args.action,
         args.max_consecutive_llm_failures,
+        args.resume,
     )
     output_dir = str(Path(args.report).parent)
 
@@ -657,6 +727,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--table-file", required=True)
     p.add_argument("--report", required=True)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        default=os.getenv("RESUME", "").strip() in ("1", "true", "yes"),
+        help="断点续跑：跳过报告中 status 为 OK/SKIP 的表（环境变量 RESUME=1）",
+    )
     p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--action", choices=["append", "overwrite"], default=os.getenv("DOC_WRITE_ACTION", "append"))

@@ -26,7 +26,7 @@ pytest job_info_sync_datahub/tests/test_runtime_parser.py \
 
 | 方式 | 说明 |
 |------|------|
-| `sh scripts/run_job_info_sync_datahub_tests.sh` | **默认**：含 `runtime_parser`、`manual_upstream_lineage`、`table_documentation_full_discovery`（`TABLE_PRE` 等）等，**不要求 trino**，通过后再上传 neo4j2。 |
+| `sh scripts/run_job_info_sync_datahub_tests.sh` | **默认**：含 `runtime_parser`、`manual_upstream_lineage`、`table_documentation_full_discovery`（`TABLE_PRE`）、`table_documentation_batch_resume`（`RESUME`）等，**不要求 trino**，通过后再上传 neo4j2。 |
 | `FULL_TESTS=1 sh scripts/run_job_info_sync_datahub_tests.sh` | 跑 **全部** `tests/`，且当前 Python 必须能 `import trino`（否则脚本退出 1）。 |
 
 ## 依赖
