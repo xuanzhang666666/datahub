@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -160,11 +161,22 @@ def filter_table_names_file(input_path: str, prefix: str, output_path: str) -> i
     return len(filtered)
 
 
-def _mysql_base_cmd() -> list[str]:
+def _mysql_host_base_cmd() -> list[str]:
     user = os.getenv("DATAHUB_MYSQL_USER", "root")
     password = os.getenv("DATAHUB_MYSQL_PASSWORD", "datahub")
     database = os.getenv("DATAHUB_MYSQL_DATABASE", "datahub")
-    common = [
+    host = os.getenv("DATAHUB_MYSQL_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = os.getenv("DATAHUB_MYSQL_PORT", "3306").strip() or "3306"
+    mysql_bin = (
+        os.getenv("DATAHUB_MYSQL_CLIENT", "").strip()
+        or os.getenv("DATAHUB_MYSQL_BIN", "").strip()
+        or shutil.which("mysql")
+        or "/opt/anaconda3/bin/mysql"
+    )
+    return [
+        mysql_bin,
+        f"-h{host}",
+        f"-P{port}",
         f"-u{user}",
         f"-p{password}",
         "-D",
@@ -174,25 +186,46 @@ def _mysql_base_cmd() -> list[str]:
         "--skip-column-names",
     ]
 
-    host = os.getenv("DATAHUB_MYSQL_HOST", "").strip()
-    if host:
-        port = os.getenv("DATAHUB_MYSQL_PORT", "3306").strip() or "3306"
-        mysql_bin = os.getenv("DATAHUB_MYSQL_CLIENT", "mysql").strip() or "mysql"
-        return [mysql_bin, f"-h{host}", f"-P{port}", *common]
 
+def _mysql_docker_base_cmd() -> list[str]:
+    user = os.getenv("DATAHUB_MYSQL_USER", "root")
+    password = os.getenv("DATAHUB_MYSQL_PASSWORD", "datahub")
+    database = os.getenv("DATAHUB_MYSQL_DATABASE", "datahub")
     container = os.getenv("DATAHUB_MYSQL_CONTAINER", "datahub-mysql-1")
-    return ["docker", "exec", container, "mysql", *common]
+    return [
+        "docker",
+        "exec",
+        container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-D",
+        database,
+        "--batch",
+        "--raw",
+        "--skip-column-names",
+    ]
+
+
+def _mysql_candidate_cmds() -> list[list[str]]:
+    mode = os.getenv("DATAHUB_MYSQL_MODE", "host").strip().lower()
+    if mode == "docker":
+        return [_mysql_docker_base_cmd()]
+    if mode == "host":
+        return [_mysql_host_base_cmd(), _mysql_docker_base_cmd()]
+    return [_mysql_host_base_cmd(), _mysql_docker_base_cmd()]
 
 
 def _run_mysql_query(sql: str) -> str:
-    cmd = _mysql_base_cmd() + ["-e", sql]
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0:
+    errors: list[str] = []
+    for base_cmd in _mysql_candidate_cmds():
+        proc = subprocess.run(base_cmd + ["-e", sql], capture_output=True)
+        if proc.returncode == 0:
+            return proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         stdout = proc.stdout.decode("utf-8", errors="replace").strip()
-        detail = stderr or stdout or "no output"
-        raise RuntimeError(f"MySQL 查询失败 exit={proc.returncode}: {detail[:2000]}")
-    return proc.stdout.decode("utf-8", errors="replace")
+        errors.append(f"cmd={base_cmd[0]} exit={proc.returncode}: {(stderr or stdout or 'no output')[:1000]}")
+    raise RuntimeError("MySQL 查询失败: " + " | ".join(errors)[:2000])
 
 
 def _parse_tab_rows(output: str, expected_columns: int) -> list[tuple[str, ...]]:

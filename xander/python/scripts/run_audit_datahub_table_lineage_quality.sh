@@ -13,6 +13,14 @@
 # BATCH_SIZE           DataHub scroll batch size，默认 2000
 # HIVE_CHUNK_SIZE      Hive information_schema 分批大小，默认 1000
 # CHECK_NO_UPSTREAM    设为 1 时检查非 ODS/源层表无上游血缘；可能产生较多结果
+# DATAHUB_MYSQL_MODE   读取 view/Etl Script 结构化属性的 MySQL 方式，默认 host；可设 docker
+# DATAHUB_MYSQL_BIN    宿主机 mysql 命令路径，默认自动查找或 /opt/anaconda3/bin/mysql
+#
+# 默认检查：
+# - view dataset 必须有至少一个表级上游血缘
+# - blf.data.warehouse.etl_script 有有效内容的表，如果表名前缀属于
+#   dwa/dwd/pdim/dim/pdw/mid/dm/dw，则必须有至少一个表级上游血缘
+# - ods/ai/app 前缀表不要求必须有上游血缘
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

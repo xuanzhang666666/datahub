@@ -7,7 +7,8 @@ from unittest import mock
 from job_info_sync_datahub.structured_properties import URN_ETL_SCRIPT, URN_EXECUTE_SHELL
 from job_info_sync_datahub.table_documentation_full_discovery import (
     DatasetDocCandidate,
-    _mysql_base_cmd,
+    _mysql_candidate_cmds,
+    _mysql_host_base_cmd,
     discover_candidates_from_rows,
     filter_candidates_by_table_prefix,
     filter_table_names_by_prefix,
@@ -99,23 +100,26 @@ def test_mysql_base_cmd_uses_direct_client_when_host_is_set() -> None:
         "DATAHUB_MYSQL_PASSWORD": "secret",
         "DATAHUB_MYSQL_DATABASE": "datahub",
         "DATAHUB_MYSQL_CONTAINER": "should-not-use",
+        "DATAHUB_MYSQL_CLIENT": "mysql",
     }
     with mock.patch.dict(os.environ, env, clear=False):
-        cmd = _mysql_base_cmd()
+        cmd = _mysql_host_base_cmd()
     assert cmd[:6] == ["mysql", "-h127.0.0.1", "-P3307", "-uroot", "-psecret", "-D"]
     assert "docker" not in cmd
 
 
-def test_mysql_base_cmd_uses_docker_exec_when_host_is_unset() -> None:
+def test_mysql_candidate_cmds_prefers_host_and_keeps_docker_fallback() -> None:
     env = {
         "DATAHUB_MYSQL_USER": "root",
         "DATAHUB_MYSQL_PASSWORD": "datahub",
         "DATAHUB_MYSQL_DATABASE": "datahub",
         "DATAHUB_MYSQL_CONTAINER": "datahub-mysql-1",
+        "DATAHUB_MYSQL_CLIENT": "mysql",
     }
     with mock.patch.dict(os.environ, env, clear=True):
-        cmd = _mysql_base_cmd()
-    assert cmd[:4] == ["docker", "exec", "datahub-mysql-1", "mysql"]
+        cmds = _mysql_candidate_cmds()
+    assert cmds[0][:3] == ["mysql", "-h127.0.0.1", "-P3306"]
+    assert cmds[1][:4] == ["docker", "exec", "datahub-mysql-1", "mysql"]
 
 
 def test_table_name_matches_prefix_table_segment_only() -> None:
