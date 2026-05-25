@@ -51,6 +51,7 @@ from .field_lineage_datahub_reader import (
     fetch_structured_properties,
     make_hive_dataset_urn,
 )
+from .structured_properties import URN_DATA_AVAILABILITY_FLAG
 
 _DEFAULT_PLATFORM_INSTANCE = "blf-prod-hive"
 _DEFAULT_ENV = "PROD"
@@ -182,6 +183,55 @@ def check_structured_properties(
     return bool(etl_script.strip()), bool(execute_shell.strip())
 
 
+def _iter_property_assignments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    current: Any = payload
+    for key in ("structuredProperties", "value"):
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+    if not isinstance(current, dict) or not isinstance(current.get("properties"), list):
+        return []
+    return [item for item in current["properties"] if isinstance(item, dict)]
+
+
+def _first_string_value(assignment: Dict[str, Any]) -> str:
+    values = assignment.get("values")
+    if not isinstance(values, list):
+        return ""
+    for value in values:
+        if isinstance(value, dict) and isinstance(value.get("string"), str):
+            return value["string"]
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def extract_data_availability_flag(payload: Dict[str, Any]) -> str:
+    """Read blf.data.warehouse.data_availability_flag from structuredProperties."""
+    for assignment in _iter_property_assignments(payload):
+        if assignment.get("propertyUrn") == URN_DATA_AVAILABILITY_FLAG:
+            return _first_string_value(assignment).strip()
+    return ""
+
+
+def read_upstream_structured_status(
+    gms_url: str,
+    token: Optional[str],
+    dataset_urn: str,
+) -> Tuple[bool, bool, str]:
+    """Return (has_etl_script, has_execute_shell, data_availability_flag)."""
+    try:
+        payload = fetch_structured_properties(gms_url, dataset_urn, token=token)
+    except Exception:
+        return False, False, ""
+
+    etl_script, execute_shell = extract_property_texts(payload)
+    return (
+        bool(etl_script.strip()),
+        bool(execute_shell.strip()),
+        extract_data_availability_flag(payload),
+    )
+
+
 def _dataset_aspect_url(gms_url: str, dataset_urn: str, aspect_name: str) -> str:
     encoded = urllib.parse.quote(dataset_urn, safe="")
     return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/{aspect_name}"
@@ -309,6 +359,12 @@ def run(
     )
 
     print(f"[INFO] 合并去重后共 {len(upstream_tables)} 个上游表")
+    upstream_status: Dict[str, Tuple[bool, bool, str]] = {}
+    for table_name in upstream_tables:
+        urn = make_hive_dataset_urn(table_name, platform_instance, env)
+        upstream_status[table_name] = read_upstream_structured_status(gms_url, token, urn)
+        data_availability_flag = upstream_status[table_name][2] or "-"
+        print(f"  {table_name}\tdata_availability_flag={data_availability_flag}")
 
     if skip_check_props:
         return 0
@@ -321,7 +377,7 @@ def run(
     skipped_view_tables: List[str] = []
     for t in upstream_tables:
         urn = make_hive_dataset_urn(t, platform_instance, env)
-        has_etl, has_shell = check_structured_properties(gms_url, token, urn)
+        has_etl, has_shell, _ = upstream_status.get(t) or read_upstream_structured_status(gms_url, token, urn)
         missing: List[str] = []
         if not has_etl:
             missing.append(_LABEL_ETL_SCRIPT)

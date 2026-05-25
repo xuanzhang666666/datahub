@@ -93,3 +93,36 @@ def test_run_groups_missing_properties_and_returns_success(monkeypatch, capsys) 
     assert "缺少: Execute Shell 的如下：" in output
     assert "  table_db.shell_missing" in output
     assert "  table_db.both_missing" in output
+
+
+def test_run_prints_data_availability_flag_for_sorted_upstream_tables(monkeypatch, capsys) -> None:
+    upstream_a = q.make_hive_dataset_urn("table_db.a_upstream")
+    upstream_b = q.make_hive_dataset_urn("table_db.b_upstream")
+
+    monkeypatch.setattr(q, "fetch_all_upstream_urns", lambda *args, **kwargs: {upstream_b, upstream_a})
+
+    def _fetch_structured_properties(*args, **kwargs):
+        urn = args[1]
+        table_name = q.urn_to_table_name(urn)
+        flag = "表DDL, 表血缘" if table_name == "table_db.a_upstream" else ""
+        return {
+            "structuredProperties": {
+                "value": {
+                    "properties": [
+                        {
+                            "propertyUrn": q.URN_DATA_AVAILABILITY_FLAG,
+                            "values": [{"string": flag}],
+                        }
+                    ]
+                }
+            }
+        }
+
+    monkeypatch.setattr(q, "fetch_structured_properties", _fetch_structured_properties)
+
+    assert q.run(["target_db.target_table"], "http://gms", skip_check_props=True) == 0
+
+    output = capsys.readouterr().out
+    first = output.index("  table_db.a_upstream\tdata_availability_flag=表DDL, 表血缘")
+    second = output.index("  table_db.b_upstream\tdata_availability_flag=-")
+    assert first < second

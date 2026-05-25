@@ -23,6 +23,7 @@ logger = get_logger("structured_properties")
 URN_ETL_SCRIPT = "urn:li:structuredProperty:blf.data.warehouse.etl_script"
 URN_SCHEDULE_URL = "urn:li:structuredProperty:blf.data.schedule.schedule_url"
 URN_EXECUTE_SHELL = "urn:li:structuredProperty:blf.data.schedule.execute_shell"
+URN_DATA_AVAILABILITY_FLAG = "urn:li:structuredProperty:blf.data.warehouse.data_availability_flag"
 
 SCHEDULE_URL_TEMPLATE = "https://schedule.corp.bianlifeng.com/job/{job}"
 
