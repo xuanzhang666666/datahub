@@ -47,8 +47,13 @@ def test_table_basic_check_rejects_empty_structured_property() -> None:
 
     assert "DDL" not in result.passed_flags
     assert "DDL-STRUCTURED-PROPERTIES" in result.reason
-    assert "structuredProperties: Etl Script" in result.reason
-    assert mod.URN_ETL_SCRIPT in result.reason
+    ddl_issues = [issue for issue in result.issues if issue.check == "DDL"]
+    assert len(ddl_issues) == 1
+    assert ddl_issues[0].property_label == "Etl Script"
+    assert "占位符" in ddl_issues[0].message
+    log_text = "\n".join(mod.format_result_log_lines(result))
+    assert "[WARN]" in log_text
+    assert "Etl Script" in log_text
 
 
 def test_failure_reasons_include_rule_and_aspect_locations() -> None:
@@ -69,7 +74,7 @@ def test_failure_reasons_include_rule_and_aspect_locations() -> None:
     assert "structuredProperties: Schedule URL" in result.reason
     assert "structuredProperties: Execute Shell" in result.reason
     assert "LINEAGE-DOC-SECTION" in result.reason
-    assert "editableDatasetProperties.description" in result.reason
+    assert "aspect=editableDatasetProperties field=description" in result.reason
 
 
 def test_table_lineage_check_matches_documented_sources_with_unqualified_names() -> None:
@@ -130,6 +135,42 @@ def test_table_lineage_parser_ignores_inline_field_names_in_data_source_descript
     )
 
     assert "表血缘" in result.passed_flags
+    assert result.lineage_missing_upstreams == []
+    assert result.lineage_extra_upstreams == []
+
+
+def test_table_lineage_parser_ignores_api_names_and_urls_in_data_sources() -> None:
+    result = mod.evaluate_dataset_availability(
+        table_name="data_takeaway.pdw_takeaway_tp_night_aftersale_order_process_detail_di",
+        dataset_urn="urn:dataset:data_takeaway.pdw_takeaway_tp_night_aftersale_order_process_detail_di",
+        is_view=False,
+        structured_values={},
+        schema_field_count=0,
+        view_logic="",
+        documentation="""
+### 4. 数据来源
+
+主要数据来源包括：
+
+1. `data_takeaway.pdw_takeaway_store_operating_state_info_di`
+   - 用于获取当前可运营且美团或饿了么售卖状态有效的门店清单。
+
+2. 饿了么开放接口
+   - `order.reverse.unprocessedlist`
+   - `order.reverse.process`
+
+3. 美团开放接口
+   - `https://waimaiopen.meituan.com/api/v1/ecommerce/order/getAfterSaleOrders`
+   - `https://waimaiopen.meituan.com/api/v1/order/refund/reject`
+
+### 5. 使用到的上游表字段
+""",
+        upstreams={"data_takeaway.pdw_takeaway_store_operating_state_info_di"},
+        existing_flags=set(),
+    )
+
+    assert "表血缘" in result.passed_flags
+    assert result.lineage_documented_upstreams == ["data_takeaway.pdw_takeaway_store_operating_state_info_di"]
     assert result.lineage_missing_upstreams == []
     assert result.lineage_extra_upstreams == []
 
@@ -344,6 +385,71 @@ def test_main_uses_table_prefix_when_explicit_table_names_are_empty(monkeypatch,
 
     assert exit_code == 0
     assert captured["table_names"] == ["default.pdw_target"]
+
+
+def test_set_available_flags_one_dataset_writes_exact_ddl_and_table_lineage(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        mod,
+        "fetch_structured_properties_or_empty",
+        lambda gms_url, dataset_urn, token=None: {
+            "structuredProperties": {
+                "value": {
+                    "properties": [
+                        {
+                            "propertyUrn": mod.URN_DATA_AVAILABILITY_FLAG,
+                            "values": [{"string": "字段血缘"}],
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    def fake_patch(gms_url, dataset_urn, flags, token=None):
+        captured["dataset_urn"] = dataset_urn
+        captured["flags"] = flags
+
+    monkeypatch.setattr(mod, "patch_data_availability_flags", fake_patch)
+
+    result = mod.set_available_flags_one_dataset(
+        "dw.target",
+        gms_url="http://gms",
+        token=None,
+        platform_instance="blf-prod-hive",
+        env="PROD",
+        dry_run=False,
+    )
+
+    assert captured["dataset_urn"] == "urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.dw.target,PROD)"
+    assert captured["flags"] == ["DDL", "表血缘"]
+    assert result.existing_flags == {"字段血缘"}
+    assert result.final_flags == ["DDL", "表血缘"]
+    assert result.write_status == "UPDATED"
+
+
+def test_main_set_available_flags_requires_explicit_table_names(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("TABLE_NAMES", raising=False)
+    monkeypatch.setattr(
+        mod,
+        "discover_table_names_by_prefix_from_mysql",
+        lambda table_prefix, *, platform_instance, env: ["default.pdw_target"],
+    )
+
+    exit_code = mod.main(
+        [
+            "--set-available-flags",
+            "--table-prefix",
+            "pdw",
+            "--jsonl",
+            str(tmp_path / "report.jsonl"),
+            "--xlsx",
+            str(tmp_path / "report.xlsx"),
+        ]
+    )
+
+    assert exit_code == 2
 
 
 def test_merge_availability_flags_preserves_existing_field_lineage() -> None:

@@ -22,7 +22,7 @@
 # HMS_THRIFT_HOST / HMS_THRIFT_PORT     默认 hiveserver5.dp.data.bj1.wormpex.com:9083
 # HIVE_INGEST_CHUNK_SIZE                recipe 正则分块，默认 600
 # BLF_HIVE_INGEST_TIMEOUT_SEC           ingest 超时，默认 1800
-# HIVE_INGEST_INCLUDE_VIEW_LINEAGE=1    开启视图血缘（慢）
+# HIVE_INGEST_INCLUDE_VIEW_LINEAGE=0    关闭视图血缘（默认开启）
 # EXISTING_DATASET_ACTION               skip（默认）/ update / delete
 # DELETE_EXISTING_DATASET=1             允许删除已存在 Dataset 后重新 ingest（默认 0）
 # DRY_RUN=1                             只打印计划，不删不写
@@ -122,7 +122,7 @@ ARGS=(--table-list-file "$_RESOLVED_LIST")
 [[ "${DRY_RUN:-0}" == "1" ]] && ARGS+=(--dry-run)
 [[ -n "${EXISTING_DATASET_ACTION:-}" ]] && ARGS+=(--existing-dataset-action "$EXISTING_DATASET_ACTION")
 [[ "${DELETE_EXISTING_DATASET:-0}" == "1" ]] && ARGS+=(--delete-existing-dataset)
-[[ "${HIVE_INGEST_INCLUDE_VIEW_LINEAGE:-}" == "1" ]] && ARGS+=(--include-view-lineage)
+[[ "${HIVE_INGEST_INCLUDE_VIEW_LINEAGE:-1}" != "0" ]] && ARGS+=(--include-view-lineage)
 [[ -n "${HIVE_INGEST_CHUNK_SIZE:-}" ]] && ARGS+=(--chunk-size "$HIVE_INGEST_CHUNK_SIZE")
 ARGS+=(--ingest-mode "$BLF_HIVE_INGEST_MODE")
 

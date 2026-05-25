@@ -59,6 +59,20 @@ STRUCTURED_PROPERTY_RULES = {
 
 
 @dataclass
+class CheckIssue:
+    """单条检查结果，用于日志与报告精确定位。"""
+
+    check: str  # DDL | 表血缘 | 字段血缘
+    code: str  # 如 DDL-STRUCTURED-PROPERTIES
+    message: str
+    aspect: str = ""
+    field: str = ""
+    property_label: str = ""
+    property_urn: str = ""
+    hint: str = ""
+
+
+@dataclass
 class AvailabilityResult:
     table_name: str
     dataset_urn: str
@@ -68,6 +82,7 @@ class AvailabilityResult:
     existing_flags: set[str] = field(default_factory=set)
     final_flags: list[str] = field(default_factory=list)
     reason: str = ""
+    issues: list[CheckIssue] = field(default_factory=list)
     write_status: str = "SKIP"
     lineage_documented_upstreams: list[str] = field(default_factory=list)
     lineage_existing_upstreams: list[str] = field(default_factory=list)
@@ -122,6 +137,124 @@ def discover_table_names_by_prefix_from_mysql(
 def is_meaningful_text(value: str) -> bool:
     text = strip_markdown_code_fence(value or "").strip()
     return bool(text) and text.lower() not in {"无", "null", "none"}
+
+
+def diagnose_structured_property_value(raw: str) -> tuple[str, str]:
+    """返回 (状态, 说明)：MISSING | EMPTY | PLACEHOLDER | OK。"""
+    if raw is None or not str(raw).strip():
+        return "MISSING", "structuredProperties 中无该属性或未赋值"
+    text = strip_markdown_code_fence(str(raw)).strip()
+    if not text:
+        return "EMPTY", "属性存在但 string 值为空"
+    if text.lower() in {"无", "null", "none"}:
+        return "PLACEHOLDER", f"值为占位符「{text}」，视为无效"
+    return "OK", f"已填写（{len(text)} 字符）"
+
+
+def _issue(
+    check: str,
+    code: str,
+    message: str,
+    *,
+    aspect: str = "",
+    field: str = "",
+    property_label: str = "",
+    property_urn: str = "",
+    hint: str = "",
+) -> CheckIssue:
+    return CheckIssue(
+        check=check,
+        code=code,
+        message=message,
+        aspect=aspect,
+        field=field,
+        property_label=property_label,
+        property_urn=property_urn,
+        hint=hint,
+    )
+
+
+def build_reason_from_issues(issues: list[CheckIssue], passes: list[str]) -> str:
+    parts = list(passes)
+    for issue in issues:
+        loc = f" aspect={issue.aspect}" if issue.aspect else ""
+        field = f" field={issue.field}" if issue.field else ""
+        prop = f" property={issue.property_label}" if issue.property_label else ""
+        parts.append(f"{issue.check}: FAIL [{issue.code}]{loc}{field}{prop} — {issue.message}")
+    return "；".join(parts)
+
+
+def format_result_log_lines(result: AvailabilityResult) -> list[str]:
+    """生成便于 Jenkins 日志阅读的逐行说明。"""
+    status = result.status
+    if result.error:
+        status = "FAIL"
+    elif result.issues and status == "OK":
+        status = "WARN"
+    failed_checks = sorted({i.check for i in result.issues})
+    summary = (
+        f"[{status}] table={result.table_name} type={result.dataset_type} "
+        f"write={result.write_status} passed={sorted(result.passed_flags)} "
+        f"final={result.final_flags}"
+    )
+    if failed_checks:
+        summary += f" failed_checks={failed_checks}"
+    lines = [summary]
+
+    if result.error:
+        lines.append(f"  [ERROR] {result.error}")
+        return lines
+
+    if result.reason == "Dataset 已废弃，跳过可用性检查":
+        lines.append(f"  note: {result.reason}")
+        return lines
+
+    fail_by_check: dict[str, list[CheckIssue]] = {}
+    for issue in result.issues:
+        fail_by_check.setdefault(issue.check, []).append(issue)
+
+    for check in FLAG_ORDER:
+        if check not in fail_by_check and check not in result.passed_flags:
+            continue
+        if check in result.passed_flags:
+            lines.append(f"  {check}: PASS")
+            continue
+        lines.append(f"  {check}: FAIL")
+        for issue in fail_by_check.get(check, []):
+            lines.append(f"    [{issue.code}] {issue.message}")
+            if issue.aspect or issue.field:
+                loc_bits = []
+                if issue.aspect:
+                    loc_bits.append(f"aspect={issue.aspect}")
+                if issue.field:
+                    loc_bits.append(f"field={issue.field}")
+                if issue.property_label:
+                    loc_bits.append(f"property={issue.property_label}")
+                if issue.property_urn:
+                    loc_bits.append(f"urn={issue.property_urn}")
+                lines.append(f"      location: {', '.join(loc_bits)}")
+            if issue.hint:
+                lines.append(f"      fix: {issue.hint}")
+
+    if result.lineage_missing_upstreams or result.lineage_extra_upstreams:
+        if result.lineage_documented_upstreams:
+            lines.append(
+                f"      doc_upstreams({len(result.lineage_documented_upstreams)}): "
+                f"{result.lineage_documented_upstreams[:8]}"
+                f"{'...' if len(result.lineage_documented_upstreams) > 8 else ''}"
+            )
+        if result.lineage_existing_upstreams:
+            lines.append(
+                f"      datahub_upstreams({len(result.lineage_existing_upstreams)}): "
+                f"{result.lineage_existing_upstreams[:8]}"
+                f"{'...' if len(result.lineage_existing_upstreams) > 8 else ''}"
+            )
+        if result.lineage_missing_upstreams:
+            lines.append(f"      missing_in_datahub: {result.lineage_missing_upstreams}")
+        if result.lineage_extra_upstreams:
+            lines.append(f"      extra_in_datahub: {result.lineage_extra_upstreams}")
+
+    return lines
 
 
 def _iter_property_assignments(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -307,6 +440,8 @@ def _normalize_table_token(value: str) -> str:
     token = _clean_table_token(value)
     if not token:
         return ""
+    if not _is_hive_table_ref(token):
+        return ""
     if "." in token:
         db_name, table_name = token.rsplit(".", 1)
         if table_name.startswith("not_verified_"):
@@ -315,6 +450,15 @@ def _normalize_table_token(value: str) -> str:
     if token.startswith("not_verified_"):
         return token.removeprefix("not_verified_")
     return token
+
+
+def _is_hive_table_ref(token: str) -> bool:
+    if not token or "://" in token or "/" in token:
+        return False
+    parts = token.split(".")
+    if len(parts) > 2:
+        return False
+    return all(re.match(r"^[a-z_][a-z0-9_]*$", part) for part in parts)
 
 
 def parse_documented_upstreams(description: str) -> tuple[bool, set[str]]:
@@ -374,26 +518,29 @@ def evaluate_table_lineage(
     documentation: str,
     upstreams: set[str],
     target_table_name: str = "",
-) -> tuple[bool, set[str], list[str], list[str], list[str], str]:
+) -> tuple[bool, set[str], list[str], list[str], list[str], list[CheckIssue], list[str]]:
+    """返回 (ok, documented, missing, extra, parse_errors, issues, pass_messages)。"""
     section_found, documented_raw = parse_documented_upstreams(documentation)
     if not section_found:
-        return (
-            False,
-            set(),
-            [],
-            sorted(upstreams),
-            [],
-            '表血缘: FAIL [LINEAGE-DOC-SECTION] editableDatasetProperties.description 缺少 "4. 数据来源" 小节',
+        issue = _issue(
+            FLAG_TABLE_LINEAGE,
+            "LINEAGE-DOC-SECTION",
+            'description 中缺少「4. 数据来源」小节（支持 ### 4. 数据来源 或含 4. 数据来源 的标题行）',
+            aspect="editableDatasetProperties",
+            field="description",
+            hint="在表文档 Markdown 中增加 ### 4. 数据来源，并用表格或列表写出上游 db.table",
         )
+        return False, set(), [], sorted(upstreams), [], [issue], []
     if not documented_raw:
-        return (
-            False,
-            set(),
-            [],
-            sorted(upstreams),
-            [],
-            '表血缘: FAIL [LINEAGE-DOC-PARSE] editableDatasetProperties.description 的 "4. 数据来源" 小节未解析到上游表；支持表格第一列或编号列表中的反引号表名',
+        issue = _issue(
+            FLAG_TABLE_LINEAGE,
+            "LINEAGE-DOC-PARSE",
+            "「4. 数据来源」小节存在，但未解析到任何上游表名",
+            aspect="editableDatasetProperties",
+            field='description / "4. 数据来源"',
+            hint="表格第一列写 `db.table`，或编号列表项写 `db.table`（反引号包裹）",
         )
+        return False, set(), [], sorted(upstreams), [], [issue], []
     documented, errors = resolve_documented_upstreams(documented_raw, upstreams)
     normalized_target = _normalize_table_token(target_table_name)
     if normalized_target:
@@ -401,23 +548,33 @@ def evaluate_table_lineage(
         documented = _exclude_target_table(documented, normalized_target, target_table)
         upstreams = _exclude_target_table(upstreams, normalized_target, target_table)
     if errors:
-        return (
-            False,
-            documented,
-            [],
-            [],
-            errors,
-            "表血缘: FAIL [LINEAGE-DOC-AMBIGUOUS] Documentation 上游表存在无库名歧义；请在 4. 数据来源 中补全 db.table",
+        issue = _issue(
+            FLAG_TABLE_LINEAGE,
+            "LINEAGE-DOC-AMBIGUOUS",
+            "文档中的上游表名缺少库名，且匹配到多个 DataHub upstream",
+            aspect="editableDatasetProperties",
+            field='description / "4. 数据来源"',
+            hint="在 4. 数据来源 中使用完整库.表名，避免仅用表名",
         )
+        return False, documented, [], [], errors, [issue], []
     missing = sorted(documented - upstreams)
     extra = sorted(upstreams - documented)
     if missing or extra:
-        reason = (
-            "表血缘: FAIL [LINEAGE-DIFF] Documentation 的 4. 数据来源 与 DataHub upstreamLineage 不一致 "
-            f"missing_in_datahub={missing} extra_in_datahub={extra}"
+        parts = []
+        if missing:
+            parts.append(f"文档有但 DataHub upstreamLineage 无: {missing}")
+        if extra:
+            parts.append(f"DataHub 有但文档未写: {extra}")
+        issue = _issue(
+            FLAG_TABLE_LINEAGE,
+            "LINEAGE-DIFF",
+            "；".join(parts),
+            aspect="upstreamLineage",
+            field="upstreams",
+            hint="对齐文档 4. 数据来源 与 GMS upstreamLineage，或跑表级血缘同步",
         )
-        return False, documented, missing, extra, [], reason
-    return True, documented, [], [], [], "表血缘: PASS"
+        return False, documented, missing, extra, [], [issue], []
+    return True, documented, [], [], [], [], [f"{FLAG_TABLE_LINEAGE}: PASS"]
 
 
 def _exclude_target_table(
@@ -478,31 +635,79 @@ def evaluate_dataset_availability(
             result.passed_flags.add(FLAG_DDL)
             reasons.append("DDL: PASS")
         else:
+            status, detail = diagnose_structured_property_value(view_logic)
+            result.issues.append(
+                _issue(
+                    FLAG_DDL,
+                    "DDL-VIEW-LOGIC",
+                    f"viewLogic {detail}（诊断: {status}）",
+                    aspect="viewProperties",
+                    field="viewLogic",
+                    hint="对该 view 执行 Hive ingest（full 模式）或补全 view DDL",
+                )
+            )
             reasons.append("DDL: FAIL [DDL-VIEW-LOGIC] viewProperties.viewLogic 缺失或为空")
 
         if upstreams:
             result.passed_flags.add(FLAG_TABLE_LINEAGE)
             reasons.append("表血缘: PASS")
         else:
+            result.issues.append(
+                _issue(
+                    FLAG_TABLE_LINEAGE,
+                    "LINEAGE-UPSTREAM-ASPECT",
+                    "upstreamLineage.upstreams 为空，view 无任何表级上游",
+                    aspect="upstreamLineage",
+                    field="upstreams",
+                    hint="导入 view 时开启 include_view_lineage，或手工补 upstreamLineage",
+                )
+            )
             reasons.append("表血缘: FAIL [LINEAGE-UPSTREAM-ASPECT] view 的 upstreamLineage.upstreams 为空")
     else:
-        missing_props = [
-            f"{STRUCTURED_PROPERTY_RULES[urn]} ({urn})"
-            for urn in LABELS
-            if not is_meaningful_text(_value(urn))
-        ]
-        if missing_props:
+        prop_issues: list[CheckIssue] = []
+        for urn, label in LABELS.items():
+            raw = _value(urn)
+            if is_meaningful_text(raw):
+                continue
+            status, detail = diagnose_structured_property_value(raw)
+            prop_issues.append(
+                _issue(
+                    FLAG_DDL,
+                    "DDL-STRUCTURED-PROPERTIES",
+                    f"{label}: {detail}",
+                    aspect="structuredProperties",
+                    field=STRUCTURED_PROPERTY_RULES[urn],
+                    property_label=label,
+                    property_urn=urn,
+                    hint={
+                        URN_ETL_SCRIPT: "跑 job 血缘同步，写入 Etl Script（GitLab 脚本）",
+                        URN_SCHEDULE_URL: "跑 job 血缘同步，写入 Schedule URL",
+                        URN_EXECUTE_SHELL: "跑 job 血缘同步且写入表级血缘时，会写入 Execute Shell",
+                    }.get(urn, "跑 job_info_sync_datahub 同步 structuredProperties"),
+                )
+            )
+        if prop_issues:
+            result.issues.extend(prop_issues)
             reasons.append(
-                "DDL: FAIL [DDL-STRUCTURED-PROPERTIES] "
-                + "、".join(f"{label} 缺失或为空" for label in missing_props)
+                f"DDL: FAIL [DDL-STRUCTURED-PROPERTIES] 共 {len(prop_issues)} 项未满足，见下方逐条说明"
             )
         elif schema_field_count <= 0:
+            result.issues.append(
+                _issue(
+                    FLAG_DDL,
+                    "DDL-SCHEMA-FIELDS",
+                    f"schemaMetadata.fields 为空（当前字段数=0）",
+                    aspect="schemaMetadata",
+                    field="fields",
+                    hint="对该表执行 Hive ingest（full），从 HMS 拉取列定义",
+                )
+            )
             reasons.append("DDL: FAIL [DDL-SCHEMA-FIELDS] schemaMetadata.fields 为空")
         else:
             result.passed_flags.add(FLAG_DDL)
             reasons.append("DDL: PASS")
 
-        ok, documented, missing, extra, errors, lineage_reason = evaluate_table_lineage(
+        ok, documented, missing, extra, errors, lineage_issues, lineage_passes = evaluate_table_lineage(
             documentation,
             upstreams,
             target_table_name=table_name,
@@ -512,11 +717,27 @@ def evaluate_dataset_availability(
         result.lineage_extra_upstreams = extra
         if ok:
             result.passed_flags.add(FLAG_TABLE_LINEAGE)
-        reasons.append(lineage_reason)
-        reasons.extend(errors)
+        result.issues.extend(lineage_issues)
+        for err in errors:
+            result.issues.append(
+                _issue(
+                    FLAG_TABLE_LINEAGE,
+                    "LINEAGE-DOC-AMBIGUOUS",
+                    err,
+                    aspect="editableDatasetProperties",
+                    field='description / "4. 数据来源"',
+                )
+            )
+        reasons.extend(lineage_passes)
+        if lineage_issues:
+            reasons.append(
+                f"表血缘: FAIL [{lineage_issues[0].code}] {lineage_issues[0].message}"
+            )
 
     result.final_flags = merge_availability_flags(existing_flags, result.passed_flags)
-    result.reason = "；".join(reasons)
+    result.reason = build_reason_from_issues(result.issues, [r for r in reasons if ": PASS" in r])
+    if not result.reason and reasons:
+        result.reason = "；".join(reasons)
     return result
 
 
@@ -632,10 +853,44 @@ def check_one_dataset(
     return result
 
 
+def set_available_flags_one_dataset(
+    table_name: str,
+    *,
+    gms_url: str,
+    token: Optional[str],
+    platform_instance: str,
+    env: str,
+    dry_run: bool,
+) -> AvailabilityResult:
+    normalized = table_name.strip().lower()
+    dataset_urn = make_hive_dataset_urn(normalized, platform_instance, env)
+    structured_payload = fetch_structured_properties_or_empty(gms_url, dataset_urn, token=token)
+    existing_flags = extract_existing_flags(extract_structured_values(structured_payload))
+    final_flags = [FLAG_DDL, FLAG_TABLE_LINEAGE]
+    result = AvailabilityResult(
+        table_name=normalized,
+        dataset_urn=dataset_urn,
+        dataset_type="table",
+        passed_flags=set(final_flags),
+        existing_flags=existing_flags,
+        final_flags=final_flags,
+        reason="手工设置 Data Availability Flag = [\"DDL\", \"表血缘\"]",
+    )
+    if set(final_flags) == existing_flags:
+        result.write_status = "NO_CHANGE"
+    elif dry_run:
+        result.write_status = "DRY_RUN"
+    else:
+        patch_data_availability_flags(gms_url, dataset_urn, final_flags, token=token)
+        result.write_status = "UPDATED"
+    return result
+
+
 def result_to_row(result: AvailabilityResult) -> dict[str, Any]:
     row = asdict(result)
     row["passed_flags"] = sorted(result.passed_flags)
     row["existing_flags"] = sorted(result.existing_flags)
+    row["issues"] = [asdict(issue) for issue in result.issues]
     return row
 
 
@@ -667,6 +922,7 @@ def write_xlsx_report(path: str, rows: list[dict[str, Any]]) -> None:
         "final_flags",
         "write_status",
         "reason",
+        "issues",
         "lineage_documented_upstreams",
         "lineage_existing_upstreams",
         "lineage_missing_upstreams",
@@ -731,21 +987,81 @@ def run(
                 reason="DataHub 读取或写入失败",
                 error=str(exc),
             )
+        if result.error:
+            result.status = "FAIL"
+        elif result.issues:
+            result.status = "WARN"
+        else:
+            result.status = "OK"
         row = result_to_row(result)
         row["elapsed"] = round(time.time() - started, 2)
         rows.append(row)
-        print(
-            f"[{result.status}] table={result.table_name} type={result.dataset_type} "
-            f"passed={sorted(result.passed_flags)} final={result.final_flags} write={result.write_status}",
-            flush=True,
-        )
-        if result.reason:
-            print(f"    reason={result.reason}", flush=True)
-        if result.error:
-            print(f"    error={result.error}", flush=True)
+        for line in format_result_log_lines(result):
+            print(line, flush=True)
 
     write_jsonl_report(jsonl_path, rows)
     write_xlsx_report(xlsx_path, rows)
+    ok_count = sum(1 for r in rows if r.get("status") == "OK")
+    warn_count = sum(1 for r in rows if r.get("status") == "WARN")
+    fail_count = sum(1 for r in rows if r.get("status") == "FAIL")
+    print(
+        f"[DONE] checked={len(rows)} ok={ok_count} warn={warn_count} fail={fail_count} "
+        f"(WARN=检查未通过但已读 GMS；FAIL=请求异常)",
+        flush=True,
+    )
+    print(f"[DONE] jsonl: {jsonl_path}", flush=True)
+    print(f"[DONE] xlsx: {xlsx_path}", flush=True)
+    return 1 if failures else 0
+
+
+def run_set_available_flags(
+    table_names: list[str],
+    *,
+    gms_url: str,
+    token: Optional[str],
+    platform_instance: str,
+    env: str,
+    dry_run: bool,
+    jsonl_path: str,
+    xlsx_path: str,
+) -> int:
+    rows: list[dict[str, Any]] = []
+    failures = 0
+    for idx, table_name in enumerate(table_names, start=1):
+        started = time.time()
+        print(f"[INFO] [{idx}/{len(table_names)}] 设置 Data Availability Flag {table_name}", flush=True)
+        try:
+            result = set_available_flags_one_dataset(
+                table_name,
+                gms_url=gms_url,
+                token=token,
+                platform_instance=platform_instance,
+                env=env,
+                dry_run=dry_run,
+            )
+        except Exception as exc:
+            failures += 1
+            normalized = table_name.strip().lower()
+            result = AvailabilityResult(
+                table_name=normalized,
+                dataset_urn=make_hive_dataset_urn(normalized, platform_instance, env),
+                dataset_type="unknown",
+                status="FAIL",
+                reason="DataHub 读取或写入失败",
+                error=str(exc),
+            )
+        result.status = "FAIL" if result.error else "OK"
+        row = result_to_row(result)
+        row["elapsed"] = round(time.time() - started, 2)
+        rows.append(row)
+        for line in format_result_log_lines(result):
+            print(line, flush=True)
+
+    write_jsonl_report(jsonl_path, rows)
+    write_xlsx_report(xlsx_path, rows)
+    ok_count = sum(1 for r in rows if r.get("status") == "OK")
+    fail_count = sum(1 for r in rows if r.get("status") == "FAIL")
+    print(f"[DONE] set_available_flags checked={len(rows)} ok={ok_count} fail={fail_count}", flush=True)
     print(f"[DONE] jsonl: {jsonl_path}", flush=True)
     print(f"[DONE] xlsx: {xlsx_path}", flush=True)
     return 1 if failures else 0
@@ -761,6 +1077,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--platform-instance", default=os.getenv("BLF_DATAHUB_PLATFORM_INSTANCE", "blf-prod-hive"))
     p.add_argument("--env", default=os.getenv("DATAHUB_ENV", "PROD"))
     p.add_argument("--dry-run", action="store_true", default=os.getenv("DRY_RUN", "1") == "1")
+    p.add_argument("--set-available-flags", action="store_true", default=os.getenv("SET_AVAILABLE_FLAGS", "0") == "1")
     p.add_argument("--jsonl", required=True)
     p.add_argument("--xlsx", required=True)
     return p.parse_args(argv)
@@ -768,12 +1085,26 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
-    table_names: list[str] = []
+    explicit_table_names: list[str] = []
     if args.table_list_file:
-        table_names.extend(parse_table_names(Path(args.table_list_file).read_text(encoding="utf-8")))
-    table_names.extend(parse_table_names("\n".join(args.table_name)))
-    table_names.extend(parse_table_names(os.getenv("TABLE_NAMES", "")))
-    table_names = list(dict.fromkeys(table_names))
+        explicit_table_names.extend(parse_table_names(Path(args.table_list_file).read_text(encoding="utf-8")))
+    explicit_table_names.extend(parse_table_names("\n".join(args.table_name)))
+    explicit_table_names.extend(parse_table_names(os.getenv("TABLE_NAMES", "")))
+    table_names = list(dict.fromkeys(explicit_table_names))
+    if args.set_available_flags:
+        if not table_names:
+            print("ERROR: SET_AVAILABLE_FLAGS/--set-available-flags 只支持显式 TABLE_NAMES、--table-name 或 --table-list-file", file=sys.stderr)
+            return 2
+        return run_set_available_flags(
+            table_names,
+            gms_url=args.datahub_gms,
+            token=args.token,
+            platform_instance=args.platform_instance,
+            env=args.env,
+            dry_run=args.dry_run,
+            jsonl_path=args.jsonl,
+            xlsx_path=args.xlsx,
+        )
     if not table_names and args.table_prefix:
         table_names = discover_table_names_by_prefix_from_mysql(
             args.table_prefix,
