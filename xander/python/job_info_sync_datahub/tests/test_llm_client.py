@@ -13,6 +13,7 @@ from job_info_sync_datahub.llm_client import (
     LlmConfig,
     call_openai_compatible_chat_json,
     get_llm_config,
+    llm_user_message_max_chars,
     normalize_openai_v1_base,
 )
 
@@ -23,11 +24,28 @@ def _clear_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "BLF_LLM_API_KEY",
         "BLF_LLM_MODEL",
         "BLF_ACTIVE_LLM",
+        "BLF_LLM_CONTEXT_TOKENS",
+        "BLF_LINEAGE_LLM_PROMPT_MAX_CHARS",
         "DEEPSEEK_OPENAI_BASE_URL",
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_MODEL",
     ):
         monkeypatch.delenv(key, raising=False)
+
+
+def test_user_message_max_chars_aligns_with_default_128k_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_llm_env(monkeypatch)
+    budget = llm_user_message_max_chars(system_prompt_chars=2500)
+    assert budget >= 360_000
+
+
+def test_user_message_max_chars_honors_explicit_char_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_llm_env(monkeypatch)
+    assert llm_user_message_max_chars(explicit_max_chars=200_000) == 200_000
 
 
 def test_get_llm_config_uses_active_blf_provider(monkeypatch: pytest.MonkeyPatch) -> None:

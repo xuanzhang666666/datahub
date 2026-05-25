@@ -26,6 +26,7 @@ from .field_lineage_datahub_reader import (
     make_hive_dataset_urn,
 )
 from .lineage_llm_compare import _prune_shell_job_to_entrypoint
+from .llm_client import llm_user_message_max_chars
 from .llm_client import call_openai_compatible_chat_text, get_llm_config, parse_llm_json_object
 from .logging_utils import get_logger, setup_logging
 from .query_upstream_lineage import is_view_dataset, normalize_table_name
@@ -291,8 +292,12 @@ def build_llm_user_message(
     execute_shell: str,
     etl_script: str,
     ddl: str,
-    max_chars: int = 180_000,
+    max_chars: Optional[int] = None,
 ) -> str:
+    limit = llm_user_message_max_chars(
+        system_prompt_chars=len(SYSTEM_PROMPT),
+        explicit_max_chars=max_chars,
+    )
     pruned_etl = prune_etl_for_prompt(etl_script, execute_shell, table_name)
     body = f"""目标表：{table_name}
 Dataset URN：{dataset_urn}
@@ -318,8 +323,8 @@ Dataset URN：{dataset_urn}
 - Markdown 表格表头：| 上游表 | 字段 | 在本表加工中的用途 | 相关逻辑/表达式 |
 - 无法确认字段时填“未明确”，不能编造字段。
 """
-    if len(body) > max_chars:
-        body = body[:max_chars] + "\n... [truncated]"
+    if len(body) > limit:
+        body = body[:limit] + "\n... [truncated]"
     return body
 
 

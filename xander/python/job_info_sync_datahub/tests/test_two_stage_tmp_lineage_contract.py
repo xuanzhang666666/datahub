@@ -18,7 +18,7 @@ class TestTwoStageTmpLineageContract(unittest.TestCase):
         for fragment in (
             "tmp_",
             "不得",
-            "跨段",
+            "折叠",
             "最终",
         ):
             self.assertIn(fragment, SYSTEM_PROMPT)

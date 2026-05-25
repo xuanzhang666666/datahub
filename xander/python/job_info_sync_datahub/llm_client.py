@@ -20,6 +20,13 @@ DEFAULT_BLF_LLM_BASE_URL = "http://token-pool.vip.blibee.com/v1"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_ACTIVE_LLM = "deepseek"
 
+# OpenAI-compatible 模型 context 预算（可通过环境变量与 BLF_LLM_MODEL 对齐）
+DEFAULT_LLM_CONTEXT_TOKENS = 128_000
+DEFAULT_LLM_RESERVED_OUTPUT_TOKENS = 4_096
+DEFAULT_LLM_RESERVED_SYSTEM_TOKENS = 2_500
+DEFAULT_LLM_CHARS_PER_TOKEN = 3
+MIN_USER_MESSAGE_CHARS = 10_000
+
 
 @dataclass(frozen=True)
 class LlmConfig:
@@ -34,6 +41,54 @@ def normalize_openai_v1_base(url: str) -> str:
     if not base.endswith("/v1"):
         base = f"{base}/v1"
     return base
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if raw.isdigit():
+        return max(1, int(raw))
+    return default
+
+
+def llm_user_message_max_chars(
+    *,
+    system_prompt_chars: int = 0,
+    explicit_max_chars: Optional[int] = None,
+    legacy_env_name: str = "BLF_LINEAGE_LLM_PROMPT_MAX_CHARS",
+) -> int:
+    """按模型 context 推算 user message 字符上限（保守估计 token）。
+
+    优先级：explicit_max_chars > legacy_env_name（如 BLF_LINEAGE_LLM_PROMPT_MAX_CHARS）
+    > BLF_LLM_CONTEXT_TOKENS - 输出预留 - system 预留。
+
+    环境变量：
+      BLF_LLM_CONTEXT_TOKENS（默认 128000，与 gpt-5.5 等 128k 窗口对齐）
+      BLF_LLM_RESERVED_OUTPUT_TOKENS（默认 4096）
+      BLF_LLM_RESERVED_SYSTEM_TOKENS（未传 system_prompt_chars 时使用，默认 2500）
+      BLF_LLM_CHARS_PER_TOKEN（默认 3，SQL/中文混合偏保守）
+    """
+    if explicit_max_chars is not None and explicit_max_chars > 0:
+        return explicit_max_chars
+    legacy = os.environ.get(legacy_env_name, "").strip()
+    if legacy.isdigit():
+        return max(MIN_USER_MESSAGE_CHARS, int(legacy))
+
+    context_tokens = _read_positive_int_env("BLF_LLM_CONTEXT_TOKENS", DEFAULT_LLM_CONTEXT_TOKENS)
+    output_tokens = _read_positive_int_env(
+        "BLF_LLM_RESERVED_OUTPUT_TOKENS", DEFAULT_LLM_RESERVED_OUTPUT_TOKENS
+    )
+    chars_per_token = _read_positive_int_env("BLF_LLM_CHARS_PER_TOKEN", DEFAULT_LLM_CHARS_PER_TOKEN)
+    if system_prompt_chars > 0:
+        system_tokens = (system_prompt_chars + chars_per_token - 1) // chars_per_token
+    else:
+        system_tokens = _read_positive_int_env(
+            "BLF_LLM_RESERVED_SYSTEM_TOKENS", DEFAULT_LLM_RESERVED_SYSTEM_TOKENS
+        )
+    user_tokens = max(
+        MIN_USER_MESSAGE_CHARS // chars_per_token,
+        context_tokens - output_tokens - system_tokens,
+    )
+    return user_tokens * chars_per_token
 
 
 def get_llm_config() -> LlmConfig:

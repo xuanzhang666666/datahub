@@ -26,7 +26,13 @@ from .field_lineage_datahub_reader import (
     fetch_structured_properties,
     make_hive_dataset_urn,
 )
-from .lineage_write_policy import append_lineage_audit_jsonl, evaluate_llm_only
+from .lineage_write_policy import (
+    _parse_lineage_array,
+    append_lineage_audit_jsonl,
+    evaluate_llm_only,
+    llm_row_to_fqtn,
+)
+from .models import TableLineage
 from .logging_utils import get_logger, setup_logging
 from .query_upstream_lineage import is_view_dataset, normalize_table_name
 
@@ -100,6 +106,11 @@ def _base_result(input_table: str, dataset_urn: str) -> Dict[str, Any]:
         "error": None,
         "target_table": None,
         "upstream_count": 0,
+        "upstream_count_input_table": 0,
+        "upstreams_input_table": None,
+        "lineage_sources_deepseek": None,
+        "lineage_dropped_by_fqtn": None,
+        "lineage_dropped_by_hive": None,
         "field_count": 0,
         "lineage_status": None,
         "lineage_reason": None,
@@ -114,6 +125,124 @@ def _base_result(input_table: str, dataset_urn: str) -> Dict[str, Any]:
         "source_property": None,
         "replace_existing_lineage": None,
     }
+
+
+def _normalize_table_key(name: str) -> str:
+    return normalize_table_name(name).strip().lower()
+
+
+def find_lineage_for_input_table(
+    table_lineages: List[TableLineage],
+    input_table: str,
+) -> Optional[TableLineage]:
+    key = _normalize_table_key(input_table)
+    for tl in table_lineages:
+        if tl.target.full_name.lower() == key:
+            return tl
+    return None
+
+
+def _upstream_names_for_target_from_raw(raw: Dict[str, Any], input_table: str) -> set[str]:
+    """LLM 原始 JSON 中，指定目标表对应的上游（未做 fqtn/Hive 过滤）。"""
+    key = _normalize_table_key(input_table)
+    lineage_items = raw.get("lineage")
+    if isinstance(lineage_items, list) and lineage_items:
+        names: set[str] = set()
+        for item in lineage_items:
+            if not isinstance(item, dict):
+                continue
+            tgt = llm_row_to_fqtn(item.get("target"))
+            if tgt != key:
+                continue
+            for row in item.get("upstreams") or []:
+                u = llm_row_to_fqtn(row)
+                if u:
+                    names.add(u)
+        return names
+    parsed = _parse_lineage_array(raw)
+    tl = find_lineage_for_input_table(parsed, input_table)
+    if tl:
+        return {u.full_name for u in tl.upstreams}
+    return set()
+
+
+def _fqtn_dropped_for_target(fqtn_meta: Optional[Dict[str, Any]], input_table: str) -> List[Dict[str, str]]:
+    if not fqtn_meta:
+        return []
+    key = _normalize_table_key(input_table)
+    out: List[Dict[str, str]] = []
+    for block in fqtn_meta.get("stripped_invalid_upstreams") or []:
+        if (block.get("target") or "").lower() != key:
+            continue
+        for item in block.get("removed") or []:
+            if isinstance(item, dict):
+                out.append({"fqtn": item.get("fqtn", ""), "reason": item.get("reason", "")})
+    return out
+
+
+def _hive_drop_for_target(hive_meta: Optional[Dict[str, Any]], input_table: str) -> Optional[Dict[str, Any]]:
+    if not hive_meta:
+        return None
+    key = _normalize_table_key(input_table)
+    for item in hive_meta.get("removed_lineages") or []:
+        if (item.get("target") or "").lower() == key:
+            return item
+    return None
+
+
+def attach_lineage_diagnosis(
+    result: Dict[str, Any],
+    *,
+    input_table: str,
+    table_lineages: List[TableLineage],
+    decision,
+    llm_raw: Dict[str, Any],
+) -> None:
+    """把「为何上游变少」的分解写入 result，并修正 upstream_count 为当前表口径。"""
+    input_tl = find_lineage_for_input_table(table_lineages, input_table)
+    input_upstreams = sorted(u.full_name for u in input_tl.upstreams) if input_tl else []
+    llm_upstreams = sorted(_upstream_names_for_target_from_raw(llm_raw, input_table))
+    fqtn_dropped = _fqtn_dropped_for_target(decision.fqtn_validation, input_table)
+    hive_drop = _hive_drop_for_target(decision.hive_existence, input_table)
+
+    result["upstream_count_input_table"] = len(input_upstreams)
+    result["upstreams_input_table"] = input_upstreams
+    result["upstream_count"] = len(input_upstreams)
+    result["lineage_sources_deepseek"] = llm_upstreams
+    result["lineage_dropped_by_fqtn"] = fqtn_dropped
+    result["lineage_dropped_by_hive"] = hive_drop
+    result["lineage_targets_chosen"] = sorted(decision.selected_targets)
+    result["lineage_sources_chosen"] = sorted(decision.selected_upstreams)
+    if input_tl:
+        result["target_table"] = input_tl.target.full_name
+
+
+def print_lineage_diagnosis(result: Dict[str, Any]) -> None:
+    """在 Jenkins 日志中打印可读的上下游差异分解。"""
+    table = result.get("input_table") or "-"
+    print(f"  [DIAG] table={table} source_property={result.get('source_property') or '-'}")
+    llm_n = len(result.get("lineage_sources_deepseek") or [])
+    final_n = result.get("upstream_count_input_table") or 0
+    print(f"  [DIAG] upstreams: LLM(未过滤)={llm_n} -> 写入前(当前表)={final_n}")
+    if llm_n > final_n:
+        print(f"  [DIAG] 共减少 {llm_n - final_n} 个上游，见下方 fqtn / Hive 明细")
+    for item in result.get("lineage_dropped_by_fqtn") or []:
+        print(f"  [DIAG] fqtn过滤: {item.get('fqtn')} reason={item.get('reason')}")
+    hive_drop = result.get("lineage_dropped_by_hive")
+    if isinstance(hive_drop, dict):
+        print(
+            f"  [DIAG] Hive过滤: reason={hive_drop.get('reason')} "
+            f"missing={hive_drop.get('missing_upstreams')}"
+        )
+    if not result.get("upstreams_input_table") and llm_n:
+        print(
+            "  [DIAG] 提示: LLM 有上游但当前表最终为 0，"
+            "可能目标表名与 ETL 中不一致，或整段 lineage 被 Hive 丢弃"
+        )
+    if result.get("upstreams_input_table"):
+        print(f"  [DIAG] 最终上游: {result.get('upstreams_input_table')}")
+    if result.get("llm_raw_export_path"):
+        print(f"  [DIAG] llm_raw: {result.get('llm_raw_export_path')}")
 
 
 def _empty_structured_properties_payload() -> Dict[str, Any]:
@@ -282,9 +411,15 @@ def sync_one_table(
             result["lineage_status"] = decision.status
             result["lineage_reason"] = decision.reason
             result["write_upstream_lineage"] = decision.write_upstream_lineage
-            result["lineage_targets_chosen"] = sorted(decision.selected_targets)
-            result["lineage_sources_chosen"] = sorted(decision.selected_upstreams)
             result["trust_score"] = decision.trust_score
+            attach_lineage_diagnosis(
+                result,
+                input_table=input_table,
+                table_lineages=table_lineages,
+                decision=decision,
+                llm_raw=llm_raw,
+            )
+            print_lineage_diagnosis(result)
             if audit_jsonl:
                 append_lineage_audit_jsonl(
                     Path(audit_jsonl),
@@ -348,8 +483,14 @@ def sync_one_table(
                     ),
                     error="现有 DataHub 表级血缘与解析结果不一致",
                 )
-            result["target_table"] = ",".join(sorted(decision.selected_targets)) or None
-            result["upstream_count"] = len(decision.selected_upstreams)
+            attach_lineage_diagnosis(
+                result,
+                input_table=input_table,
+                table_lineages=table_lineages,
+                decision=decision,
+                llm_raw=llm_raw,
+            )
+            print_lineage_diagnosis(result)
             return result
 
         writer = DatahubWriter(
@@ -374,8 +515,14 @@ def sync_one_table(
             )
         else:
             result["status"] = "OK"
-        result["target_table"] = ",".join(sorted(decision.selected_targets)) or None
-        result["upstream_count"] = len(decision.selected_upstreams)
+        attach_lineage_diagnosis(
+            result,
+            input_table=input_table,
+            table_lineages=table_lineages,
+            decision=decision,
+            llm_raw=llm_raw,
+        )
+        print_lineage_diagnosis(result)
         return result
     except Exception as exc:
         result.update(
@@ -444,6 +591,22 @@ def summarize_report(path: str) -> None:
             f"source_property={r.get('source_property') or '-'}",
         ]
         print("  " + " ".join(parts))
+        if r.get("lineage_sources_deepseek") is not None:
+            llm_n = len(r.get("lineage_sources_deepseek") or [])
+            fin_n = r.get("upstream_count_input_table") or 0
+            print(f"      upstreams_llm={llm_n} upstreams_final={fin_n}")
+            if llm_n > fin_n:
+                print(f"      upstreams_reduced={llm_n - fin_n} (see fqtn/Hive fields in jsonl)")
+        for item in r.get("lineage_dropped_by_fqtn") or []:
+            print(f"      fqtn_dropped: {item.get('fqtn')} ({item.get('reason')})")
+        hive_drop = r.get("lineage_dropped_by_hive")
+        if isinstance(hive_drop, dict):
+            print(
+                f"      hive_dropped: reason={hive_drop.get('reason')} "
+                f"missing={_format_name_list(hive_drop.get('missing_upstreams'))}"
+            )
+        if r.get("upstreams_input_table"):
+            print(f"      upstreams_final_list: {_format_name_list(r.get('upstreams_input_table'))}")
         if r.get("lineage_reason"):
             print(f"      reason={str(r.get('lineage_reason'))[:200]}")
         if r.get("error"):

@@ -23,7 +23,7 @@ select * from ods_uploads_tag_info_tag_details_v1;
     assert "pdim_tag_info_tag_details_v1" in msg
 
 
-def test_job_prompt_keeps_segments_after_30_so_final_insert_is_visible() -> None:
+def test_job_prompt_sends_full_script_without_semicolon_segments() -> None:
     segments = [f"select {i} as c" for i in range(35)]
     segments.append(
         "insert overwrite table $DB_NAME.$NOT_VERIFIED_TABLE_NAME "
@@ -33,7 +33,9 @@ def test_job_prompt_keeps_segments_after_30_so_final_insert_is_visible() -> None
 
     msg = _build_user_message(script, job_file_name="large.job")
 
-    assert "-- SQL 段 36 --" in msg
+    assert "-- SQL 段" not in msg
+    assert "不要按分号拆段理解" in msg
+    assert "select 34 as c" in msg
     assert "insert overwrite table $DB_NAME.$NOT_VERIFIED_TABLE_NAME" in msg
     assert "data_smartorder.dw_ordering_tad14_store_di" in msg
 
@@ -65,6 +67,16 @@ function dw_ordering_inventory_store_changes_realtime_teardown_di_v1_run {
     assert "data_smartorder.real_source" in msg
     assert "calculate_backup" not in msg
     assert "default.dw_ordering_inventory_store_changes_realtime_di_v1" not in msg
+
+
+def test_job_prompt_truncation_keeps_tail_not_head() -> None:
+    head = "x" * 150_000
+    tail = "insert overwrite table data_takeaway.target select * from data_takeaway.ods_uploads_tail_table;"
+    msg = _build_user_message(head + tail, job_file_name="big.job", max_chars=120_000)
+
+    assert "ods_uploads_tail_table" in msg
+    assert "omitted" in msg and "script head" in msg
+    assert msg.count("x") < 120_000
 
 
 def test_system_prompt_allows_physical_fully_qualified_tmp_upstreams() -> None:

@@ -40,4 +40,6 @@ pytest job_info_sync_datahub/tests/test_runtime_parser.py \
 1. 修改 `job_info_sync_datahub/` 或相关 `scripts/`。  
 2. **`sh scripts/run_job_info_sync_datahub_tests.sh` 必须通过。**  
 3. 再打 `job_info_sync_datahub.tar.gz` 并 `put2` / `get2` 同步（见仓库 `xander/README.md`）。  
+
+LLM 表血缘 prompt 长度默认按 **128k context** 推算（`BLF_LLM_CONTEXT_TOKENS`），约 **36 万字符** user 预算；超长 ETL 保留尾部。可用 `BLF_LINEAGE_LLM_PROMPT_MAX_CHARS` 覆盖。  
 4. 若需验证与 DMP/Hive 强相关的用例，在具备 trino 的环境执行 **`FULL_TESTS=1`** 后再发版。

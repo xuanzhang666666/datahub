@@ -13,6 +13,12 @@
   DEEPSEEK_MODEL=deepseek-v4-pro                        # 可选
 
 可选：BLF_LINEAGE_ENV_FILE 指向 .env；CLI --env-file 可多次指定。
+
+Prompt 长度与模型 context 对齐（见 llm_client.llm_user_message_max_chars）：
+  BLF_LLM_CONTEXT_TOKENS=128000
+  BLF_LLM_RESERVED_OUTPUT_TOKENS=4096
+  BLF_LLM_CHARS_PER_TOKEN=3
+  BLF_LINEAGE_LLM_PROMPT_MAX_CHARS  # 显式字符上限，优先于 token 推算
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from .llm_client import (
     LlmConfig,
     call_openai_compatible_chat_json,
     get_llm_config,
+    llm_user_message_max_chars,
     normalize_openai_v1_base,
 )
 
@@ -119,11 +126,13 @@ SYSTEM_PROMPT = """你是数据平台工程师，擅长阅读 Hive/Spark SQL、s
 - lineage 数组：每个元素对应一条写入语句（INSERT INTO/OVERWRITE、CREATE TABLE AS 等）及其读取的上游表。
 - target：该写入语句的物理目标表，db 省略时用 default，全部小写。
 - upstreams：该目标表对应 SQL 中 FROM/JOIN/子查询读取的物理表；排除 WITH/CTE 别名；排除明显临时变量占位；全部小写。
-- 若脚本写入多个目标表，每个目标表单独列一条 lineage 条目，各自只列与该 SQL 语句相关的上游表。
+- 若脚本写入多个目标表，每个目标表单独列一条 lineage 条目，各自只列与该写入相关的上游表。
 - 若同一目标表被多条 SQL 写入，合并为一条，upstreams 取并集。
-- 脚本可能已按 '-- SQL 段 N --' 标注分段，每段对应一条写入语句，请按段分别提取各自的 target 和 upstreams。
-- 多段 SQL（先 CREATE/INSERT 临时表、再写正式分层表）时：以**最终持久化落表**为 target（如 mid_*、dw_*、pdw_* 等）；以 tmp_ 开头或明显作业内临时表（含 tmp_mid_*）的写入目标**不得**作为 lineage[].target。
-- upstreams 中不要输出**本脚本内创建/删除的作业内临时表**。若后段仅从这类临时表读取再写入最终表，须结合**同脚本更早 SQL 段**追溯该临时表在 FROM/JOIN 中实际读取的持久化表，将其并入最终 target 的 upstreams（跨段折叠、去重），不要把作业内临时表本身列入 upstreams。
+- 输入可能是 BLF shell 调度 .job（TABLE_NAME、function calculate、${HIVE} -e << EOF 等）。请在 heredoc 或 hive -e 引号内的 Hive/Spark SQL 上分析血缘；set/add jar/create temporary function 等会话准备语句可忽略。
+- **不要**按分号把 shell 或 SQL 拆成碎片再分别猜测；以完整 SQL 语义（含整条 WITH…INSERT 链）为准。
+- 若 heredoc 内是一条 WITH…INSERT OVERWRITE 链：通常只输出**最终落表**一条 lineage；upstreams = 整条 SQL 链上所有物理表（含各 CTE 子查询中的 FROM/JOIN），不要把 CTE 名当作物理表。
+- 多语句作业（先 CREATE/INSERT 临时表、再写正式分层表，或多条独立的 insert overwrite）时：以**最终持久化落表**为 target（如 mid_*、dw_*、pdw_* 等）；以 tmp_ 开头或明显作业内临时表（含 tmp_mid_*）的写入目标**不得**作为 lineage[].target。
+- upstreams 中不要输出**本脚本内创建/删除的作业内临时表**。若后序写入仅从这类临时表读取，须结合**同脚本更早的 insert/create** 追溯该临时表在 FROM/JOIN 中实际读取的持久化表，将其并入最终 target 的 upstreams（折叠、去重），不要把作业内临时表本身列入 upstreams。
 - 有明确库名且不是本脚本内创建的 tmp_* 表，应视为外部物理上游表并保留，例如 data_smartorder.tmp_xxx、data_smartorder.tmp_${TABLE_NAME}_xxx 这类跨作业产物可以出现在 upstreams 中；不要因为表名包含 tmp_ 就一刀切删除。
 - 前段写临时表、后段写最终表时，lineage 中**至少一条** target 为最终表，其 upstreams =（后段直接读取的物理表）∪（前段构建临时表所读取的物理表），合并去重；除仅有临时表且无最终落表、须在 notes 说明的情况外，不要仅为临时表单独留一条 lineage。
 - target 表名须为数据分层可接受的前缀（如 dm/ods/pdw/pdim/app/dw/mid/ai/dwa/dwd/dim 等），**禁止**把 tmp_* 写入 target；upstreams 允许保留有明确库名的外部物理 tmp_* 上游。
@@ -292,29 +301,51 @@ def _prune_shell_job_to_entrypoint(etl_script: str, job_file_name: str) -> str:
     return "\n\n".join(part for part in parts if part.strip())
 
 
-def _build_user_message(etl_script: str, max_chars: int = 120_000, job_file_name: str = "") -> str:
-    etl_for_prompt = (
-        _prune_shell_job_to_entrypoint(etl_script, job_file_name)
-        if job_file_name.endswith(".job")
-        else etl_script
+def _prompt_max_chars(explicit: Optional[int] = None) -> int:
+    return llm_user_message_max_chars(
+        system_prompt_chars=len(SYSTEM_PROMPT),
+        explicit_max_chars=explicit,
     )
-    if job_file_name.endswith(".job"):
-        segments = [s.strip() for s in etl_for_prompt.split(";") if s.strip()]
-        if segments:
-            parts = [f"-- SQL 段 {i + 1} --\n{seg}" for i, seg in enumerate(segments)]
-            body = "\n\n".join(parts)
-        else:
-            body = etl_for_prompt
-    else:
-        body = etl_for_prompt
-    if len(body) > max_chars:
-        body = body[:max_chars] + "\n... [truncated]"
-    alias_prompt = _not_verified_alias_prompt(etl_for_prompt)
+
+
+def _truncate_body_keep_tail(body: str, max_chars: int) -> str:
+    """超长脚本保留尾部（INSERT / 后期 JOIN 多在末尾），避免 head 截断漏上游。"""
+    if len(body) <= max_chars:
+        return body
+    dropped = len(body) - max_chars
     return (
-        "以下为 ETL 脚本全文，请按 lineage 数组格式提取每个目标表及其对应的上游表：\n\n"
-        + alias_prompt
-        + body
+        f"... [truncated: omitted {dropped} chars from script head; "
+        "scan all visible FROM/JOIN for upstreams]\n\n" + body[-max_chars:]
     )
+
+
+def _build_user_message(
+    etl_script: str,
+    max_chars: Optional[int] = None,
+    job_file_name: str = "",
+) -> str:
+    limit = _prompt_max_chars(max_chars)
+    is_job = job_file_name.endswith(".job")
+    etl_for_prompt = (
+        _prune_shell_job_to_entrypoint(etl_script, job_file_name) if is_job else etl_script
+    )
+    body = _truncate_body_keep_tail(etl_for_prompt, limit)
+    if len(etl_for_prompt) > limit:
+        logger.warning(
+            "ETL 正文超过 LLM user 预算，已保留尾部: etl_chars=%s limit=%s",
+            len(etl_for_prompt),
+            limit,
+        )
+    alias_prompt = _not_verified_alias_prompt(etl_for_prompt)
+    if is_job:
+        intro = (
+            "以下为 BLF 调度 .job 全文（含 shell；不可达函数已裁剪）。"
+            "请从 ${HIVE} -e / heredoc 内的完整 Hive SQL 提取血缘，"
+            "不要按分号拆段理解：\n\n"
+        )
+    else:
+        intro = "以下为 ETL 脚本全文，请按 lineage 数组格式提取每个目标表及其对应的上游表：\n\n"
+    return intro + alias_prompt + body
 
 
 def _openai_chat_json(
@@ -354,11 +385,23 @@ def tables_from_llm_payload(payload: Dict[str, Any]) -> Tuple[Set[str], Set[str]
     return _impl(payload)
 
 
-def call_llm_extract(etl_script: str, timeout_sec: int = 90, job_file_name: str = "") -> Dict[str, Any]:
+def call_llm_extract(
+    etl_script: str,
+    timeout_sec: int = 90,
+    job_file_name: str = "",
+    prompt_max_chars: Optional[int] = None,
+) -> Dict[str, Any]:
     """调用 LLM 提取目标/上游表，返回 LLM 原始 JSON payload。失败时抛出异常。"""
     cfg = get_llm_config()
     logger.info("LLM 配置: provider=%s base=%s model=%s", cfg.provider, cfg.base_v1, cfg.model)
-    user_msg = _build_user_message(etl_script, job_file_name=job_file_name)
+    user_msg = _build_user_message(
+        etl_script, max_chars=prompt_max_chars, job_file_name=job_file_name
+    )
+    logger.info(
+        "LLM user prompt chars=%s (budget=%s)",
+        len(user_msg),
+        _prompt_max_chars(prompt_max_chars),
+    )
     return call_openai_compatible_chat_json(
         cfg,
         system_prompt=SYSTEM_PROMPT,
