@@ -65,6 +65,7 @@ Markdown 必须严格包含以下章节：
 上游表必须写实际表名，不能省略表名后缀，不能把 `pdw_opc_flag_city_info` 写成 `pdw_opc_flag_city`。
 SQL 中出现过的所有来源表都必须列出，包括 CTE 内引用过但最终 insert overwrite 未真实使用的来源表。
 如果某个来源表只在未参与最终写入的 CTE / 临时逻辑中出现，也要保留在表格中，并在「用途」列标记“脚本中定义但最终写入未使用”。
+`not_verified_` 开头的表是待校验结果表或临时结果表，不是业务计算上游，不要放入 4. 数据来源。
 
 ### 5. 使用到的上游表字段
 必须输出 Markdown 表格，表头固定为：
@@ -290,6 +291,18 @@ def prune_etl_for_prompt(etl_script: str, execute_shell: str, table_name: str) -
     return _prune_shell_job_to_entrypoint(etl_script, f"{table_name}.job")
 
 
+def strip_commented_logic_for_prompt(script: str) -> str:
+    without_block_comments = re.sub(r"/\*[\s\S]*?\*/", "", script)
+    cleaned_lines: List[str] = []
+    for raw_line in without_block_comments.splitlines():
+        stripped = raw_line.lstrip()
+        if stripped.startswith("--") or stripped.startswith("#"):
+            continue
+        cleaned = re.sub(r"\s+--.*$", "", raw_line.rstrip())
+        cleaned_lines.append(cleaned)
+    return "\n".join(cleaned_lines)
+
+
 def expand_prompt_variables(script: str) -> str:
     """Expand simple shell constants before asking the LLM to document table names."""
     assignments: Dict[str, str] = {}
@@ -321,6 +334,30 @@ def expand_prompt_variables(script: str) -> str:
     return replace_vars(script) if assignments else script
 
 
+def expand_generated_markdown_variables(markdown: str, etl_script: str) -> str:
+    """Apply ETL variable expansion to generated Markdown as a final guardrail."""
+    expanded_etl = expand_prompt_variables(etl_script)
+    assignments: Dict[str, str] = {}
+    assignment_re = re.compile(
+        r"""^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"\n]*)"|'([^'\n]*)'|([A-Za-z0-9_./-]+))\s*$"""
+    )
+    for raw_line in expanded_etl.splitlines():
+        match = assignment_re.match(raw_line.strip())
+        if not match:
+            continue
+        name = match.group(1)
+        value = next(group for group in match.groups()[1:] if group is not None)
+        assignments[name] = value
+    if not assignments:
+        return markdown
+
+    def repl(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return assignments.get(name, match.group(0))
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", repl, markdown)
+
+
 def build_llm_user_message(
     *,
     table_name: str,
@@ -334,7 +371,9 @@ def build_llm_user_message(
         system_prompt_chars=len(SYSTEM_PROMPT),
         explicit_max_chars=max_chars,
     )
-    pruned_etl = expand_prompt_variables(prune_etl_for_prompt(etl_script, execute_shell, table_name))
+    pruned_etl = strip_commented_logic_for_prompt(
+        expand_prompt_variables(prune_etl_for_prompt(etl_script, execute_shell, table_name))
+    )
     body = f"""目标表：{table_name}
 Dataset URN：{dataset_urn}
 
@@ -361,6 +400,7 @@ Dataset URN：{dataset_urn}
 - 数据来源里的上游表名必须保持 Etl Script 中出现的完整表名，不能省略后缀或改写表名。
 - SQL 中出现过的所有来源表都必须列出，不能因为最终 insert overwrite 未引用对应 CTE 就隐去。
 - 对只在未参与最终写入的 CTE / 临时逻辑中出现的来源表，在用途列标记“脚本中定义但最终写入未使用”。
+- `not_verified_` 开头的待校验结果表不是业务计算上游，不要放入 4. 数据来源。
 - ### 5. 使用到的上游表字段
 - Markdown 表格表头：| 上游表 | 字段 | 在本表加工中的用途 | 相关逻辑/表达式 |
 - 无法确认字段时填“未明确”，不能编造字段。
@@ -607,7 +647,7 @@ def sync_one_table_documentation(
     try:
         llm_raw = call_llm_generate_documentation(source, timeout_sec=llm_timeout_sec)
         result["llm_raw_export_path"] = _export_json(output_dir, "llm_raw", input_table, "json", llm_raw)
-        markdown = markdown_from_llm_payload(llm_raw)
+        markdown = expand_generated_markdown_variables(markdown_from_llm_payload(llm_raw), etl_script)
         existing = fetch_existing_editable_description(gms_url, dataset_urn, token)
         final_doc = merge_documentation(existing, markdown, action=action)
         result["markdown_export_path"] = _export_text(output_dir, "markdown", input_table, "md", final_doc)

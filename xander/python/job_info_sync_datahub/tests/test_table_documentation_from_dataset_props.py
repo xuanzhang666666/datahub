@@ -13,9 +13,11 @@ from job_info_sync_datahub.table_documentation_from_dataset_props import (
     AUTO_DOC_START,
     build_llm_user_message,
     decode_trino_ddl_unicode_comments,
+    expand_generated_markdown_variables,
     expand_prompt_variables,
     merge_documentation,
     prune_python_script_to_entrypoint,
+    strip_commented_logic_for_prompt,
     sync_one_table_documentation,
     with_updated_editable_description,
 )
@@ -119,6 +121,8 @@ def test_build_llm_user_message_contains_ddl_and_upstream_field_table_contract()
     assert "| --- | --- |" in msg
     assert "SQL 中出现过的所有来源表都必须列出" in msg
     assert "脚本中定义但最终写入未使用" in msg
+    assert "not_verified_" in msg
+    assert "不要放入 4. 数据来源" in msg
     assert "### 5. 使用到的上游表字段" in msg
     assert "| 上游表 | 字段 | 在本表加工中的用途 | 相关逻辑/表达式 |" in msg
     assert "无法确认字段时填“未明确”" in msg
@@ -160,6 +164,50 @@ join ${DEV_ONLY_DB}.dim_ordering_city_info
     assert "data_smartorder.dw_ordering_report_store_status_monitor_half_hour_info_di" in expanded
     assert "data_smartorder.dim_ordering_city_info" in expanded
     assert "data_smartorder_dev." not in expanded
+
+
+def test_expand_generated_markdown_variables_uses_etl_assignments() -> None:
+    etl_script = """
+DATABASE="data_smartorder"
+BEST_TABLE="${DATABASE}.dw_ordering_report_store_status_monitor_best_status_di"
+"""
+    markdown = """
+| `${DATABASE}.dw_ordering_report_store_status_monitor_history_status_di` | 历史状态 |
+| `${BEST_TABLE}` | 最佳状态 |
+"""
+
+    expanded = expand_generated_markdown_variables(markdown, etl_script)
+
+    assert "`data_smartorder.dw_ordering_report_store_status_monitor_history_status_di`" in expanded
+    assert "`data_smartorder.dw_ordering_report_store_status_monitor_best_status_di`" in expanded
+    assert "${DATABASE}" not in expanded
+    assert "${BEST_TABLE}" not in expanded
+
+
+def test_strip_commented_logic_for_prompt_removes_commented_sql_sources() -> None:
+    script = """
+function run_job {
+  $HIVE <<EOF
+    select *
+    from data_smartorder.real_source_di
+    -- left join data_smartorder.commented_line_source_di c on a.id = c.id
+    # left join data_smartorder.hash_commented_source_di h on a.id = h.id
+    /*
+    left join data_smartorder.block_commented_source_di b on a.id = b.id
+    */
+    left join data_smartorder.real_dim_di d on a.id = d.id -- keep inline note
+  EOF
+}
+"""
+
+    cleaned = strip_commented_logic_for_prompt(script)
+
+    assert "data_smartorder.real_source_di" in cleaned
+    assert "data_smartorder.real_dim_di" in cleaned
+    assert "commented_line_source_di" not in cleaned
+    assert "hash_commented_source_di" not in cleaned
+    assert "block_commented_source_di" not in cleaned
+    assert "keep inline note" not in cleaned
 
 
 def test_decode_trino_ddl_unicode_comments_to_readable_utf8() -> None:
