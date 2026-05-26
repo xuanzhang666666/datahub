@@ -13,6 +13,7 @@ from job_info_sync_datahub.table_documentation_from_dataset_props import (
     AUTO_DOC_START,
     build_llm_user_message,
     decode_trino_ddl_unicode_comments,
+    expand_prompt_variables,
     merge_documentation,
     prune_python_script_to_entrypoint,
     sync_one_table_documentation,
@@ -113,9 +114,52 @@ def test_build_llm_user_message_contains_ddl_and_upstream_field_table_contract()
     assert "Execute Shell" in msg
     assert "Etl Script" in msg
     assert "完整 DDL" in msg
+    assert "### 4. 数据来源" in msg
+    assert "| 上游表 | 用途 |" in msg
+    assert "| --- | --- |" in msg
+    assert "SQL 中出现过的所有来源表都必须列出" in msg
+    assert "脚本中定义但最终写入未使用" in msg
     assert "### 5. 使用到的上游表字段" in msg
     assert "| 上游表 | 字段 | 在本表加工中的用途 | 相关逻辑/表达式 |" in msg
     assert "无法确认字段时填“未明确”" in msg
+
+
+def test_expand_prompt_variables_replaces_simple_shell_assignments() -> None:
+    script = """
+DATABASE=data_smartorder
+TARGET_TABLE="${DATABASE}.dw_ordering_report_store_status_monitor_cost_di"
+
+insert overwrite table ${TARGET_TABLE}
+select *
+from ${DATABASE}.dw_ordering_report_store_status_monitor_half_hour_info_di
+"""
+
+    expanded = expand_prompt_variables(script)
+
+    assert "data_smartorder.dw_ordering_report_store_status_monitor_half_hour_info_di" in expanded
+    assert "data_smartorder.dw_ordering_report_store_status_monitor_cost_di" in expanded
+    assert "${DATABASE}.dw_ordering_report_store_status_monitor_half_hour_info_di" not in expanded
+
+
+def test_expand_prompt_variables_normalizes_dev_database_assignments() -> None:
+    script = """
+if [ "$1" == "gray" ] ; then
+    DATABASE="data_smartorder_dev"
+else
+    DATABASE="data_smartorder"
+fi
+DEV_ONLY_DB=data_smartorder_dev
+
+select *
+from ${DATABASE}.dw_ordering_report_store_status_monitor_half_hour_info_di
+join ${DEV_ONLY_DB}.dim_ordering_city_info
+"""
+
+    expanded = expand_prompt_variables(script)
+
+    assert "data_smartorder.dw_ordering_report_store_status_monitor_half_hour_info_di" in expanded
+    assert "data_smartorder.dim_ordering_city_info" in expanded
+    assert "data_smartorder_dev." not in expanded
 
 
 def test_decode_trino_ddl_unicode_comments_to_readable_utf8() -> None:

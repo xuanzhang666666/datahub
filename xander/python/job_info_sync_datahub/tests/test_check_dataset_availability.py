@@ -90,12 +90,12 @@ def test_table_lineage_check_matches_documented_sources_with_unqualified_names()
 
 | 上游表 | 用途 |
 | --- | --- |
-| `ods_source` | 来源 |
-| `dim.dim_city` | 维表 |
+| `ods_order_source_di` | 来源 |
+| `dim.dim_city_info_df` | 维表 |
 
 ### 5. 使用到的上游表字段
 """,
-        upstreams={"default.ods_source", "dim.dim_city"},
+        upstreams={"default.ods_order_source_di", "dim.dim_city_info_df"},
         existing_flags=set(),
     )
 
@@ -173,6 +173,28 @@ def test_table_lineage_parser_ignores_api_names_and_urls_in_data_sources() -> No
     assert result.lineage_documented_upstreams == ["data_takeaway.pdw_takeaway_store_operating_state_info_di"]
     assert result.lineage_missing_upstreams == []
     assert result.lineage_extra_upstreams == []
+
+
+def test_parse_documented_upstreams_defaults_db_and_rejects_invalid_table_names() -> None:
+    _, upstreams = mod.parse_documented_upstreams(
+        """
+### 4. 数据来源
+
+1. `pdw_order_detail_di`
+2. `ods.ods_order_detail_di`
+3. `foo_order_detail_di`
+4. `pdw-order-detail-di`
+5. `_pdw_order_detail_di`
+6. `1pdw_order_detail_di`
+7. `pdw_order`
+8. `order.reverse.process`
+9. `https://example.com/order`
+
+### 5. 使用到的上游表字段
+"""
+    )
+
+    assert upstreams == {"default.pdw_order_detail_di", "ods.ods_order_detail_di"}
 
 
 def test_table_lineage_normalizes_not_verified_tables_and_ignores_target_table() -> None:
@@ -264,15 +286,15 @@ def test_table_lineage_check_reports_documentation_diff() -> None:
 
 | 上游表 | 用途 |
 | --- | --- |
-| `ods.expected` | 来源 |
+| `ods.ods_expected_order_di` | 来源 |
 """,
-        upstreams={"ods.actual"},
+        upstreams={"ods.ods_actual_order_di"},
         existing_flags=set(),
     )
 
     assert "表血缘" not in result.passed_flags
-    assert result.lineage_missing_upstreams == ["ods.expected"]
-    assert result.lineage_extra_upstreams == ["ods.actual"]
+    assert result.lineage_missing_upstreams == ["ods.ods_expected_order_di"]
+    assert result.lineage_extra_upstreams == ["ods.ods_actual_order_di"]
 
 
 def test_view_checks_use_view_logic_and_any_upstream() -> None:

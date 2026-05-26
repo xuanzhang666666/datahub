@@ -44,6 +44,7 @@ FLAG_DDL = "DDL"
 FLAG_TABLE_LINEAGE = "表血缘"
 FLAG_FIELD_LINEAGE = "字段血缘"
 FLAG_ORDER = [FLAG_DDL, FLAG_TABLE_LINEAGE, FLAG_FIELD_LINEAGE]
+VALID_HIVE_TABLE_PREFIXES = ("dwa", "dwd", "pdim", "dim", "ods", "pdw", "app", "mid", "dm", "dw", "ai")
 
 LABELS = {
     URN_ETL_SCRIPT: "Etl Script",
@@ -446,10 +447,14 @@ def _normalize_table_token(value: str) -> str:
         db_name, table_name = token.rsplit(".", 1)
         if table_name.startswith("not_verified_"):
             table_name = table_name.removeprefix("not_verified_")
+        if not _is_valid_hive_table_name(table_name):
+            return ""
         return f"{db_name}.{table_name}"
     if token.startswith("not_verified_"):
         return token.removeprefix("not_verified_")
-    return token
+    if not _is_valid_hive_table_name(token):
+        return ""
+    return f"default.{token}"
 
 
 def _is_hive_table_ref(token: str) -> bool:
@@ -459,6 +464,14 @@ def _is_hive_table_ref(token: str) -> bool:
     if len(parts) > 2:
         return False
     return all(re.match(r"^[a-z_][a-z0-9_]*$", part) for part in parts)
+
+
+def _is_valid_hive_table_name(table_name: str) -> bool:
+    if not re.match(r"^[a-z][a-z0-9_]*$", table_name):
+        return False
+    if not table_name.startswith(VALID_HIVE_TABLE_PREFIXES):
+        return False
+    return table_name.count("_") >= 2
 
 
 def parse_documented_upstreams(description: str) -> tuple[bool, set[str]]:

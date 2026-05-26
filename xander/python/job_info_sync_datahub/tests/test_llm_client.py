@@ -24,6 +24,8 @@ def _clear_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "BLF_LLM_API_KEY",
         "BLF_LLM_MODEL",
         "BLF_ACTIVE_LLM",
+        "LLM_MODEL",
+        "LLM_PROVIDER",
         "BLF_LLM_CONTEXT_TOKENS",
         "BLF_LINEAGE_LLM_PROMPT_MAX_CHARS",
         "DEEPSEEK_OPENAI_BASE_URL",
@@ -66,6 +68,35 @@ def test_get_llm_config_uses_active_blf_provider(monkeypatch: pytest.MonkeyPatch
         model="gpt-5.5",
         provider="blf",
     )
+
+
+def test_get_llm_config_allows_jenkins_model_override_for_blf(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("BLF_ACTIVE_LLM", "blf")
+    monkeypatch.setenv("BLF_LLM_API_KEY", "sk-new")
+    monkeypatch.setenv("BLF_LLM_MODEL", "gpt-5.5")
+    monkeypatch.setenv("LLM_MODEL", "claude-sonnet-4-5-20250929")
+
+    cfg = get_llm_config()
+
+    assert cfg.provider == "blf"
+    assert cfg.model == "claude-sonnet-4-5-20250929"
+
+
+def test_get_llm_config_allows_jenkins_provider_and_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("BLF_ACTIVE_LLM", "blf")
+    monkeypatch.setenv("BLF_LLM_API_KEY", "sk-new")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-old")
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-flash")
+
+    cfg = get_llm_config()
+
+    assert cfg.provider == "deepseek"
+    assert cfg.model == "deepseek-v4-flash"
 
 
 def test_get_llm_config_defaults_to_deepseek_even_when_blf_variables_exist(

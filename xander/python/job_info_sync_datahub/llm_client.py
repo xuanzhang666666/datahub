@@ -93,7 +93,8 @@ def llm_user_message_max_chars(
 
 def get_llm_config() -> LlmConfig:
     """Resolve LLM config using BLF_ACTIVE_LLM, defaulting to deepseek."""
-    active = os.environ.get("BLF_ACTIVE_LLM", DEFAULT_ACTIVE_LLM).strip().lower()
+    active = os.environ.get("LLM_PROVIDER", os.environ.get("BLF_ACTIVE_LLM", DEFAULT_ACTIVE_LLM)).strip().lower()
+    model_override = os.environ.get("LLM_MODEL", "").strip()
     if active in ("blf", "token-pool", "token_pool"):
         blf_base = os.environ.get("BLF_LLM_BASE_URL", "").strip()
         blf_key = os.environ.get("BLF_LLM_API_KEY", "").strip()
@@ -103,7 +104,7 @@ def get_llm_config() -> LlmConfig:
         return LlmConfig(
             base_v1=normalize_openai_v1_base(blf_base or DEFAULT_BLF_LLM_BASE_URL),
             api_key=blf_key,
-            model=blf_model or "gpt-5.5",
+            model=model_override or blf_model or "gpt-5.5",
             provider="blf",
         )
     if active != "deepseek":
@@ -122,7 +123,7 @@ def get_llm_config() -> LlmConfig:
     return LlmConfig(
         base_v1=normalize_openai_v1_base(deepseek_base),
         api_key=deepseek_key,
-        model=deepseek_model,
+        model=model_override or deepseek_model,
         provider="deepseek",
     )
 

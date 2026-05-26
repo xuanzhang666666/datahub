@@ -59,7 +59,12 @@ Markdown 必须严格包含以下章节：
 说明 Execute Shell 中实际启动命令、入口函数/脚本、关键参数。
 
 ### 4. 数据来源
-列出主要上游表及用途。
+必须使用下面的 Markdown 表格形式列出主要上游表及用途，表头固定为：
+| 上游表 | 用途 |
+| --- | --- |
+上游表必须写实际表名，不能省略表名后缀，不能把 `pdw_opc_flag_city_info` 写成 `pdw_opc_flag_city`。
+SQL 中出现过的所有来源表都必须列出，包括 CTE 内引用过但最终 insert overwrite 未真实使用的来源表。
+如果某个来源表只在未参与最终写入的 CTE / 临时逻辑中出现，也要保留在表格中，并在「用途」列标记“脚本中定义但最终写入未使用”。
 
 ### 5. 使用到的上游表字段
 必须输出 Markdown 表格，表头固定为：
@@ -285,6 +290,37 @@ def prune_etl_for_prompt(etl_script: str, execute_shell: str, table_name: str) -
     return _prune_shell_job_to_entrypoint(etl_script, f"{table_name}.job")
 
 
+def expand_prompt_variables(script: str) -> str:
+    """Expand simple shell constants before asking the LLM to document table names."""
+    assignments: Dict[str, str] = {}
+    assignment_re = re.compile(
+        r"""^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"\n]*)"|'([^'\n]*)'|([A-Za-z0-9_./-]+))\s*$"""
+    )
+
+    def replace_vars(value: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            name = match.group(1) or match.group(2)
+            return assignments.get(name, match.group(0))
+
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", repl, value)
+
+    def normalize_assignment_value(value: str) -> str:
+        expanded = replace_vars(value)
+        if re.match(r"^[A-Za-z][A-Za-z0-9_]*_dev$", expanded):
+            return expanded.removesuffix("_dev")
+        return expanded
+
+    for raw_line in script.splitlines():
+        match = assignment_re.match(raw_line.strip())
+        if not match:
+            continue
+        name = match.group(1)
+        value = next(group for group in match.groups()[1:] if group is not None)
+        assignments[name] = normalize_assignment_value(value)
+
+    return replace_vars(script) if assignments else script
+
+
 def build_llm_user_message(
     *,
     table_name: str,
@@ -298,7 +334,7 @@ def build_llm_user_message(
         system_prompt_chars=len(SYSTEM_PROMPT),
         explicit_max_chars=max_chars,
     )
-    pruned_etl = prune_etl_for_prompt(etl_script, execute_shell, table_name)
+    pruned_etl = expand_prompt_variables(prune_etl_for_prompt(etl_script, execute_shell, table_name))
     body = f"""目标表：{table_name}
 Dataset URN：{dataset_urn}
 
@@ -319,6 +355,12 @@ Dataset URN：{dataset_urn}
 
 请基于以上内容生成 Markdown。必须包含：
 - ### 2. 表结构 DDL
+- ### 4. 数据来源
+- 数据来源必须使用 Markdown 表格，表头固定为：| 上游表 | 用途 |
+- 数据来源表格第二行固定为：| --- | --- |
+- 数据来源里的上游表名必须保持 Etl Script 中出现的完整表名，不能省略后缀或改写表名。
+- SQL 中出现过的所有来源表都必须列出，不能因为最终 insert overwrite 未引用对应 CTE 就隐去。
+- 对只在未参与最终写入的 CTE / 临时逻辑中出现的来源表，在用途列标记“脚本中定义但最终写入未使用”。
 - ### 5. 使用到的上游表字段
 - Markdown 表格表头：| 上游表 | 字段 | 在本表加工中的用途 | 相关逻辑/表达式 |
 - 无法确认字段时填“未明确”，不能编造字段。
