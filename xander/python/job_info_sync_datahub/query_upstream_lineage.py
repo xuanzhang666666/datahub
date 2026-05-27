@@ -26,6 +26,7 @@ Jenkins 部署::
   DATAHUB_GMS_TOKEN       GMS token（无鉴权时可不填）
   BLF_DATAHUB_PLATFORM_INSTANCE  默认 blf-prod-hive
   DATAHUB_ENV             默认 PROD
+  UPSTREAM_LINEAGE_XLSX   上游明细 Excel 输出路径
 
 退出码::
 
@@ -44,6 +45,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .field_lineage_datahub_reader import (
@@ -51,7 +53,12 @@ from .field_lineage_datahub_reader import (
     fetch_structured_properties,
     make_hive_dataset_urn,
 )
-from .structured_properties import URN_DATA_AVAILABILITY_FLAG
+from .structured_properties import (
+    URN_DATA_AVAILABILITY_FLAG,
+    URN_ETL_SCRIPT,
+    URN_EXECUTE_SHELL,
+    URN_SCHEDULE_URL,
+)
 
 _DEFAULT_PLATFORM_INSTANCE = "blf-prod-hive"
 _DEFAULT_ENV = "PROD"
@@ -117,6 +124,21 @@ def fetch_all_upstream_urns(
     platform_instance: str = _DEFAULT_PLATFORM_INSTANCE,
 ) -> Set[str]:
     """BFS 递归查询所有上游表 URN（不含起始表本身）。"""
+    return fetch_all_upstream_urns_with_counts(
+        gms_url=gms_url,
+        token=token,
+        start_urn=start_urn,
+        platform_instance=platform_instance,
+    )[0]
+
+
+def fetch_all_upstream_urns_with_counts(
+    gms_url: str,
+    token: Optional[str],
+    start_urn: str,
+    platform_instance: str = _DEFAULT_PLATFORM_INSTANCE,
+) -> Tuple[Set[str], Dict[str, int]]:
+    """BFS 递归查询所有上游表 URN，并返回每个已访问 dataset 的直接上游数。"""
     try:
         from datahub.ingestion.graph.client import DataHubGraph, DatahubClientConfig
         from datahub.metadata.schema_classes import UpstreamLineageClass
@@ -126,6 +148,7 @@ def fetch_all_upstream_urns(
     graph = DataHubGraph(DatahubClientConfig(server=gms_url.rstrip("/"), token=token))
 
     all_upstream_urns: Set[str] = set()
+    upstream_counts: Dict[str, int] = {}
     visited: Set[str] = set()
     queue: deque[str] = deque([start_urn])
 
@@ -142,8 +165,10 @@ def fetch_all_upstream_urns(
             continue
 
         if not lineage or not lineage.upstreams:
+            upstream_counts[urn] = 0
             continue
 
+        direct_upstreams: Set[str] = set()
         for upstream in lineage.upstreams:
             upstream_urn = getattr(upstream, "dataset", None)
             if not isinstance(upstream_urn, str):
@@ -151,12 +176,14 @@ def fetch_all_upstream_urns(
             # 只收录同平台实例的 Hive 表
             if platform_instance not in upstream_urn:
                 continue
+            direct_upstreams.add(upstream_urn)
             if upstream_urn != start_urn:
                 all_upstream_urns.add(upstream_urn)
             if upstream_urn not in visited:
                 queue.append(upstream_urn)
+        upstream_counts[urn] = len(direct_upstreams)
 
-    return all_upstream_urns
+    return all_upstream_urns, upstream_counts
 
 
 # ---------------------------------------------------------------------------
@@ -205,11 +232,36 @@ def _first_string_value(assignment: Dict[str, Any]) -> str:
     return ""
 
 
+def _all_string_values(assignment: Dict[str, Any]) -> List[str]:
+    values = assignment.get("values")
+    if not isinstance(values, list):
+        return []
+    results: List[str] = []
+    for value in values:
+        text = ""
+        if isinstance(value, dict) and isinstance(value.get("string"), str):
+            text = value["string"]
+        elif isinstance(value, str):
+            text = value
+        text = text.strip()
+        if text:
+            results.append(text)
+    return results
+
+
+def extract_structured_property_value(payload: Dict[str, Any], property_urn: str) -> str:
+    """Read one structured property value from a structuredProperties payload."""
+    for assignment in _iter_property_assignments(payload):
+        if assignment.get("propertyUrn") == property_urn:
+            return _first_string_value(assignment).strip()
+    return ""
+
+
 def extract_data_availability_flag(payload: Dict[str, Any]) -> str:
-    """Read blf.data.warehouse.data_availability_flag from structuredProperties."""
+    """Read all blf.data.warehouse.data_availability_flag values."""
     for assignment in _iter_property_assignments(payload):
         if assignment.get("propertyUrn") == URN_DATA_AVAILABILITY_FLAG:
-            return _first_string_value(assignment).strip()
+            return ", ".join(_all_string_values(assignment))
     return ""
 
 
@@ -217,16 +269,18 @@ def read_upstream_structured_status(
     gms_url: str,
     token: Optional[str],
     dataset_urn: str,
-) -> Tuple[bool, bool, str]:
-    """Return (has_etl_script, has_execute_shell, data_availability_flag)."""
+) -> Tuple[bool, bool, bool, str]:
+    """Return (has_etl_script, has_schedule_url, has_execute_shell, data_availability_flag)."""
     try:
         payload = fetch_structured_properties(gms_url, dataset_urn, token=token)
     except Exception:
-        return False, False, ""
+        return False, False, False, ""
 
     etl_script, execute_shell = extract_property_texts(payload)
+    schedule_url = extract_structured_property_value(payload, URN_SCHEDULE_URL)
     return (
         bool(etl_script.strip()),
+        bool(schedule_url.strip()),
         bool(execute_shell.strip()),
         extract_data_availability_flag(payload),
     )
@@ -281,6 +335,88 @@ def is_view_dataset(gms_url: str, token: Optional[str], dataset_urn: str) -> boo
     return isinstance(current, dict) and bool(current.get("viewLogic"))
 
 
+def _has_schema_metadata(gms_url: str, token: Optional[str], dataset_urn: str) -> bool:
+    try:
+        payload = _fetch_dataset_aspect(gms_url, dataset_urn, "schemaMetadata", token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} schemaMetadata 失败 HTTP {exc.code}",
+            file=sys.stderr,
+        )
+        return False
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} schemaMetadata 失败: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    return bool(payload)
+
+
+def read_dataset_type(gms_url: str, token: Optional[str], dataset_urn: str) -> str:
+    """Return view/table/dataset for report display."""
+    if is_view_dataset(gms_url, token, dataset_urn):
+        return "view"
+    if _has_schema_metadata(gms_url, token, dataset_urn):
+        return "table"
+    return "dataset"
+
+
+def split_table_name(full_table_name: str) -> Tuple[str, str]:
+    if "." not in full_table_name:
+        return "default", full_table_name
+    db_name, table_name = full_table_name.split(".", 1)
+    return db_name, table_name
+
+
+def _yes_or_dash(value: bool) -> str:
+    return "是" if value else "-"
+
+
+def write_upstream_detail_xlsx(path: str, rows: List[Dict[str, Any]]) -> None:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise RuntimeError("请先安装 openpyxl") from exc
+
+    headers = [
+        "库名",
+        "表名",
+        "完整表表",
+        "表类型",
+        "etl_script",
+        "schedule_url",
+        "execute_shell",
+        "data_availability_flag",
+        "上游表数量",
+    ]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "upstream_lineage"
+    ws.append(headers)
+    for row in rows:
+        ws.append([row.get(header, "") for header in headers])
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+    for col_idx, _ in enumerate(headers, start=1):
+        col_letter = get_column_letter(col_idx)
+        max_len = 10
+        for cell in ws[col_letter]:
+            if cell.value is not None:
+                max_len = min(max(max_len, len(str(cell.value))), 80)
+        ws.column_dimensions[col_letter].width = max_len + 2
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out)
+
+
 # ---------------------------------------------------------------------------
 # 主逻辑
 # ---------------------------------------------------------------------------
@@ -312,6 +448,7 @@ def run(
     platform_instance: str = _DEFAULT_PLATFORM_INSTANCE,
     env: str = _DEFAULT_ENV,
     skip_check_props: bool = False,
+    output_xlsx: Optional[str] = None,
 ) -> int:
     """执行查询并输出结果，返回退出码。"""
     if not table_names:
@@ -326,6 +463,7 @@ def run(
 
     # ── 1. 对每个目标表递归查询上游，合并结果 ─────────────────────────────
     all_upstream_urns: Set[str] = set()
+    upstream_dependency_counts: Dict[str, int] = {}
     # 把所有目标表的 URN 也收集进来，BFS 时排除
     target_urns: Set[str] = set()
     for t in table_names:
@@ -335,7 +473,17 @@ def run(
         start_urn = make_hive_dataset_urn(t, platform_instance, env)
         print(f"[INFO] 查询 {t} 的上游...")
         try:
-            urns = fetch_all_upstream_urns(gms_url, token, start_urn, platform_instance)
+            try:
+                urns, dependency_counts = fetch_all_upstream_urns_with_counts(
+                    gms_url,
+                    token,
+                    start_urn,
+                    platform_instance,
+                )
+            except TypeError:
+                # Compatibility for tests or callers that monkeypatch the old helper.
+                urns = fetch_all_upstream_urns(gms_url, token, start_urn, platform_instance)
+                dependency_counts = {}
         except RuntimeError as exc:
             print(f"[ERROR] {exc}", file=sys.stderr)
             return 1
@@ -346,11 +494,15 @@ def run(
         urns -= target_urns
         print(f"[INFO]   {t} → 找到 {len(urns)} 个上游 URN")
         all_upstream_urns |= urns
+        upstream_dependency_counts.update(dependency_counts)
 
     print()
 
     if not all_upstream_urns:
         print("[INFO] 未找到任何上游表（DataHub 中无表级血缘记录）")
+        if output_xlsx:
+            write_upstream_detail_xlsx(output_xlsx, [])
+            print(f"[INFO] 上游明细 Excel 已生成: {output_xlsx}")
         return 0
 
     # ── 2. 去重、排序、输出 ────────────────────────────────────────────────
@@ -359,12 +511,34 @@ def run(
     )
 
     print(f"[INFO] 合并去重后共 {len(upstream_tables)} 个上游表")
-    upstream_status: Dict[str, Tuple[bool, bool, str]] = {}
+    upstream_status: Dict[str, Tuple[bool, bool, bool, str]] = {}
+    upstream_types: Dict[str, str] = {}
+    upstream_report_rows: List[Dict[str, Any]] = []
     for table_name in upstream_tables:
         urn = make_hive_dataset_urn(table_name, platform_instance, env)
         upstream_status[table_name] = read_upstream_structured_status(gms_url, token, urn)
-        data_availability_flag = upstream_status[table_name][2] or "-"
+        upstream_types[table_name] = read_dataset_type(gms_url, token, urn)
+        has_etl, has_schedule_url, has_shell, raw_data_availability_flag = upstream_status[table_name]
+        data_availability_flag = raw_data_availability_flag or "-"
+        db_name, short_table_name = split_table_name(table_name)
+        upstream_report_rows.append(
+            {
+                "库名": db_name,
+                "表名": short_table_name,
+                "完整表表": table_name,
+                "表类型": upstream_types[table_name],
+                "etl_script": _yes_or_dash(has_etl),
+                "schedule_url": _yes_or_dash(has_schedule_url),
+                "execute_shell": _yes_or_dash(has_shell),
+                "data_availability_flag": data_availability_flag,
+                "上游表数量": upstream_dependency_counts.get(urn, 0),
+            }
+        )
         print(f"  {table_name}\tdata_availability_flag={data_availability_flag}")
+
+    if output_xlsx:
+        write_upstream_detail_xlsx(output_xlsx, upstream_report_rows)
+        print(f"[INFO] 上游明细 Excel 已生成: {output_xlsx}")
 
     if skip_check_props:
         return 0
@@ -377,14 +551,14 @@ def run(
     skipped_view_tables: List[str] = []
     for t in upstream_tables:
         urn = make_hive_dataset_urn(t, platform_instance, env)
-        has_etl, has_shell, _ = upstream_status.get(t) or read_upstream_structured_status(gms_url, token, urn)
+        has_etl, _, has_shell, _ = upstream_status.get(t) or read_upstream_structured_status(gms_url, token, urn)
         missing: List[str] = []
         if not has_etl:
             missing.append(_LABEL_ETL_SCRIPT)
         if not has_shell:
             missing.append(_LABEL_EXECUTE_SHELL)
         if missing:
-            if is_view_dataset(gms_url, token, urn):
+            if upstream_types.get(t) == "view":
                 skipped_view_tables.append(t)
                 continue
             missing_props[t] = missing
@@ -465,6 +639,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="跳过结构化属性（Etl Script / Execute Shell）检查",
     )
+    p.add_argument(
+        "--output-xlsx",
+        default=os.getenv("UPSTREAM_LINEAGE_XLSX"),
+        help="去重后的上游任务明细 Excel 输出路径（默认读取 UPSTREAM_LINEAGE_XLSX）",
+    )
     return p.parse_args()
 
 
@@ -496,6 +675,7 @@ def main() -> int:
         platform_instance=args.platform_instance,
         env=args.env,
         skip_check_props=args.no_check_props,
+        output_xlsx=args.output_xlsx,
     )
 
 

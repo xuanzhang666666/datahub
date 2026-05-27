@@ -16,6 +16,7 @@
 # DATAHUB_GMS_TOKEN   GMS token（无鉴权时可不填）
 # LINEAGE_PYTHON      Python 解释器，默认 /opt/anaconda3/bin/python
 # NO_CHECK_PROPS      设为 1 时跳过结构化属性检查
+# UPSTREAM_LINEAGE_XLSX  上游明细 Excel 输出路径，默认在 Jenkins WORKSPACE 下生成
 #
 # ── 退出码 ────────────────────────────────────────────────────────────────────
 # 0  正常；如有上游表缺少结构化属性，会按缺少项分组打印
@@ -81,6 +82,9 @@ if [[ ${#TABLE_NAME_ARGS[@]} -eq 0 ]]; then
 fi
 
 GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
+REPORT_WORKSPACE="${WORKSPACE:-$PWD}"
+UPSTREAM_LINEAGE_XLSX="${UPSTREAM_LINEAGE_XLSX:-$REPORT_WORKSPACE/upstream_lineage_details_$(date +%Y%m%d_%H%M%S).xlsx}"
+mkdir -p "$(dirname "$UPSTREAM_LINEAGE_XLSX")"
 
 # ── 构造额外参数 ──────────────────────────────────────────────────────────────
 EXTRA_ARGS=()
@@ -95,6 +99,7 @@ echo "[INFO] query upstream lineage started at $(date -Iseconds)"
 echo "[INFO] table count: $(( ${#TABLE_NAME_ARGS[@]} / 2 ))"
 echo "[INFO] gms url: $GMS_URL"
 echo "[INFO] python: $PYTHON"
+echo "[INFO] upstream detail xlsx: $UPSTREAM_LINEAGE_XLSX"
 echo "[INFO] ----------------------------------------"
 
 set +e
@@ -104,6 +109,7 @@ set +e
         "$PYTHON" -m job_info_sync_datahub.query_upstream_lineage \
         "${TABLE_NAME_ARGS[@]}" \
         --gms-url "$GMS_URL" \
+        --output-xlsx "$UPSTREAM_LINEAGE_XLSX" \
         ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 )
 EXIT_CODE=$?
