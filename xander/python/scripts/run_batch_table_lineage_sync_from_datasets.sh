@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# run_batch_table_lineage_sync_from_datasets.sh — 按 DataHub 表结构化属性重跑表级血缘
+# run_batch_table_lineage_sync_from_datasets.sh — 按 DataHub 表属性重跑表级血缘
+#
+# 优先：若表已有 LLM 生成的 Documentation，从 description 中「4. 数据来源」解析上游表
+#       （与 run_check_datahub_dataset_availability.sh 相同解析逻辑）。
+# 否则：读取 Etl Script / Execute Shell，调用 LLM 解析目标表与上游表。
 #
 # Jenkins 参数：
 #   TABLE_NAMES             Multi-line：每行一个 db.table

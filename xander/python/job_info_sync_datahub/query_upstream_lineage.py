@@ -62,6 +62,15 @@ from .structured_properties import (
 
 _DEFAULT_PLATFORM_INSTANCE = "blf-prod-hive"
 _DEFAULT_ENV = "PROD"
+_AUTO_DOC_START = "<!-- DATAHUB_AUTO_PROCESSING_DOC_START -->"
+_AUTO_DOC_END = "<!-- DATAHUB_AUTO_PROCESSING_DOC_END -->"
+_GENERATED_DOC_REQUIRED_SECTIONS = (
+    "## 表加工逻辑说明",
+    "### 1. 表用途概览",
+    "### 2. 表结构 DDL",
+    "### 4. 数据来源",
+    "### 5. 使用到的上游表字段",
+)
 
 # 属性显示名（和 DataHub UI 一致）
 _LABEL_ETL_SCRIPT = "Etl Script"
@@ -355,6 +364,14 @@ def _has_schema_metadata(gms_url: str, token: Optional[str], dataset_urn: str) -
     return bool(payload)
 
 
+def _unwrap_aspect(payload: Dict[str, Any], aspect_name: str) -> Dict[str, Any]:
+    current: Any = payload
+    for key in (aspect_name, "value"):
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+    return current if isinstance(current, dict) else {}
+
+
 def read_dataset_type(gms_url: str, token: Optional[str], dataset_urn: str) -> str:
     """Return view/table/dataset for report display."""
     if is_view_dataset(gms_url, token, dataset_urn):
@@ -364,11 +381,69 @@ def read_dataset_type(gms_url: str, token: Optional[str], dataset_urn: str) -> s
     return "dataset"
 
 
+def is_deprecated_dataset(gms_url: str, token: Optional[str], dataset_urn: str) -> bool:
+    try:
+        payload = _fetch_dataset_aspect(gms_url, dataset_urn, "deprecation", token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} deprecation 失败 HTTP {exc.code}",
+            file=sys.stderr,
+        )
+        return False
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} deprecation 失败: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    return _unwrap_aspect(payload, "deprecation").get("deprecated") is True
+
+
+def is_llm_generated_description(description: str) -> bool:
+    """判断 editableDatasetProperties.description 是否为批量 Documentation 生成产物。"""
+    text = (description or "").strip()
+    if not text:
+        return False
+    if _AUTO_DOC_START in text and _AUTO_DOC_END in text:
+        return True
+    return all(section in text for section in _GENERATED_DOC_REQUIRED_SECTIONS)
+
+
+def is_llm_generated_documentation(gms_url: str, token: Optional[str], dataset_urn: str) -> bool:
+    try:
+        payload = _fetch_dataset_aspect(gms_url, dataset_urn, "editableDatasetProperties", token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} editableDatasetProperties 失败 HTTP {exc.code}",
+            file=sys.stderr,
+        )
+        return False
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} editableDatasetProperties 失败: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+    description = _unwrap_aspect(payload, "editableDatasetProperties").get("description")
+    if not isinstance(description, str):
+        return False
+    return is_llm_generated_description(description)
+
+
 def split_table_name(full_table_name: str) -> Tuple[str, str]:
     if "." not in full_table_name:
         return "default", full_table_name
     db_name, table_name = full_table_name.split(".", 1)
     return db_name, table_name
+
+
+def table_name_prefix(table_name: str) -> str:
+    return table_name.split("_", 1)[0] if table_name else ""
 
 
 def _yes_or_dash(value: bool) -> str:
@@ -386,8 +461,11 @@ def write_upstream_detail_xlsx(path: str, rows: List[Dict[str, Any]]) -> None:
     headers = [
         "库名",
         "表名",
+        "表名前辍",
         "完整表表",
         "表类型",
+        "标记废弃",
+        "Documentation生成",
         "etl_script",
         "schedule_url",
         "execute_shell",
@@ -513,11 +591,15 @@ def run(
     print(f"[INFO] 合并去重后共 {len(upstream_tables)} 个上游表")
     upstream_status: Dict[str, Tuple[bool, bool, bool, str]] = {}
     upstream_types: Dict[str, str] = {}
+    upstream_deprecated: Dict[str, bool] = {}
+    upstream_documentation_generated: Dict[str, bool] = {}
     upstream_report_rows: List[Dict[str, Any]] = []
     for table_name in upstream_tables:
         urn = make_hive_dataset_urn(table_name, platform_instance, env)
         upstream_status[table_name] = read_upstream_structured_status(gms_url, token, urn)
         upstream_types[table_name] = read_dataset_type(gms_url, token, urn)
+        upstream_deprecated[table_name] = is_deprecated_dataset(gms_url, token, urn)
+        upstream_documentation_generated[table_name] = is_llm_generated_documentation(gms_url, token, urn)
         has_etl, has_schedule_url, has_shell, raw_data_availability_flag = upstream_status[table_name]
         data_availability_flag = raw_data_availability_flag or "-"
         db_name, short_table_name = split_table_name(table_name)
@@ -525,8 +607,11 @@ def run(
             {
                 "库名": db_name,
                 "表名": short_table_name,
+                "表名前辍": table_name_prefix(short_table_name),
                 "完整表表": table_name,
                 "表类型": upstream_types[table_name],
+                "标记废弃": _yes_or_dash(upstream_deprecated[table_name]),
+                "Documentation生成": _yes_or_dash(upstream_documentation_generated[table_name]),
                 "etl_script": _yes_or_dash(has_etl),
                 "schedule_url": _yes_or_dash(has_schedule_url),
                 "execute_shell": _yes_or_dash(has_shell),

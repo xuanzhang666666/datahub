@@ -15,7 +15,9 @@ from job_info_sync_datahub.table_documentation_from_dataset_props import (
     decode_trino_ddl_unicode_comments,
     expand_generated_markdown_variables,
     expand_prompt_variables,
+    documentation_default_database,
     merge_documentation,
+    qualify_unqualified_markdown_table_names,
     prune_python_script_to_entrypoint,
     strip_commented_logic_for_prompt,
     sync_one_table_documentation,
@@ -123,6 +125,9 @@ def test_build_llm_user_message_contains_ddl_and_upstream_field_table_contract()
     assert "脚本中定义但最终写入未使用" in msg
     assert "not_verified_" in msg
     assert "不要放入 4. 数据来源" in msg
+    assert "如果脚本里有明确库名，按脚本里的库名" in msg
+    assert "如果脚本里有 `use xxx`" in msg
+    assert "如果表名没带库名且脚本里没有 `use xxx`，按 `default.表名` 补全" in msg
     assert "### 5. 使用到的上游表字段" in msg
     assert "| 上游表 | 字段 | 在本表加工中的用途 | 相关逻辑/表达式 |" in msg
     assert "无法确认字段时填“未明确”" in msg
@@ -182,6 +187,37 @@ BEST_TABLE="${DATABASE}.dw_ordering_report_store_status_monitor_best_status_di"
     assert "`data_smartorder.dw_ordering_report_store_status_monitor_best_status_di`" in expanded
     assert "${DATABASE}" not in expanded
     assert "${BEST_TABLE}" not in expanded
+
+
+def test_documentation_default_database_uses_use_statement() -> None:
+    script = """
+use data_smartorder;
+select * from dim_sku_info;
+"""
+
+    assert documentation_default_database(script) == "data_smartorder"
+
+
+def test_documentation_default_database_falls_back_to_default_without_use() -> None:
+    script = "select * from dim_sku_info"
+
+    assert documentation_default_database(script) == "default"
+
+
+def test_qualify_unqualified_markdown_table_names_uses_default_database() -> None:
+    markdown = """
+| 上游表 | 用途 |
+| --- | --- |
+| `dim_sku_info` | SKU |
+| data_smartorder.dim_store_info | 门店 |
+| `not_verified_dim_sku_info` | 校验 |
+"""
+
+    expanded = qualify_unqualified_markdown_table_names(markdown, "default")
+
+    assert "`default.dim_sku_info`" in expanded
+    assert "data_smartorder.dim_store_info" in expanded
+    assert "`default.not_verified_dim_sku_info`" in expanded
 
 
 def test_strip_commented_logic_for_prompt_removes_commented_sql_sources() -> None:

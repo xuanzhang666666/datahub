@@ -313,6 +313,116 @@ def apply_lineage_filters_from_parsed(
     return table_lineages, decision
 
 
+def _fqtn_to_llm_row(fqtn: str) -> Dict[str, str]:
+    db_name, table_name = fqtn.split(".", 1)
+    return {"db": db_name, "table": table_name}
+
+
+def evaluate_documentation_lineage(
+    input_table: str,
+    description: str,
+    *,
+    existing_upstream_names: Optional[Set[str]] = None,
+) -> Tuple[List[TableLineage], LineageWriteDecision, Dict[str, Any]]:
+    """从 Documentation Markdown「4. 数据来源」解析表级血缘（与 check_dataset_availability 同解析器）。"""
+    from .check_dataset_availability import (
+        _exclude_target_table,
+        _normalize_table_token,
+        parse_documented_upstreams,
+        resolve_documented_upstreams,
+    )
+    from .query_upstream_lineage import normalize_table_name
+
+    section_found, documented_raw = parse_documented_upstreams(description)
+    if not section_found:
+        decision = LineageWriteDecision(
+            write_upstream_lineage=False,
+            status="SKIP_NO_DOC_SECTION",
+            reason='Documentation 缺少「4. 数据来源」小节',
+            trust_score=0,
+        )
+        return [], decision, {"source": "documentation", "lineage": []}
+
+    if not documented_raw:
+        decision = LineageWriteDecision(
+            write_upstream_lineage=False,
+            status="SKIP_DOC_PARSE_EMPTY",
+            reason="「4. 数据来源」存在但未解析到上游表名",
+            trust_score=0,
+        )
+        return [], decision, {"source": "documentation", "lineage": []}
+
+    normalized_target = normalize_table_name(input_table)
+
+    target_table = normalized_target.rsplit(".", 1)[-1]
+    documented_raw = _exclude_target_table(documented_raw, normalized_target, target_table)
+    if not documented_raw:
+        decision = LineageWriteDecision(
+            write_upstream_lineage=False,
+            status="SKIP_DOC_PARSE_EMPTY",
+            reason="「4. 数据来源」仅包含目标表自身，无有效上游",
+            trust_score=0,
+        )
+        return [], decision, {"source": "documentation", "lineage": []}
+
+    documented, errors = resolve_documented_upstreams(
+        documented_raw,
+        existing_upstream_names or set(),
+    )
+    if errors:
+        decision = LineageWriteDecision(
+            write_upstream_lineage=False,
+            status="SKIP_DOC_AMBIGUOUS",
+            reason="；".join(errors),
+            trust_score=0,
+        )
+        return [], decision, {"source": "documentation", "lineage": [], "parse_errors": errors}
+
+    raw: Dict[str, Any] = {
+        "source": "documentation",
+        "notes": "upstream tables from Documentation section 4. 数据来源",
+        "lineage": [
+            {
+                "target": _fqtn_to_llm_row(normalized_target),
+                "upstreams": [_fqtn_to_llm_row(name) for name in sorted(documented)],
+            }
+        ],
+    }
+    parsed = _parse_lineage_array(raw)
+    table_lineages, decision = apply_lineage_filters_from_parsed(parsed, raw)
+    if decision.write_upstream_lineage:
+        upstream_count = len({u.full_name for tl in table_lineages for u in tl.upstreams})
+        decision = LineageWriteDecision(
+            write_upstream_lineage=True,
+            status="DOC_EXTRACTED",
+            reason=(
+                f"从 Documentation「4. 数据来源」解析到 {upstream_count} 个上游表"
+                "（已校验库白名单、表前缀、下划线及 Hive 存在性）"
+            ),
+            trust_score=decision.trust_score,
+            selected_targets=decision.selected_targets,
+            selected_upstreams=decision.selected_upstreams,
+            deepseek_targets={normalized_target},
+            deepseek_upstreams=set(documented),
+            fqtn_validation=decision.fqtn_validation,
+            hive_existence=decision.hive_existence,
+        )
+    elif decision.status.startswith("SKIP"):
+        decision = LineageWriteDecision(
+            write_upstream_lineage=False,
+            status=decision.status,
+            reason=f"Documentation 上游未通过校验: {decision.reason}",
+            trust_score=decision.trust_score,
+            selected_targets=decision.selected_targets,
+            selected_upstreams=decision.selected_upstreams,
+            deepseek_targets={normalized_target},
+            deepseek_upstreams=set(documented),
+            fqtn_validation=decision.fqtn_validation,
+            hive_existence=decision.hive_existence,
+        )
+    return table_lineages, decision, raw
+
+
 def evaluate_llm_only(
     etl_script: str,
     timeout_sec: int = 90,

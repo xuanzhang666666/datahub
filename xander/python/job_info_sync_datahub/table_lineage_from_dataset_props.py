@@ -26,15 +26,24 @@ from .field_lineage_datahub_reader import (
     fetch_structured_properties,
     make_hive_dataset_urn,
 )
+from .check_dataset_availability import (
+    editable_description_from_payload,
+    fetch_aspect_payload,
+)
 from .lineage_write_policy import (
     _parse_lineage_array,
     append_lineage_audit_jsonl,
+    evaluate_documentation_lineage,
     evaluate_llm_only,
     llm_row_to_fqtn,
 )
-from .models import TableLineage
+from .models import TableLineage, TableRef
 from .logging_utils import get_logger, setup_logging
-from .query_upstream_lineage import is_view_dataset, normalize_table_name
+from .query_upstream_lineage import (
+    is_llm_generated_description,
+    is_view_dataset,
+    normalize_table_name,
+)
 
 logger = get_logger("table_lineage_from_dataset_props")
 
@@ -78,6 +87,13 @@ def choose_structured_etl_source(
             job_file_name=f"{input_table}.structured_property.sh",
         )
     return None
+
+
+def _table_ref_from_input(input_table: str) -> TableRef:
+    if "." in input_table:
+        db_name, table_name = input_table.split(".", 1)
+        return TableRef(db_name, table_name)
+    return TableRef("default", input_table)
 
 
 def load_table_names(path: str) -> List[str]:
@@ -359,88 +375,144 @@ def sync_one_table(
             )
             return result
 
-        payload = _fetch_structured_properties_or_empty(gms_url, dataset_urn, token)
-        source = choose_structured_etl_source(
-            payload,
-            input_table=input_table,
-            dataset_urn=dataset_urn,
+        doc_payload = fetch_aspect_payload(
+            gms_url, dataset_urn, "editableDatasetProperties", token=token
         )
-        if source is None:
-            result.update(
-                status="SKIP",
-                lineage_status="SKIP_NO_STRUCTURED_ETL_SOURCE",
-                lineage_reason="目标表 structuredProperties 中 Etl Script / Execute Shell 均为空",
-                write_upstream_lineage=False,
-                error="structuredProperties 中无可解析 ETL 内容",
-            )
-            return result
+        description = editable_description_from_payload(doc_payload)
+        use_documentation = is_llm_generated_description(description)
+        source_property: str
 
-        result["etl_file_path"] = f"datahub_structured_property:{input_table}:{source.source_property}"
-        result["etl_file_source"] = f"datahub_structured_{source.source_property.lower().replace(' ', '_')}"
-        result["source_property"] = source.source_property
-        logger.info(
-            "从 DataHub 表结构化属性读取 ETL 内容: table=%s property=%s urn=%s",
-            input_table,
-            source.source_property,
-            dataset_urn,
-        )
-        result["etl_file_export_path"] = export_etl_script_snapshot(
-            batch_output_dir=batch_output_dir,
-            job_display_name=input_table,
-            job_file_name=source.job_file_name,
-            etl_content=source.content,
-        )
-        logger.info(
-            "最终采用 DataHub 表结构化属性 ETL 内容: table=%s property=%s snapshot=%s",
-            input_table,
-            source.source_property,
-            result["etl_file_export_path"] or "-",
-        )
-
-        try:
-            table_lineages, decision, llm_raw = evaluate_llm_only(
-                source.content,
-                timeout_sec=llm_timeout_sec,
-                job_file_name=source.job_file_name,
+        if use_documentation:
+            result["source_property"] = "Documentation"
+            result["etl_file_path"] = f"datahub_documentation:{input_table}"
+            result["etl_file_source"] = "datahub_documentation"
+            logger.info(
+                "目标表已有 LLM Documentation，从「4. 数据来源」解析血缘: table=%s urn=%s",
+                input_table,
+                dataset_urn,
             )
-            result["llm_raw_export_path"] = export_llm_raw_snapshot(
+            result["etl_file_export_path"] = export_etl_script_snapshot(
                 batch_output_dir=batch_output_dir,
                 job_display_name=input_table,
-                llm_raw=llm_raw,
+                job_file_name=f"{input_table}.documentation.md",
+                etl_content=description,
             )
-            result["lineage_status"] = decision.status
-            result["lineage_reason"] = decision.reason
-            result["write_upstream_lineage"] = decision.write_upstream_lineage
-            result["trust_score"] = decision.trust_score
-            attach_lineage_diagnosis(
-                result,
-                input_table=input_table,
-                table_lineages=table_lineages,
-                decision=decision,
-                llm_raw=llm_raw,
+            existing_upstream_names = fetch_existing_upstream_names(
+                gms_url,
+                token,
+                _table_ref_from_input(input_table),
+                platform_instance,
+                env,
             )
-            print_lineage_diagnosis(result)
-            if audit_jsonl:
-                append_lineage_audit_jsonl(
-                    Path(audit_jsonl),
+            source_property = "Documentation"
+            try:
+                table_lineages, decision, llm_raw = evaluate_documentation_lineage(
                     input_table,
-                    decision,
-                    extra={
-                        "input_table": input_table,
-                        "dataset_urn": dataset_urn,
-                        "source_property": source.source_property,
-                    },
+                    description,
+                    existing_upstream_names=existing_upstream_names,
                 )
-        except Exception as exc:
-            result.update(
-                status="FAIL",
-                fail_category=FAIL_LLM,
-                error=str(exc)[:500],
-                lineage_status="LLM_ERROR",
-                lineage_reason=str(exc)[:500],
-                write_upstream_lineage=False,
+            except Exception as exc:
+                result.update(
+                    status="FAIL",
+                    fail_category=FAIL_DATAHUB_READ,
+                    error=str(exc)[:500],
+                    lineage_status="DOC_PARSE_ERROR",
+                    lineage_reason=str(exc)[:500],
+                    write_upstream_lineage=False,
+                )
+                return result
+        else:
+            payload = _fetch_structured_properties_or_empty(gms_url, dataset_urn, token)
+            source = choose_structured_etl_source(
+                payload,
+                input_table=input_table,
+                dataset_urn=dataset_urn,
             )
-            return result
+            if source is None:
+                result.update(
+                    status="SKIP",
+                    lineage_status="SKIP_NO_STRUCTURED_ETL_SOURCE",
+                    lineage_reason=(
+                        "无 LLM Documentation，且 structuredProperties 中 "
+                        "Etl Script / Execute Shell 均为空"
+                    ),
+                    write_upstream_lineage=False,
+                    error="无可用于血缘解析的 Documentation 或 ETL 内容",
+                )
+                return result
+
+            result["etl_file_path"] = (
+                f"datahub_structured_property:{input_table}:{source.source_property}"
+            )
+            result["etl_file_source"] = (
+                f"datahub_structured_{source.source_property.lower().replace(' ', '_')}"
+            )
+            source_property = source.source_property
+            result["source_property"] = source_property
+            logger.info(
+                "从 DataHub 表结构化属性读取 ETL 内容: table=%s property=%s urn=%s",
+                input_table,
+                source.source_property,
+                dataset_urn,
+            )
+            result["etl_file_export_path"] = export_etl_script_snapshot(
+                batch_output_dir=batch_output_dir,
+                job_display_name=input_table,
+                job_file_name=source.job_file_name,
+                etl_content=source.content,
+            )
+            logger.info(
+                "最终采用 DataHub 表结构化属性 ETL 内容: table=%s property=%s snapshot=%s",
+                input_table,
+                source.source_property,
+                result["etl_file_export_path"] or "-",
+            )
+
+            try:
+                table_lineages, decision, llm_raw = evaluate_llm_only(
+                    source.content,
+                    timeout_sec=llm_timeout_sec,
+                    job_file_name=source.job_file_name,
+                )
+            except Exception as exc:
+                result.update(
+                    status="FAIL",
+                    fail_category=FAIL_LLM,
+                    error=str(exc)[:500],
+                    lineage_status="LLM_ERROR",
+                    lineage_reason=str(exc)[:500],
+                    write_upstream_lineage=False,
+                )
+                return result
+
+        result["llm_raw_export_path"] = export_llm_raw_snapshot(
+            batch_output_dir=batch_output_dir,
+            job_display_name=input_table,
+            llm_raw=llm_raw,
+        )
+        result["lineage_status"] = decision.status
+        result["lineage_reason"] = decision.reason
+        result["write_upstream_lineage"] = decision.write_upstream_lineage
+        result["trust_score"] = decision.trust_score
+        attach_lineage_diagnosis(
+            result,
+            input_table=input_table,
+            table_lineages=table_lineages,
+            decision=decision,
+            llm_raw=llm_raw,
+        )
+        print_lineage_diagnosis(result)
+        if audit_jsonl:
+            append_lineage_audit_jsonl(
+                Path(audit_jsonl),
+                input_table,
+                decision,
+                extra={
+                    "input_table": input_table,
+                    "dataset_urn": dataset_urn,
+                    "source_property": source_property,
+                },
+            )
 
         if not table_lineages:
             result.update(
@@ -470,7 +542,7 @@ def sync_one_table(
                 result.update(
                     status="OK",
                     lineage_status="CHECK_MATCH",
-                    lineage_reason="现有 DataHub 表级血缘与 Etl Script / Execute Shell 解析结果一致",
+                    lineage_reason=f"现有 DataHub 表级血缘与 {source_property} 解析结果一致",
                 )
             else:
                 result.update(
@@ -478,7 +550,7 @@ def sync_one_table(
                     fail_category=FAIL_LINEAGE_MISMATCH,
                     lineage_status="CHECK_MISMATCH",
                     lineage_reason=(
-                        "现有 DataHub 表级血缘与 Etl Script / Execute Shell 解析结果不一致；"
+                        f"现有 DataHub 表级血缘与 {source_property} 解析结果不一致；"
                         f"missing={len(comparison['missing_upstreams'])} extra={len(comparison['extra_upstreams'])}"
                     ),
                     error="现有 DataHub 表级血缘与解析结果不一致",

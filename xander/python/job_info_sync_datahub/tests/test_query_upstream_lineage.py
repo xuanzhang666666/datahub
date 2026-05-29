@@ -183,6 +183,8 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "read_dataset_type",
         lambda _gms_url, _token, urn: "view" if urn == upstream_b else "table",
     )
+    monkeypatch.setattr(q, "is_deprecated_dataset", lambda _gms_url, _token, urn: urn == upstream_b)
+    monkeypatch.setattr(q, "is_llm_generated_documentation", lambda _gms_url, _token, urn: urn == upstream_a)
 
     def _fetch_structured_properties(*args, **kwargs):
         urn = args[1]
@@ -219,20 +221,26 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
     assert rows[0] == (
         "库名",
         "表名",
+        "表名前辍",
         "完整表表",
         "表类型",
+        "标记废弃",
+        "Documentation生成",
         "etl_script",
         "schedule_url",
         "execute_shell",
         "data_availability_flag",
         "上游表数量",
     )
-    by_full_name = {row[2]: row for row in rows[1:]}
+    by_full_name = {row[3]: row for row in rows[1:]}
     assert by_full_name["data_smartorder.dw_sku_display_snap"] == (
         "data_smartorder",
         "dw_sku_display_snap",
+        "dw",
         "data_smartorder.dw_sku_display_snap",
         "table",
+        "-",
+        "是",
         "是",
         "是",
         "是",
@@ -242,11 +250,74 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
     assert by_full_name["default.dim_store_info"] == (
         "default",
         "dim_store_info",
+        "dim",
         "default.dim_store_info",
         "view",
+        "是",
+        "-",
         "-",
         "-",
         "-",
         "DDL, 表血缘",
         0,
     )
+
+
+def test_table_name_prefix_uses_first_underscore_segment() -> None:
+    assert q.table_name_prefix("ods_logs_v1") == "ods"
+    assert q.table_name_prefix("dim") == "dim"
+
+
+def test_is_deprecated_dataset_reads_deprecation_aspect(monkeypatch) -> None:
+    monkeypatch.setattr(
+        q,
+        "_fetch_dataset_aspect",
+        lambda *args, **kwargs: {"deprecation": {"value": {"deprecated": True}}},
+    )
+
+    assert q.is_deprecated_dataset("http://gms", None, "urn:dataset") is True
+
+
+def test_is_llm_generated_documentation_detects_marker_block(monkeypatch) -> None:
+    monkeypatch.setattr(
+        q,
+        "_fetch_dataset_aspect",
+        lambda *args, **kwargs: {
+            "editableDatasetProperties": {
+                "value": {
+                    "description": (
+                        "人工说明\n"
+                        "<!-- DATAHUB_AUTO_PROCESSING_DOC_START -->\n"
+                        "## 表加工逻辑说明\n"
+                        "<!-- DATAHUB_AUTO_PROCESSING_DOC_END -->"
+                    )
+                }
+            }
+        },
+    )
+
+    assert q.is_llm_generated_documentation("http://gms", None, "urn:dataset") is True
+
+
+def test_is_llm_generated_documentation_detects_overwrite_style_sections(monkeypatch) -> None:
+    monkeypatch.setattr(
+        q,
+        "_fetch_dataset_aspect",
+        lambda *args, **kwargs: {
+            "editableDatasetProperties": {
+                "value": {
+                    "description": "\n".join(
+                        [
+                            "## 表加工逻辑说明",
+                            "### 1. 表用途概览",
+                            "### 2. 表结构 DDL",
+                            "### 4. 数据来源",
+                            "### 5. 使用到的上游表字段",
+                        ]
+                    )
+                }
+            }
+        },
+    )
+
+    assert q.is_llm_generated_documentation("http://gms", None, "urn:dataset") is True

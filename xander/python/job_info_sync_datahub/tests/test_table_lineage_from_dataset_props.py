@@ -83,6 +83,7 @@ def test_sync_one_table_skips_view_dataset(monkeypatch, tmp_path) -> None:
 
 def test_check_mode_reports_missing_and_extra_upstreams_without_writing(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(mod, "is_view_dataset", lambda *args, **kwargs: False)
+    monkeypatch.setattr(mod, "fetch_aspect_payload", lambda *args, **kwargs: {})
     monkeypatch.setattr(
         mod,
         "_fetch_structured_properties_or_empty",
@@ -120,7 +121,7 @@ def test_check_mode_reports_missing_and_extra_upstreams_without_writing(monkeypa
     monkeypatch.setattr(mod, "DatahubWriter", FailingWriter)
 
     result = mod.sync_one_table(
-        "dw.target",
+        "data_takeaway.pdw_order_target_table_di",
         gms_url="http://localhost:8080",
         token=None,
         platform_instance="blf-prod-hive",
@@ -141,6 +142,61 @@ def test_check_mode_reports_missing_and_extra_upstreams_without_writing(monkeypa
     assert result["missing_upstreams"] == ["ods.expected"]
     assert result["extra_upstreams"] == ["ods.extra"]
     assert result["write_upstream_lineage"] is False
+
+
+def test_sync_one_table_uses_documentation_section_four(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(mod, "is_view_dataset", lambda *args, **kwargs: False)
+    monkeypatch.setenv("BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK", "1")
+    documentation = "\n".join(
+        [
+            "## 表加工逻辑说明",
+            "### 1. 表用途概览",
+            "### 2. 表结构 DDL",
+            "### 4. 数据来源",
+            "",
+            "| 上游表 | 用途 |",
+            "| --- | --- |",
+            "| `default.ods_order_source_di` | 订单 |",
+            "| `data_takeaway.pdw_logistics_management_distribution_view` | 物流 |",
+            "",
+            "### 5. 使用到的上游表字段",
+        ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "fetch_aspect_payload",
+        lambda *args, **kwargs: {
+            "editableDatasetProperties": {"value": {"description": documentation}}
+        },
+    )
+    monkeypatch.setattr(mod, "fetch_existing_upstream_names", lambda *args, **kwargs: set())
+
+    def _fail_llm(*args, **kwargs):  # noqa: ANN001
+        raise AssertionError("evaluate_llm_only should not run when Documentation exists")
+
+    monkeypatch.setattr(mod, "evaluate_llm_only", _fail_llm)
+
+    result = mod.sync_one_table(
+        "data_takeaway.pdw_order_target_table_di",
+        gms_url="http://localhost:8080",
+        token=None,
+        platform_instance="blf-prod-hive",
+        env="PROD",
+        dry_run=True,
+        replace_existing_lineage=True,
+        llm_timeout_sec=1,
+        audit_jsonl=str(tmp_path / "audit.jsonl"),
+        batch_output_dir=str(tmp_path),
+    )
+
+    assert result["status"] == "OK"
+    assert result["source_property"] == "Documentation"
+    assert result["lineage_status"] == "DOC_EXTRACTED"
+    assert result["upstream_count"] == 2
+    assert set(result.get("upstreams_input_table") or []) == {
+        "default.ods_order_source_di",
+        "data_takeaway.pdw_logistics_management_distribution_view",
+    }
 
 
 def test_summarize_report_prints_only_table_name_for_check_match(capsys, tmp_path) -> None:

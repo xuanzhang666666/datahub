@@ -41,6 +41,7 @@ FAIL_LLM = "LLM_ERROR"
 FAIL_WRITE = "DATAHUB_WRITE"
 _TRINO_U_ESCAPE_RE = re.compile(r"\\([0-9A-Fa-f]{4})")
 _TRINO_COMMENT_U_AMP_RE = re.compile(r"COMMENT\s+U&'((?:[^'\\]|\\.)*?)'", re.IGNORECASE | re.DOTALL)
+_BARE_HIVE_TABLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 SYSTEM_PROMPT = """你是便利蜂数据仓库专家，擅长阅读 Hive SQL、Spark SQL、Python 和 shell 调度脚本。
 你会收到一个 Hive 表的 Execute Shell、Etl Script 和完整 DDL。请直接输出 Markdown 文档，不要输出 JSON，不要使用额外解释。
@@ -358,6 +359,58 @@ def expand_generated_markdown_variables(markdown: str, etl_script: str) -> str:
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", repl, markdown)
 
 
+def documentation_default_database(etl_script: str = "") -> str:
+    use_re = re.compile(r"^\s*use\s+`?([A-Za-z][A-Za-z0-9_]*)`?\s*;?\s*$", re.IGNORECASE)
+    for raw_line in strip_commented_logic_for_prompt(expand_prompt_variables(etl_script)).splitlines():
+        match = use_re.match(raw_line.strip())
+        if match:
+            db_name = match.group(1).strip()
+            if db_name.endswith("_dev"):
+                db_name = db_name.removesuffix("_dev")
+            return db_name
+    return "default"
+
+
+def _qualify_table_cell(cell: str, default_database: str) -> str:
+    stripped = cell.strip()
+    if not stripped or "." in stripped or stripped in {"---", "上游表"}:
+        return cell
+
+    prefix = ""
+    suffix = ""
+    token = stripped
+    if token.startswith("`") and token.endswith("`") and len(token) >= 2:
+        prefix = "`"
+        suffix = "`"
+        token = token[1:-1].strip()
+    if "." in token or not _BARE_HIVE_TABLE_RE.match(token):
+        return cell
+    return cell.replace(stripped, f"{prefix}{default_database}.{token}{suffix}", 1)
+
+
+def qualify_unqualified_markdown_table_names(markdown: str, default_database: str) -> str:
+    """Qualify bare upstream table names in generated Markdown table first columns."""
+    if not default_database:
+        return markdown
+
+    lines: List[str] = []
+    for line in markdown.splitlines():
+        if not line.lstrip().startswith("|"):
+            lines.append(line)
+            continue
+        cells = line.split("|")
+        if len(cells) < 4:
+            lines.append(line)
+            continue
+        first_data_cell = cells[1]
+        qualified = _qualify_table_cell(first_data_cell, default_database)
+        if qualified != first_data_cell:
+            cells[1] = qualified
+            line = "|".join(cells)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def build_llm_user_message(
     *,
     table_name: str,
@@ -371,11 +424,17 @@ def build_llm_user_message(
         system_prompt_chars=len(SYSTEM_PROMPT),
         explicit_max_chars=max_chars,
     )
+    default_database = documentation_default_database(etl_script)
     pruned_etl = strip_commented_logic_for_prompt(
         expand_prompt_variables(prune_etl_for_prompt(etl_script, execute_shell, table_name))
     )
     body = f"""目标表：{table_name}
 Dataset URN：{dataset_urn}
+表名库名解析规则：
+1. 如果脚本里有明确库名，按脚本里的库名。
+2. 如果脚本里有 `use xxx`，未带库名前缀的表按 `xxx.表名` 补全。
+3. 如果表名没带库名且脚本里没有 `use xxx`，按 `default.表名` 补全。
+当前脚本解析到的默认库为 `{default_database}`。
 
 ## Execute Shell
 ```shell
@@ -398,6 +457,7 @@ Dataset URN：{dataset_urn}
 - 数据来源必须使用 Markdown 表格，表头固定为：| 上游表 | 用途 |
 - 数据来源表格第二行固定为：| --- | --- |
 - 数据来源里的上游表名必须保持 Etl Script 中出现的完整表名，不能省略后缀或改写表名。
+- Etl Script 中未带库名前缀的来源表，必须按当前默认库 `{default_database}` 补全为 `{default_database}.表名`。
 - SQL 中出现过的所有来源表都必须列出，不能因为最终 insert overwrite 未引用对应 CTE 就隐去。
 - 对只在未参与最终写入的 CTE / 临时逻辑中出现的来源表，在用途列标记“脚本中定义但最终写入未使用”。
 - `not_verified_` 开头的待校验结果表不是业务计算上游，不要放入 4. 数据来源。
@@ -648,6 +708,10 @@ def sync_one_table_documentation(
         llm_raw = call_llm_generate_documentation(source, timeout_sec=llm_timeout_sec)
         result["llm_raw_export_path"] = _export_json(output_dir, "llm_raw", input_table, "json", llm_raw)
         markdown = expand_generated_markdown_variables(markdown_from_llm_payload(llm_raw), etl_script)
+        markdown = qualify_unqualified_markdown_table_names(
+            markdown,
+            documentation_default_database(etl_script),
+        )
         existing = fetch_existing_editable_description(gms_url, dataset_urn, token)
         final_doc = merge_documentation(existing, markdown, action=action)
         result["markdown_export_path"] = _export_text(output_dir, "markdown", input_table, "md", final_doc)
