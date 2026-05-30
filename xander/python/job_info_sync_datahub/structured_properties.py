@@ -11,8 +11,9 @@ Execute Shell（blf.data.schedule.execute_shell）须在 GMS 预建为富文本�
 from __future__ import annotations
 
 import os
+import re
 from abc import ABC, abstractmethod
-from typing import List
+from typing import Iterable, List
 
 from .logging_utils import get_logger
 from .models import JobContext, StructuredPropertyValue
@@ -24,6 +25,23 @@ URN_ETL_SCRIPT = "urn:li:structuredProperty:blf.data.warehouse.etl_script"
 URN_SCHEDULE_URL = "urn:li:structuredProperty:blf.data.schedule.schedule_url"
 URN_EXECUTE_SHELL = "urn:li:structuredProperty:blf.data.schedule.execute_shell"
 URN_DATA_AVAILABILITY_FLAG = "urn:li:structuredProperty:blf.data.warehouse.data_availability_flag"
+URN_OTHER_REMARK = "urn:li:structuredProperty:blf.data.warehouse.other_remark"
+
+DATA_AVAILABILITY_FLAG_ORDER = ("DDL", "表血缘", "字段血缘")
+
+
+def sort_data_availability_flags(flags: Iterable[str]) -> list[str]:
+    """Return de-duplicated availability flags in stable display/write order."""
+    unique: set[str] = set()
+    for flag in flags:
+        for token in re.split(r"[,，/、\n]+", str(flag)):
+            token = token.strip()
+            if token:
+                unique.add(token)
+    ordered = [flag for flag in DATA_AVAILABILITY_FLAG_ORDER if flag in unique]
+    ordered.extend(sorted(unique - set(ordered)))
+    return ordered
+
 
 SCHEDULE_URL_TEMPLATE = "https://schedule.corp.bianlifeng.com/job/{job}"
 

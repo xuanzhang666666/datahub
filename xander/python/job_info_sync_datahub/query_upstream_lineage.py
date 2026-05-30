@@ -57,7 +57,9 @@ from .structured_properties import (
     URN_DATA_AVAILABILITY_FLAG,
     URN_ETL_SCRIPT,
     URN_EXECUTE_SHELL,
+    URN_OTHER_REMARK,
     URN_SCHEDULE_URL,
+    sort_data_availability_flags,
 )
 
 _DEFAULT_PLATFORM_INSTANCE = "blf-prod-hive"
@@ -267,23 +269,28 @@ def extract_structured_property_value(payload: Dict[str, Any], property_urn: str
 
 
 def extract_data_availability_flag(payload: Dict[str, Any]) -> str:
-    """Read all blf.data.warehouse.data_availability_flag values."""
+    """Read all blf.data.warehouse.data_availability_flag values in stable order."""
     for assignment in _iter_property_assignments(payload):
         if assignment.get("propertyUrn") == URN_DATA_AVAILABILITY_FLAG:
-            return ", ".join(_all_string_values(assignment))
+            return ", ".join(sort_data_availability_flags(_all_string_values(assignment)))
     return ""
+
+
+def extract_other_remark(payload: Dict[str, Any]) -> str:
+    """Read blf.data.warehouse.other_remark value."""
+    return extract_structured_property_value(payload, URN_OTHER_REMARK)
 
 
 def read_upstream_structured_status(
     gms_url: str,
     token: Optional[str],
     dataset_urn: str,
-) -> Tuple[bool, bool, bool, str]:
-    """Return (has_etl_script, has_schedule_url, has_execute_shell, data_availability_flag)."""
+) -> Tuple[bool, bool, bool, str, str]:
+    """Return (has_etl_script, has_schedule_url, has_execute_shell, data_availability_flag, other_remark)."""
     try:
         payload = fetch_structured_properties(gms_url, dataset_urn, token=token)
     except Exception:
-        return False, False, False, ""
+        return False, False, False, "", ""
 
     etl_script, execute_shell = extract_property_texts(payload)
     schedule_url = extract_structured_property_value(payload, URN_SCHEDULE_URL)
@@ -292,6 +299,7 @@ def read_upstream_structured_status(
         bool(schedule_url.strip()),
         bool(execute_shell.strip()),
         extract_data_availability_flag(payload),
+        extract_other_remark(payload),
     )
 
 
@@ -470,6 +478,7 @@ def write_upstream_detail_xlsx(path: str, rows: List[Dict[str, Any]]) -> None:
         "schedule_url",
         "execute_shell",
         "data_availability_flag",
+        "other_remark",
         "上游表数量",
     ]
     wb = Workbook()
@@ -589,7 +598,7 @@ def run(
     )
 
     print(f"[INFO] 合并去重后共 {len(upstream_tables)} 个上游表")
-    upstream_status: Dict[str, Tuple[bool, bool, bool, str]] = {}
+    upstream_status: Dict[str, Tuple[bool, bool, bool, str, str]] = {}
     upstream_types: Dict[str, str] = {}
     upstream_deprecated: Dict[str, bool] = {}
     upstream_documentation_generated: Dict[str, bool] = {}
@@ -600,8 +609,11 @@ def run(
         upstream_types[table_name] = read_dataset_type(gms_url, token, urn)
         upstream_deprecated[table_name] = is_deprecated_dataset(gms_url, token, urn)
         upstream_documentation_generated[table_name] = is_llm_generated_documentation(gms_url, token, urn)
-        has_etl, has_schedule_url, has_shell, raw_data_availability_flag = upstream_status[table_name]
+        has_etl, has_schedule_url, has_shell, raw_data_availability_flag, raw_other_remark = (
+            upstream_status[table_name]
+        )
         data_availability_flag = raw_data_availability_flag or "-"
+        other_remark = raw_other_remark or "-"
         db_name, short_table_name = split_table_name(table_name)
         upstream_report_rows.append(
             {
@@ -616,6 +628,7 @@ def run(
                 "schedule_url": _yes_or_dash(has_schedule_url),
                 "execute_shell": _yes_or_dash(has_shell),
                 "data_availability_flag": data_availability_flag,
+                "other_remark": other_remark,
                 "上游表数量": upstream_dependency_counts.get(urn, 0),
             }
         )
@@ -636,7 +649,9 @@ def run(
     skipped_view_tables: List[str] = []
     for t in upstream_tables:
         urn = make_hive_dataset_urn(t, platform_instance, env)
-        has_etl, _, has_shell, _ = upstream_status.get(t) or read_upstream_structured_status(gms_url, token, urn)
+        has_etl, _, has_shell, _, _ = upstream_status.get(t) or read_upstream_structured_status(
+            gms_url, token, urn
+        )
         missing: List[str] = []
         if not has_etl:
             missing.append(_LABEL_ETL_SCRIPT)

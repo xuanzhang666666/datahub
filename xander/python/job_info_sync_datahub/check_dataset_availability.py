@@ -28,10 +28,12 @@ from .field_lineage_datahub_reader import (
 )
 from .query_upstream_lineage import urn_to_table_name
 from .structured_properties import (
+    DATA_AVAILABILITY_FLAG_ORDER,
     URN_DATA_AVAILABILITY_FLAG,
     URN_ETL_SCRIPT,
     URN_EXECUTE_SHELL,
     URN_SCHEDULE_URL,
+    sort_data_availability_flags,
 )
 from .table_documentation_full_discovery import (
     _parse_tab_rows,
@@ -40,10 +42,8 @@ from .table_documentation_full_discovery import (
     table_name_matches_prefix,
 )
 
-FLAG_DDL = "DDL"
-FLAG_TABLE_LINEAGE = "表血缘"
-FLAG_FIELD_LINEAGE = "字段血缘"
-FLAG_ORDER = [FLAG_DDL, FLAG_TABLE_LINEAGE, FLAG_FIELD_LINEAGE]
+FLAG_DDL, FLAG_TABLE_LINEAGE, FLAG_FIELD_LINEAGE = DATA_AVAILABILITY_FLAG_ORDER
+FLAG_ORDER = list(DATA_AVAILABILITY_FLAG_ORDER)
 VALID_HIVE_TABLE_PREFIXES = ("dwa", "dwd", "pdim", "dim", "ods", "pdw", "app", "mid", "dm", "dw", "ai")
 
 LABELS = {
@@ -309,11 +309,10 @@ def extract_existing_flags(values: dict[str, list[str]]) -> set[str]:
 
 
 def merge_availability_flags(existing: Iterable[str], passed: Iterable[str]) -> list[str]:
-    merged = {v for v in existing if v}
-    merged.update(v for v in passed if v)
-    ordered = [flag for flag in FLAG_ORDER if flag in merged]
-    ordered.extend(sorted(merged - set(ordered)))
-    return ordered
+    merged: list[str] = []
+    for source in (existing, passed):
+        merged.extend(str(value) for value in source if value)
+    return sort_data_availability_flags(merged)
 
 
 def _aspect_url(gms_url: str, dataset_urn: str, aspect_name: str) -> str:

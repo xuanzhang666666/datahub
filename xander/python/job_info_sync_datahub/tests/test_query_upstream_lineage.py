@@ -13,6 +13,7 @@ from job_info_sync_datahub.structured_properties import (
     URN_DATA_AVAILABILITY_FLAG,
     URN_ETL_SCRIPT,
     URN_EXECUTE_SHELL,
+    URN_OTHER_REMARK,
     URN_SCHEDULE_URL,
 )
 
@@ -35,7 +36,7 @@ def test_run_allows_view_upstreams_with_empty_etl_properties(monkeypatch) -> Non
     upstream = q.make_hive_dataset_urn("view_db.some_view")
 
     monkeypatch.setattr(q, "fetch_all_upstream_urns_with_counts", lambda *args, **kwargs: ({upstream}, {upstream: 0}))
-    monkeypatch.setattr(q, "read_upstream_structured_status", lambda *args, **kwargs: (False, False, False, ""))
+    monkeypatch.setattr(q, "read_upstream_structured_status", lambda *args, **kwargs: (False, False, False, "", ""))
     monkeypatch.setattr(
         urllib.request,
         "urlopen",
@@ -81,10 +82,10 @@ def test_run_groups_missing_properties_and_returns_success(monkeypatch, capsys) 
         urn = args[2]
         table_name = q.urn_to_table_name(urn)
         if table_name == "table_db.etl_missing":
-            return False, True, True, ""
+            return False, True, True, "", ""
         if table_name == "table_db.shell_missing":
-            return True, True, False, ""
-        return False, True, False, ""
+            return True, True, False, "", ""
+        return False, True, False, "", ""
 
     monkeypatch.setattr(q, "read_upstream_structured_status", _read_upstream_structured_status)
 
@@ -124,7 +125,7 @@ def test_run_prints_data_availability_flag_for_sorted_upstream_tables(monkeypatc
     def _fetch_structured_properties(*args, **kwargs):
         urn = args[1]
         table_name = q.urn_to_table_name(urn)
-        flag = "表DDL, 表血缘" if table_name == "table_db.a_upstream" else ""
+        flag = "表血缘, DDL" if table_name == "table_db.a_upstream" else ""
         return {
             "structuredProperties": {
                 "value": {
@@ -143,7 +144,7 @@ def test_run_prints_data_availability_flag_for_sorted_upstream_tables(monkeypatc
     assert q.run(["target_db.target_table"], "http://gms", skip_check_props=True) == 0
 
     output = capsys.readouterr().out
-    first = output.index("  table_db.a_upstream\tdata_availability_flag=表DDL, 表血缘")
+    first = output.index("  table_db.a_upstream\tdata_availability_flag=DDL, 表血缘")
     second = output.index("  table_db.b_upstream\tdata_availability_flag=-")
     assert first < second
 
@@ -163,6 +164,40 @@ def test_extract_data_availability_flag_reads_all_values() -> None:
     }
 
     assert q.extract_data_availability_flag(payload) == "DDL, 表血缘"
+
+
+def test_extract_data_availability_flag_sorts_values() -> None:
+    payload = {
+        "structuredProperties": {
+            "value": {
+                "properties": [
+                    {
+                        "propertyUrn": q.URN_DATA_AVAILABILITY_FLAG,
+                        "values": [{"string": "表血缘"}, {"string": "DDL"}],
+                    }
+                ]
+            }
+        }
+    }
+
+    assert q.extract_data_availability_flag(payload) == "DDL, 表血缘"
+
+
+def test_extract_other_remark_reads_value() -> None:
+    payload = {
+        "structuredProperties": {
+            "value": {
+                "properties": [
+                    {
+                        "propertyUrn": q.URN_OTHER_REMARK,
+                        "values": [{"string": "已废弃，勿使用"}],
+                    }
+                ]
+            }
+        }
+    }
+
+    assert q.extract_other_remark(payload) == "已废弃，勿使用"
 
 
 def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) -> None:
@@ -194,6 +229,7 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
             URN_SCHEDULE_URL: "https://schedule/job/x" if table_name == "data_smartorder.dw_sku_display_snap" else "",
             URN_EXECUTE_SHELL: "sh run.sh" if table_name == "data_smartorder.dw_sku_display_snap" else "",
             URN_DATA_AVAILABILITY_FLAG: "DDL, 表血缘",
+            URN_OTHER_REMARK: "view 无调度" if table_name == "default.dim_store_info" else "",
         }
         return {
             "structuredProperties": {
@@ -230,6 +266,7 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "schedule_url",
         "execute_shell",
         "data_availability_flag",
+        "other_remark",
         "上游表数量",
     )
     by_full_name = {row[3]: row for row in rows[1:]}
@@ -245,6 +282,7 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "是",
         "是",
         "DDL, 表血缘",
+        "-",
         2,
     )
     assert by_full_name["default.dim_store_info"] == (
@@ -259,6 +297,7 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "-",
         "-",
         "DDL, 表血缘",
+        "view 无调度",
         0,
     )
 
