@@ -51,6 +51,8 @@ else
     job_info_sync_datahub/tests/test_field_lineage_pipeline.py \
     job_info_sync_datahub/tests/test_table_documentation_full_discovery.py \
     job_info_sync_datahub/tests/test_table_documentation_batch_resume.py \
+    job_info_sync_datahub/tests/test_export_view_datasets_report.py \
+    job_info_sync_datahub/tests/test_batch_update_view_availability_flags.py \
     -q "$@"
 fi
 
