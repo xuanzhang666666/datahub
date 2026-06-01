@@ -200,9 +200,10 @@ def _hive_drop_for_target(hive_meta: Optional[Dict[str, Any]], input_table: str)
     if not hive_meta:
         return None
     key = _normalize_table_key(input_table)
-    for item in hive_meta.get("removed_lineages") or []:
-        if (item.get("target") or "").lower() == key:
-            return item
+    for bucket in ("stripped_upstreams", "removed_lineages"):
+        for item in hive_meta.get(bucket) or []:
+            if (item.get("target") or "").lower() == key:
+                return item
     return None
 
 
@@ -387,7 +388,7 @@ def sync_one_table(
             result["etl_file_path"] = f"datahub_documentation:{input_table}"
             result["etl_file_source"] = "datahub_documentation"
             logger.info(
-                "目标表已有 LLM Documentation，从「4. 数据来源」解析血缘: table=%s urn=%s",
+                "Documentation 含「4. 数据来源」，从该小节解析血缘: table=%s urn=%s",
                 input_table,
                 dataset_urn,
             )

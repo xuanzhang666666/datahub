@@ -1,7 +1,11 @@
 """通过 Trino 查询 Hive information_schema，确认表/视图是否真实存在。
 
-用于血缘写入前校验：目标表与 **全部** 上游表均须在 Hive 中存在（``BASE TABLE`` 或 ``VIEW``），
-否则整段 ``TableLineage`` 丢弃。查询失败视为「不确定」，不写入血缘。
+用于血缘写入前校验（``BASE TABLE`` 或 ``VIEW``）：
+
+- ``filter_lineages_require_full_hive_presence``：目标或任一上游不存在则整段丢弃（LLM 路径）。
+- ``filter_lineages_drop_missing_upstreams``：仅剔除不存在的上游（Documentation「4. 数据来源」路径）。
+
+查询失败视为「不确定」，不写入血缘。
 
 环境变量 ``BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK=1`` 时跳过校验（仅开发/单测；审计中记 ``skipped``）。
 """
@@ -112,6 +116,75 @@ def filter_lineages_require_full_hive_presence(
         norm_target = TableRef(db=tl.target.db.strip().lower(), table=tl.target.table.strip().lower())
         norm_up = [
             TableRef(db=u.db.strip().lower(), table=u.table.strip().lower()) for u in tl.upstreams
+        ]
+        kept.append(replace(tl, target=norm_target, upstreams=norm_up))
+
+    meta["kept_lineage_count"] = len(kept)
+    return kept, meta
+
+
+def filter_lineages_drop_missing_upstreams(
+    lineages: List[TableLineage],
+) -> Tuple[List[TableLineage], Dict[str, Any]]:
+    """保留目标表存在的 lineage；Hive 中不存在的上游表逐条剔除（不整段丢弃）。
+
+    若剔除后无有效上游，则丢弃该 lineage。Trino 查询失败时不写入血缘。
+    """
+    meta: Dict[str, Any] = {
+        "checked": True,
+        "skipped": False,
+        "mode": "drop_missing_upstream",
+        "removed_lineages": [],
+        "stripped_upstreams": [],
+    }
+    if should_skip_hive_existence_check():
+        meta["skipped"] = True
+        meta["reason"] = "BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK"
+        return lineages, meta
+
+    need = _collect_fqtns(lineages)
+    try:
+        existing = query_hive_existing_fqtns(need)
+    except Exception as exc:
+        meta["error"] = str(exc)[:800]
+        meta["checked"] = False
+        return [], meta
+
+    meta["requested_count"] = len(need)
+    meta["found_count"] = len(existing & need)
+    kept: List[TableLineage] = []
+
+    for tl in lineages:
+        tgt = tl.target.full_name.lower()
+        if tgt not in existing:
+            meta["removed_lineages"].append(
+                {"target": tl.target.full_name, "reason": "target_not_in_hive"}
+            )
+            continue
+
+        missing = [u.full_name for u in tl.upstreams if u.full_name.lower() not in existing]
+        valid_upstreams = [u for u in tl.upstreams if u.full_name.lower() in existing]
+        if missing:
+            meta["stripped_upstreams"].append(
+                {
+                    "target": tl.target.full_name,
+                    "reason": "upstream_not_in_hive",
+                    "missing_upstreams": missing,
+                }
+            )
+        if not valid_upstreams:
+            meta["removed_lineages"].append(
+                {
+                    "target": tl.target.full_name,
+                    "reason": "no_valid_upstream_in_hive",
+                    "missing_upstreams": missing,
+                }
+            )
+            continue
+
+        norm_target = TableRef(db=tl.target.db.strip().lower(), table=tl.target.table.strip().lower())
+        norm_up = [
+            TableRef(db=u.db.strip().lower(), table=u.table.strip().lower()) for u in valid_upstreams
         ]
         kept.append(replace(tl, target=norm_target, upstreams=norm_up))
 

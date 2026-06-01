@@ -35,6 +35,77 @@ def test_evaluate_documentation_lineage_parses_markdown_table() -> None:
     }
 
 
+def test_evaluate_documentation_lineage_parses_escaped_markdown_table_cells() -> None:
+    documentation = """
+### 4\\. 数据来源
+
+| 上游表 | 用途 |
+| --- | --- |
+| data\_md.dm\_md\_dim\_base\_sku\_info\_base\_sku\_v1 | 商品 |
+"""
+    with patch.dict(os.environ, {"BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK": "1"}):
+        lineages, decision, _raw = evaluate_documentation_lineage(
+            "data_md.dm_md_features_base_sku_tag_di_v2",
+            documentation,
+        )
+
+    assert decision.status == "DOC_EXTRACTED"
+    assert {u.full_name for u in lineages[0].upstreams} == {
+        "data_md.dm_md_dim_base_sku_info_base_sku_v1",
+    }
+
+
+def test_evaluate_documentation_lineage_parses_escaped_section_four_heading() -> None:
+    documentation = """
+### 4\\. 数据来源
+
+| 上游表 | 用途 |
+| --- | --- |
+| `data_md.dm_md_dim_base_sku_info_base_sku_v1` | 商品 |
+"""
+    with patch.dict(os.environ, {"BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK": "1"}):
+        lineages, decision, _raw = evaluate_documentation_lineage(
+            "data_md.dm_md_features_base_sku_tag_di_v2",
+            documentation,
+        )
+
+    assert decision.status == "DOC_EXTRACTED"
+    assert len(lineages) == 1
+    assert {u.full_name for u in lineages[0].upstreams} == {
+        "data_md.dm_md_dim_base_sku_info_base_sku_v1",
+    }
+
+
+def test_evaluate_documentation_lineage_drops_missing_upstream_in_hive() -> None:
+    documentation = """
+### 4. 数据来源
+
+| 上游表 | 用途 |
+| --- | --- |
+| `default.ods_exists` | ok |
+| `default.ods_missing` | ghost |
+"""
+    existing = {
+        "data_takeaway.pdw_order_target_table_di",
+        "default.ods_exists",
+    }
+    with patch(
+        "job_info_sync_datahub.hive_table_existence.query_hive_existing_fqtns",
+        return_value=existing,
+    ):
+        lineages, decision, _raw = evaluate_documentation_lineage(
+            "data_takeaway.pdw_order_target_table_di",
+            documentation,
+        )
+
+    assert decision.status == "DOC_EXTRACTED"
+    assert decision.write_upstream_lineage is True
+    assert {u.full_name for u in lineages[0].upstreams} == {"default.ods_exists"}
+    hive_meta = decision.hive_existence or {}
+    assert hive_meta.get("stripped_upstreams")
+    assert "default.ods_missing" in hive_meta["stripped_upstreams"][0]["missing_upstreams"]
+
+
 def test_evaluate_documentation_lineage_skips_when_section_missing() -> None:
     lineages, decision, _raw = evaluate_documentation_lineage(
         "data_takeaway.pdw_order_target_table_di",

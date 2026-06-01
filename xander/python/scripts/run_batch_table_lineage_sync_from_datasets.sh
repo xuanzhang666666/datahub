@@ -3,6 +3,7 @@
 #
 # 优先：若表已有 LLM 生成的 Documentation，从 description 中「4. 数据来源」解析上游表
 #       （与 run_check_datahub_dataset_availability.sh 相同解析逻辑）。
+#       写入前逐条校验 Hive 表存在性：不存在的上游表跳过，不加入 lineage。
 # 否则：读取 Etl Script / Execute Shell，调用 LLM 解析目标表与上游表。
 #
 # Jenkins 参数：

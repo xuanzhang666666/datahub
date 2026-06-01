@@ -23,6 +23,7 @@
 #   TABLE_PRE         表名前缀过滤，如 pdw → 只保留 *.pdw*（不含 pdw.xxx 库名前缀）（空=不过滤）
 #   RESUME            1=断点续跑：复用已有表清单与 jsonl 报告，跳过 OK/SKIP 的表
 #   FORCE_REDISCOVER  RESUME=1 时仍重新从 MySQL 发现表（默认 0，复用 table_names_all_document.txt）
+#   SKIP_IF_LLM_DOC_EXISTS  1=Documentation 已含 LLM 生成内容时跳过（不调用 LLM、不写入）
 #   TRINO_*           查询 SHOW CREATE TABLE 使用
 set -euo pipefail
 
@@ -33,6 +34,7 @@ MAX_CONSECUTIVE_LLM_FAILURES="${MAX_CONSECUTIVE_LLM_FAILURES:-3}"
 DOC_WRITE_ACTION="${DOC_WRITE_ACTION:-append}"
 RESUME="${RESUME:-0}"
 FORCE_REDISCOVER="${FORCE_REDISCOVER:-0}"
+SKIP_IF_LLM_DOC_EXISTS="${SKIP_IF_LLM_DOC_EXISTS:-0}"
 if [[ "$RESUME" == "1" ]]; then
   TABLE_LIST_CLEAR=0
 else
@@ -77,6 +79,7 @@ echo " LLM_TIMEOUT=$LLM_TIMEOUT"
 echo " MAX_CONSECUTIVE_LLM_FAILURES=$MAX_CONSECUTIVE_LLM_FAILURES"
 echo " TABLE_PRE=${TABLE_PRE:-}"
 echo " RESUME=$RESUME  FORCE_REDISCOVER=$FORCE_REDISCOVER"
+echo " SKIP_IF_LLM_DOC_EXISTS=$SKIP_IF_LLM_DOC_EXISTS"
 echo "==================================================================="
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
@@ -127,7 +130,7 @@ fi
 
 export TABLE_LIST_FILE="$_DISCOVERED_TABLES"
 unset TABLE_NAMES
-export CONCURRENCY DRY_RUN LLM_TIMEOUT MAX_CONSECUTIVE_LLM_FAILURES DOC_WRITE_ACTION TABLE_LIST_CLEAR RESUME
+export CONCURRENCY DRY_RUN LLM_TIMEOUT MAX_CONSECUTIVE_LLM_FAILURES DOC_WRITE_ACTION TABLE_LIST_CLEAR RESUME SKIP_IF_LLM_DOC_EXISTS
 
 echo "[INFO] running existing table documentation batch script ..."
 sh "$SCRIPT_DIR/run_batch_table_documentation_from_datasets.sh"

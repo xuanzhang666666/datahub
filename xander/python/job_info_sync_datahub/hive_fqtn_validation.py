@@ -118,6 +118,14 @@ def _table_matches_layer_prefix(table_name: str) -> bool:
     return any(t.startswith(p) for p in _LAYER_PREFIXES_SORTED)
 
 
+def table_name_has_layer_prefix(table_name: str) -> bool:
+    """表名是否以数仓层级前缀开头（dwa/dwd/pdim/dim/ods/...）。"""
+    return _table_matches_layer_prefix(table_name)
+
+
+HIVE_TABLE_LAYER_PREFIXES: Tuple[str, ...] = _LAYER_PREFIXES
+
+
 def is_valid_hive_fqtn(full_name: str) -> Tuple[bool, str]:
     """满足形态、库白名单、表前缀与下划线条数则 (True, \"\")，否则 (False, 原因码)。"""
     s = full_name.strip()

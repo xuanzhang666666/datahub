@@ -144,6 +144,53 @@ def test_check_mode_reports_missing_and_extra_upstreams_without_writing(monkeypa
     assert result["write_upstream_lineage"] is False
 
 
+def test_sync_one_table_uses_documentation_with_only_section_four_heading(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(mod, "is_view_dataset", lambda *args, **kwargs: False)
+    monkeypatch.setenv("BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK", "1")
+    documentation = "\n".join(
+        [
+            "### 4. 数据来源",
+            "",
+            "| 上游表 | 用途 |",
+            "| --- | --- |",
+            "| `default.ods_order_source_di` | 订单 |",
+        ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "fetch_aspect_payload",
+        lambda *args, **kwargs: {
+            "editableDatasetProperties": {"value": {"description": documentation}}
+        },
+    )
+    monkeypatch.setattr(mod, "fetch_existing_upstream_names", lambda *args, **kwargs: set())
+
+    def _fail_llm(*args, **kwargs):  # noqa: ANN001
+        raise AssertionError("evaluate_llm_only should not run when section 4 exists")
+
+    monkeypatch.setattr(mod, "evaluate_llm_only", _fail_llm)
+
+    result = mod.sync_one_table(
+        "data_takeaway.pdw_order_target_table_di",
+        gms_url="http://localhost:8080",
+        token=None,
+        platform_instance="blf-prod-hive",
+        env="PROD",
+        dry_run=True,
+        replace_existing_lineage=True,
+        llm_timeout_sec=1,
+        audit_jsonl=str(tmp_path / "audit.jsonl"),
+        batch_output_dir=str(tmp_path),
+    )
+
+    assert result["status"] == "OK"
+    assert result["source_property"] == "Documentation"
+    assert result["lineage_status"] == "DOC_EXTRACTED"
+    assert result["upstream_count"] == 1
+
+
 def test_sync_one_table_uses_documentation_section_four(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(mod, "is_view_dataset", lambda *args, **kwargs: False)
     monkeypatch.setenv("BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK", "1")

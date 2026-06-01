@@ -14,6 +14,9 @@
 #   DATAHUB_GMS_TOKEN GMS token
 #   TABLE_PRE         表名前缀过滤（pdw → 只保留 *.pdw*；空=不过滤）
 #   RESUME            1=断点续跑：不清空 jsonl，跳过报告中 OK/SKIP 的表，只处理未完成/失败项
+#   SKIP_IF_LLM_DOC_EXISTS  1=Documentation 已含 LLM 生成内容时跳过（不调用 LLM、不写入）
+#   上游表名规则：无库名时仅当表名以 dwa/dwd/pdim/dim/ods/pdw/app/mid/dm/dw/ai 开头才补 default.表名
+#   「4. 数据来源」表格会自动增加「是否 Hive 表」列（Trino information_schema 校验）
 #   TRINO_*           查询 SHOW CREATE TABLE 使用
 set -euo pipefail
 
@@ -23,6 +26,7 @@ LLM_TIMEOUT="${LLM_TIMEOUT:-300}"
 MAX_CONSECUTIVE_LLM_FAILURES="${MAX_CONSECUTIVE_LLM_FAILURES:-3}"
 DOC_WRITE_ACTION="${DOC_WRITE_ACTION:-append}"
 RESUME="${RESUME:-0}"
+SKIP_IF_LLM_DOC_EXISTS="${SKIP_IF_LLM_DOC_EXISTS:-0}"
 if [[ "$RESUME" == "1" ]]; then
   TABLE_LIST_CLEAR=0
 else
@@ -67,6 +71,7 @@ echo " LLM_TIMEOUT=$LLM_TIMEOUT"
 echo " MAX_CONSECUTIVE_LLM_FAILURES=$MAX_CONSECUTIVE_LLM_FAILURES"
 echo " TABLE_PRE=${TABLE_PRE:-}"
 echo " RESUME=$RESUME"
+echo " SKIP_IF_LLM_DOC_EXISTS=$SKIP_IF_LLM_DOC_EXISTS"
 echo "==================================================================="
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
@@ -150,6 +155,7 @@ ARGS="$ARGS --action $DOC_WRITE_ACTION"
 [[ -n "${BLF_DATAHUB_PLATFORM_INSTANCE:-}" ]] && ARGS="$ARGS --platform-instance $BLF_DATAHUB_PLATFORM_INSTANCE"
 [[ -n "${DATAHUB_ENV:-}" ]] && ARGS="$ARGS --env $DATAHUB_ENV"
 [[ "$RESUME" == "1" ]] && ARGS="$ARGS --resume"
+[[ "$SKIP_IF_LLM_DOC_EXISTS" == "1" ]] && ARGS="$ARGS --skip-if-llm-doc-exists"
 
 echo "[INFO] running: $PYTHON -m job_info_sync_datahub.table_documentation_from_dataset_props $ARGS"
 cd "$PYTHONPATH_ROOT"

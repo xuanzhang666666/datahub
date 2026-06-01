@@ -25,11 +25,18 @@ from .field_lineage_datahub_reader import (
     fetch_structured_properties,
     make_hive_dataset_urn,
 )
+from .check_dataset_availability import normalize_upstream_table_ref
+from .hive_fqtn_validation import HIVE_TABLE_LAYER_PREFIXES, table_name_has_layer_prefix
+from .hive_table_existence import query_hive_existing_fqtns, should_skip_hive_existence_check
 from .lineage_llm_compare import _prune_shell_job_to_entrypoint
 from .llm_client import llm_user_message_max_chars
 from .llm_client import call_openai_compatible_chat_text, get_llm_config, parse_llm_json_object
 from .logging_utils import get_logger, setup_logging
-from .query_upstream_lineage import is_view_dataset, normalize_table_name
+from .query_upstream_lineage import (
+    is_llm_generated_description,
+    is_view_dataset,
+    normalize_table_name,
+)
 
 logger = get_logger("table_documentation_from_dataset_props")
 
@@ -42,8 +49,15 @@ FAIL_WRITE = "DATAHUB_WRITE"
 _TRINO_U_ESCAPE_RE = re.compile(r"\\([0-9A-Fa-f]{4})")
 _TRINO_COMMENT_U_AMP_RE = re.compile(r"COMMENT\s+U&'((?:[^'\\]|\\.)*?)'", re.IGNORECASE | re.DOTALL)
 _BARE_HIVE_TABLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_DEFAULT_DB_QUALIFY_PREFIXES_TEXT = " / ".join(HIVE_TABLE_LAYER_PREFIXES)
+_DATA_SOURCE_HIVE_FLAG_COLUMN = "是否 Hive 表"
+_SECTION_4_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s*4(?:\\?\.|[.、])\s*数据来源\s*$"
+)
+_SECTION_4_INLINE_RE = re.compile(r"4(?:\\?\.|[.、])\s*数据来源")
+_SECTION_NEXT_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*\d+(?:\\?\.|[.、])\s+")
 
-SYSTEM_PROMPT = """你是便利蜂数据仓库专家，擅长阅读 Hive SQL、Spark SQL、Python 和 shell 调度脚本。
+SYSTEM_PROMPT = f"""你是便利蜂数据仓库专家，擅长阅读 Hive SQL、Spark SQL、Python 和 shell 调度脚本。
 你会收到一个 Hive 表的 Execute Shell、Etl Script 和完整 DDL。请直接输出 Markdown 文档，不要输出 JSON，不要使用额外解释。
 
 Markdown 必须严格包含以下章节：
@@ -63,7 +77,9 @@ Markdown 必须严格包含以下章节：
 必须使用下面的 Markdown 表格形式列出主要上游表及用途，表头固定为：
 | 上游表 | 用途 |
 | --- | --- |
-上游表必须写实际表名，不能省略表名后缀，不能把 `pdw_opc_flag_city_info` 写成 `pdw_opc_flag_city`。
+上游表必须写 `库.表` 全名。脚本里已写 `库.表` 的按原样；脚本里未写库名前缀且表名以数仓层级前缀（{_DEFAULT_DB_QUALIFY_PREFIXES_TEXT}）开头的，写 `default.表名`；其它裸表名不要补库名，禁止根据 `use` 语句、同脚本其它引用或数仓规范推测库名。
+禁止在表格外添加“可能为 xxx 库”“推测”“保留原样”等说明。
+上游表不能省略表名后缀，不能把 `pdw_opc_flag_city_info` 写成 `pdw_opc_flag_city`。
 SQL 中出现过的所有来源表都必须列出，包括 CTE 内引用过但最终 insert overwrite 未真实使用的来源表。
 如果某个来源表只在未参与最终写入的 CTE / 临时逻辑中出现，也要保留在表格中，并在「用途」列标记“脚本中定义但最终写入未使用”。
 `not_verified_` 开头的表是待校验结果表或临时结果表，不是业务计算上游，不要放入 4. 数据来源。
@@ -89,6 +105,7 @@ SQL 中出现过的所有来源表都必须列出，包括 CTE 内引用过但�
 要求：
 - 只解释实际入口会执行的逻辑，不要解释 backup、历史废弃、未被入口调用的函数。
 - 不要编造脚本中不存在的上游表、字段或业务口径。
+- 未带库名前缀且表名以数仓层级前缀开头的上游表写 `default.表名`；其它裸表名不要补库名，禁止推测或解释库名归属。
 - 内容用中文，适合 DataHub Documentation 页面直接展示。
 """
 
@@ -191,17 +208,53 @@ def merge_documentation(existing: str, generated: str, *, action: str) -> str:
 
 
 def _called_python_functions(func: ast.FunctionDef, function_names: Set[str]) -> Set[str]:
+    return _function_calls_in_ast(func, function_names)
+
+
+def _function_calls_in_ast(node: ast.AST, function_names: Set[str]) -> Set[str]:
     calls: Set[str] = set()
-    for node in ast.walk(func):
-        if isinstance(node, ast.Call):
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
             name = ""
-            if isinstance(node.func, ast.Name):
-                name = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                name = node.func.attr
+            if isinstance(child.func, ast.Name):
+                name = child.func.id
+            elif isinstance(child.func, ast.Attribute):
+                name = child.func.attr
             if name in function_names:
                 calls.add(name)
     return calls
+
+
+def _is_dunder_main_guard(test: ast.AST) -> bool:
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return False
+    if not isinstance(test.ops[0], ast.Eq):
+        return False
+    left, right = test.left, test.comparators[0]
+    if not isinstance(left, ast.Name) or left.id != "__name__":
+        return False
+    if isinstance(right, ast.Constant):
+        return right.value == "__main__"
+    if hasattr(ast, "Str") and isinstance(right, ast.Str):
+        return right.s == "__main__"
+    return False
+
+
+def _entrypoints_from_module_level(tree: ast.Module, function_names: Set[str]) -> List[str]:
+    """Collect function entrypoints invoked from module-level code or ``if __name__ == '__main__'``."""
+    found: List[str] = []
+    for node in tree.body:
+        blocks: List[ast.AST] = []
+        if isinstance(node, ast.If) and _is_dunder_main_guard(node.test):
+            blocks.extend(node.body)
+            blocks.extend(node.orelse)
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            blocks.append(node)
+        for block in blocks:
+            for name in sorted(_function_calls_in_ast(block, function_names)):
+                if name not in found:
+                    found.append(name)
+    return found
 
 
 def _entrypoints_from_execute_shell(execute_shell: str, function_names: Set[str]) -> List[str]:
@@ -228,7 +281,13 @@ def prune_python_script_to_entrypoint(etl_script: str, execute_shell: str = "") 
     if not functions:
         return etl_script
 
-    entrypoints = _entrypoints_from_execute_shell(execute_shell, set(functions))
+    entrypoints: List[str] = []
+    for candidate in (
+        *_entrypoints_from_execute_shell(execute_shell, set(functions)),
+        *_entrypoints_from_module_level(tree, set(functions)),
+    ):
+        if candidate not in entrypoints:
+            entrypoints.append(candidate)
     if not entrypoints and "main" in functions:
         entrypoints = ["main"]
     if not entrypoints:
@@ -360,14 +419,8 @@ def expand_generated_markdown_variables(markdown: str, etl_script: str) -> str:
 
 
 def documentation_default_database(etl_script: str = "") -> str:
-    use_re = re.compile(r"^\s*use\s+`?([A-Za-z][A-Za-z0-9_]*)`?\s*;?\s*$", re.IGNORECASE)
-    for raw_line in strip_commented_logic_for_prompt(expand_prompt_variables(etl_script)).splitlines():
-        match = use_re.match(raw_line.strip())
-        if match:
-            db_name = match.group(1).strip()
-            if db_name.endswith("_dev"):
-                db_name = db_name.removesuffix("_dev")
-            return db_name
+    """未带库名前缀的上游表统一补 ``default``，不根据 ``use`` 语句或其它引用推测库名。"""
+    del etl_script
     return "default"
 
 
@@ -384,6 +437,8 @@ def _qualify_table_cell(cell: str, default_database: str) -> str:
         suffix = "`"
         token = token[1:-1].strip()
     if "." in token or not _BARE_HIVE_TABLE_RE.match(token):
+        return cell
+    if not table_name_has_layer_prefix(token):
         return cell
     return cell.replace(stripped, f"{prefix}{default_database}.{token}{suffix}", 1)
 
@@ -411,6 +466,168 @@ def qualify_unqualified_markdown_table_names(markdown: str, default_database: st
     return "\n".join(lines)
 
 
+_DB_SPECULATION_LINE_RE = re.compile(
+    r"(推测|可能为|保留原样|根据现有数仓规范|实际库名可能|以脚本中出现的原始表名为准|"
+    r"未带库名前缀.*根据|根据脚本解析规则.*保留)"
+)
+
+
+def strip_database_speculation_disclaimers(markdown: str) -> str:
+    """Remove LLM prose lines that speculate about upstream database names."""
+    kept: List[str] = []
+    for line in markdown.splitlines():
+        if _DB_SPECULATION_LINE_RE.search(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _data_source_section_line_range(lines: List[str]) -> Optional[tuple[int, int]]:
+    start: Optional[int] = None
+    for idx, line in enumerate(lines):
+        if _SECTION_4_HEADING_RE.match(line.strip()):
+            start = idx
+            break
+    if start is None:
+        for idx, line in enumerate(lines):
+            if _SECTION_4_INLINE_RE.search(line):
+                start = idx
+                break
+    if start is None:
+        return None
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if _SECTION_NEXT_HEADING_RE.match(lines[idx].strip()):
+            end = idx
+            break
+    return start, end
+
+
+def _split_markdown_table_cells(line: str) -> Optional[List[str]]:
+    if not line.lstrip().startswith("|"):
+        return None
+    parts = line.split("|")
+    if len(parts) < 3:
+        return None
+    return [part.strip() for part in parts[1:-1]]
+
+
+def _format_markdown_table_row(cells: List[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _is_markdown_separator_row(cells: List[str]) -> bool:
+    if not cells:
+        return False
+    return all(set(cell.strip()) <= {"-", " "} for cell in cells)
+
+
+def _is_upstream_table_header_row(cells: List[str]) -> bool:
+    if not cells:
+        return False
+    first = cells[0].strip().strip("`").lower()
+    return first in {"上游表", "upstream"}
+
+
+def _header_hive_flag_column_index(cells: List[str]) -> Optional[int]:
+    for idx, cell in enumerate(cells):
+        if cell.strip() == _DATA_SOURCE_HIVE_FLAG_COLUMN:
+            return idx
+    return None
+
+
+def _hive_existence_label(
+    fqtn: Optional[str],
+    *,
+    existing: Optional[Set[str]],
+    check_skipped: bool,
+    check_failed: bool,
+) -> str:
+    if not fqtn:
+        return "-"
+    if check_skipped:
+        return "-"
+    if check_failed or existing is None:
+        return "未校验"
+    return "是" if fqtn.lower() in existing else "否"
+
+
+def annotate_data_source_hive_existence(markdown: str) -> str:
+    """在「4. 数据来源」Markdown 表格中增加/更新「是否 Hive 表」列（Trino information_schema）。"""
+    lines = markdown.splitlines()
+    bounds = _data_source_section_line_range(lines)
+    if bounds is None:
+        return markdown
+
+    start, end = bounds
+    section = lines[start:end]
+    fqtns: Set[str] = set()
+    row_fqtns: List[Optional[str]] = []
+    for line in section:
+        cells = _split_markdown_table_cells(line)
+        if cells is None or _is_markdown_separator_row(cells) or _is_upstream_table_header_row(cells):
+            continue
+        fqtn = normalize_upstream_table_ref(cells[0])
+        row_fqtns.append(fqtn or None)
+        if fqtn:
+            fqtns.add(fqtn)
+
+    check_skipped = should_skip_hive_existence_check()
+    existing: Optional[Set[str]] = set()
+    check_failed = False
+    if fqtns and not check_skipped:
+        try:
+            existing = query_hive_existing_fqtns(fqtns)
+        except Exception as exc:
+            logger.warning("Hive 存在性标注失败，「是否 Hive 表」列填未校验: %s", exc)
+            existing = None
+            check_failed = True
+
+    new_section: List[str] = []
+    data_row_idx = 0
+    for line in section:
+        cells = _split_markdown_table_cells(line)
+        if cells is None:
+            new_section.append(line)
+            continue
+
+        if _is_markdown_separator_row(cells):
+            flag_idx = _header_hive_flag_column_index(cells)
+            if flag_idx is None:
+                cells = [*cells, "---"]
+            else:
+                cells[flag_idx] = "---"
+            new_section.append(_format_markdown_table_row(cells))
+            continue
+
+        if _is_upstream_table_header_row(cells):
+            flag_idx = _header_hive_flag_column_index(cells)
+            if flag_idx is None:
+                cells = [*cells, _DATA_SOURCE_HIVE_FLAG_COLUMN]
+            else:
+                cells[flag_idx] = _DATA_SOURCE_HIVE_FLAG_COLUMN
+            new_section.append(_format_markdown_table_row(cells))
+            continue
+
+        fqtn = row_fqtns[data_row_idx] if data_row_idx < len(row_fqtns) else None
+        data_row_idx += 1
+        label = _hive_existence_label(
+            fqtn,
+            existing=existing,
+            check_skipped=check_skipped,
+            check_failed=check_failed,
+        )
+        flag_idx = _header_hive_flag_column_index(cells)
+        if flag_idx is None:
+            cells = [*cells, label]
+        else:
+            cells[flag_idx] = label
+        new_section.append(_format_markdown_table_row(cells))
+
+    merged = lines[:start] + new_section + lines[end:]
+    return "\n".join(merged)
+
+
 def build_llm_user_message(
     *,
     table_name: str,
@@ -424,17 +641,17 @@ def build_llm_user_message(
         system_prompt_chars=len(SYSTEM_PROMPT),
         explicit_max_chars=max_chars,
     )
-    default_database = documentation_default_database(etl_script)
     pruned_etl = strip_commented_logic_for_prompt(
         expand_prompt_variables(prune_etl_for_prompt(etl_script, execute_shell, table_name))
     )
     body = f"""目标表：{table_name}
 Dataset URN：{dataset_urn}
-表名库名解析规则：
-1. 如果脚本里有明确库名，按脚本里的库名。
-2. 如果脚本里有 `use xxx`，未带库名前缀的表按 `xxx.表名` 补全。
-3. 如果表名没带库名且脚本里没有 `use xxx`，按 `default.表名` 补全。
-当前脚本解析到的默认库为 `{default_database}`。
+表名库名解析规则（必须严格遵守，禁止推测）：
+1. 脚本里已写 `库.表` 的，Documentation 中按原样写 `库.表`。
+2. 脚本里未写库名前缀且表名以数仓层级前缀（{_DEFAULT_DB_QUALIFY_PREFIXES_TEXT}）开头的，写 `default.表名`。
+3. 其它裸表名不要补库名，不要写入 4. 数据来源。
+4. 禁止根据 `use` 语句、同脚本其它带库名引用、目标表所在库或数仓规范推测库名。
+5. 禁止在表格外写“可能为 xxx 库”“推测”“保留原样”等说明性文字。
 
 ## Execute Shell
 ```shell
@@ -454,10 +671,10 @@ Dataset URN：{dataset_urn}
 请基于以上内容生成 Markdown。必须包含：
 - ### 2. 表结构 DDL
 - ### 4. 数据来源
-- 数据来源必须使用 Markdown 表格，表头固定为：| 上游表 | 用途 |
+- 数据来源必须使用 Markdown 表格，表头固定为：| 上游表 | 用途 |（「是否 Hive 表」列由系统根据 Trino 自动填写，无需生成）
 - 数据来源表格第二行固定为：| --- | --- |
-- 数据来源里的上游表名必须保持 Etl Script 中出现的完整表名，不能省略后缀或改写表名。
-- Etl Script 中未带库名前缀的来源表，必须按当前默认库 `{default_database}` 补全为 `{default_database}.表名`。
+- 数据来源里的上游表必须写 `库.表` 全名；未带库名且表名以层级前缀开头的写 `default.表名`，其它裸表名不要补库名。
+- 禁止推测库名，禁止在表格外解释库名归属。
 - SQL 中出现过的所有来源表都必须列出，不能因为最终 insert overwrite 未引用对应 CTE 就隐去。
 - 对只在未参与最终写入的 CTE / 临时逻辑中出现的来源表，在用途列标记“脚本中定义但最终写入未使用”。
 - `not_verified_` 开头的待校验结果表不是业务计算上游，不要放入 4. 数据来源。
@@ -649,6 +866,7 @@ def sync_one_table_documentation(
     action: str,
     llm_timeout_sec: int,
     output_dir: Optional[str],
+    skip_if_llm_doc_exists: bool = False,
 ) -> Dict[str, Any]:
     input_table = normalize_table_name(table_name)
     dataset_urn = make_hive_dataset_urn(input_table, platform_instance, env)
@@ -663,6 +881,17 @@ def sync_one_table_documentation(
                 documentation_status="SKIP_VIEW_DATASET",
                 documentation_reason="目标 dataset 是 view，Documentation 生成仅处理 table",
                 write_documentation=False,
+            )
+            return result
+
+        existing = fetch_existing_editable_description(gms_url, dataset_urn, token)
+        if skip_if_llm_doc_exists and is_llm_generated_description(existing):
+            result.update(
+                status="SKIP",
+                documentation_status="SKIP_LLM_DOC_EXISTS",
+                documentation_reason="Documentation 已含 LLM 生成内容，跳过写入",
+                write_documentation=False,
+                elapsed=round(time.time() - t0, 1),
             )
             return result
 
@@ -712,7 +941,8 @@ def sync_one_table_documentation(
             markdown,
             documentation_default_database(etl_script),
         )
-        existing = fetch_existing_editable_description(gms_url, dataset_urn, token)
+        markdown = strip_database_speculation_disclaimers(markdown)
+        markdown = annotate_data_source_hive_existence(markdown)
         final_doc = merge_documentation(existing, markdown, action=action)
         result["markdown_export_path"] = _export_text(output_dir, "markdown", input_table, "md", final_doc)
     except Exception as exc:
@@ -785,10 +1015,12 @@ def run_batch(args: argparse.Namespace) -> int:
         print("没有待处理表（断点续跑：名单内表均已在报告中为 OK/SKIP）")
         return 0
     logger.info(
-        "待处理表: %d dry_run=%s action=%s max_consecutive_llm_failures=%d resume=%s",
+        "待处理表: %d dry_run=%s action=%s skip_if_llm_doc_exists=%s "
+        "max_consecutive_llm_failures=%d resume=%s",
         len(tables),
         args.dry_run,
         args.action,
+        args.skip_if_llm_doc_exists,
         args.max_consecutive_llm_failures,
         args.resume,
     )
@@ -811,6 +1043,7 @@ def run_batch(args: argparse.Namespace) -> int:
                 action=args.action,
                 llm_timeout_sec=args.llm_timeout,
                 output_dir=output_dir,
+                skip_if_llm_doc_exists=args.skip_if_llm_doc_exists,
             ): table
             for table in tables
         }
@@ -887,6 +1120,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--action", choices=["append", "overwrite"], default=os.getenv("DOC_WRITE_ACTION", "append"))
+    p.add_argument(
+        "--skip-if-llm-doc-exists",
+        action="store_true",
+        default=os.getenv("SKIP_IF_LLM_DOC_EXISTS", "").strip().lower() in ("1", "true", "yes", "on"),
+        help="Documentation 已含 LLM 生成内容时跳过（不调用 LLM、不写入；环境变量 SKIP_IF_LLM_DOC_EXISTS=1）",
+    )
     p.add_argument("--llm-timeout", type=int, default=int(os.getenv("LLM_TIMEOUT", "90")))
     p.add_argument(
         "--max-consecutive-llm-failures",

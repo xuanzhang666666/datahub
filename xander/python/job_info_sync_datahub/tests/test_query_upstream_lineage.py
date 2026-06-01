@@ -317,43 +317,32 @@ def test_is_deprecated_dataset_reads_deprecation_aspect(monkeypatch) -> None:
     assert q.is_deprecated_dataset("http://gms", None, "urn:dataset") is True
 
 
-def test_is_llm_generated_documentation_detects_marker_block(monkeypatch) -> None:
-    monkeypatch.setattr(
-        q,
-        "_fetch_dataset_aspect",
-        lambda *args, **kwargs: {
-            "editableDatasetProperties": {
-                "value": {
-                    "description": (
-                        "人工说明\n"
-                        "<!-- DATAHUB_AUTO_PROCESSING_DOC_START -->\n"
-                        "## 表加工逻辑说明\n"
-                        "<!-- DATAHUB_AUTO_PROCESSING_DOC_END -->"
-                    )
-                }
-            }
-        },
+def test_is_llm_generated_description_requires_section_four_heading() -> None:
+    assert q.is_llm_generated_description("") is False
+    assert q.is_llm_generated_description("## 表加工逻辑说明") is False
+    assert q.is_llm_generated_description("## 4. 数据来源") is False
+    assert (
+        q.is_llm_generated_description(
+            "人工说明\n### 4. 数据来源\n| 上游表 | 用途 |\n| --- | --- |\n| `default.ods_a` | x |"
+        )
+        is True
+    )
+    assert (
+        q.is_llm_generated_description(
+            "### 4\\. 数据来源\n| 上游表 | 用途 |\n| --- | --- |\n| `data_md.dm_md_dim_a` | x |"
+        )
+        is True
     )
 
-    assert q.is_llm_generated_documentation("http://gms", None, "urn:dataset") is True
 
-
-def test_is_llm_generated_documentation_detects_overwrite_style_sections(monkeypatch) -> None:
+def test_is_llm_generated_documentation_detects_section_four(monkeypatch) -> None:
     monkeypatch.setattr(
         q,
         "_fetch_dataset_aspect",
         lambda *args, **kwargs: {
             "editableDatasetProperties": {
                 "value": {
-                    "description": "\n".join(
-                        [
-                            "## 表加工逻辑说明",
-                            "### 1. 表用途概览",
-                            "### 2. 表结构 DDL",
-                            "### 4. 数据来源",
-                            "### 5. 使用到的上游表字段",
-                        ]
-                    )
+                    "description": "### 4. 数据来源\n| `db.t` | 用途 |",
                 }
             }
         },

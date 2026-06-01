@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .hive_fqtn_validation import filter_table_lineages_by_hive_fqtn_rules
 from .hive_table_existence import (
+    filter_lineages_drop_missing_upstreams,
     filter_lineages_require_full_hive_presence,
     should_skip_hive_existence_check,
 )
@@ -204,8 +205,15 @@ def _parse_lineage_array(raw: Dict[str, Any]) -> List[TableLineage]:
 def apply_lineage_filters_from_parsed(
     parsed: List[TableLineage],
     raw: Dict[str, Any],
+    *,
+    hive_upstream_filter_mode: str = "drop_lineage",
 ) -> Tuple[List[TableLineage], LineageWriteDecision]:
-    """对 LLM 解析结果做 fqtn 规则与 Hive 存在性过滤，产出与 batch_sync 一致的写入决策。"""
+    """对 LLM 解析结果做 fqtn 规则与 Hive 存在性过滤，产出与 batch_sync 一致的写入决策。
+
+    ``hive_upstream_filter_mode``:
+    - ``drop_lineage``（默认）：目标或任一上游不在 Hive 则整段丢弃（LLM 路径）。
+    - ``drop_upstream``：仅剔除不存在的上游表（Documentation「4. 数据来源」路径）。
+    """
     ds_targets = {tl.target.full_name.lower() for tl in parsed}
     ds_upstreams = {u.full_name.lower() for tl in parsed for u in tl.upstreams}
 
@@ -246,6 +254,8 @@ def apply_lineage_filters_from_parsed(
             "reason": "BLF_LINEAGE_SKIP_HIVE_EXISTENCE_CHECK",
             "checked": False,
         }
+    elif hive_upstream_filter_mode == "drop_upstream":
+        table_lineages, hive_exist_meta = filter_lineages_drop_missing_upstreams(table_lineages)
     else:
         table_lineages, hive_exist_meta = filter_lineages_require_full_hive_presence(table_lineages)
 
@@ -285,7 +295,9 @@ def apply_lineage_filters_from_parsed(
         or fqtn_meta.get("dropped_targets_no_valid_upstream")
         or fqtn_meta.get("stripped_invalid_upstreams")
     )
-    had_hive_drop = bool(hive_exist_meta.get("removed_lineages"))
+    had_hive_drop = bool(
+        hive_exist_meta.get("removed_lineages") or hive_exist_meta.get("stripped_upstreams")
+    )
     trust = 90
     if had_fqtn_filter:
         trust = 75
@@ -296,7 +308,9 @@ def apply_lineage_filters_from_parsed(
     )
     if had_fqtn_filter:
         reason += "；部分 fqtn 已按命名规则过滤"
-    if had_hive_drop:
+    if hive_exist_meta.get("stripped_upstreams"):
+        reason += "；部分上游表在 Hive 中不存在已跳过"
+    elif hive_exist_meta.get("removed_lineages"):
         reason += "；部分 lineage 因 Hive 中不存在整段丢弃"
     decision = LineageWriteDecision(
         write_upstream_lineage=True,
@@ -389,7 +403,11 @@ def evaluate_documentation_lineage(
         ],
     }
     parsed = _parse_lineage_array(raw)
-    table_lineages, decision = apply_lineage_filters_from_parsed(parsed, raw)
+    table_lineages, decision = apply_lineage_filters_from_parsed(
+        parsed,
+        raw,
+        hive_upstream_filter_mode="drop_upstream",
+    )
     if decision.write_upstream_lineage:
         upstream_count = len({u.full_name for tl in table_lineages for u in tl.upstreams})
         decision = LineageWriteDecision(

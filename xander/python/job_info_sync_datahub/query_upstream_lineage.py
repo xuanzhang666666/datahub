@@ -64,16 +64,6 @@ from .structured_properties import (
 
 _DEFAULT_PLATFORM_INSTANCE = "blf-prod-hive"
 _DEFAULT_ENV = "PROD"
-_AUTO_DOC_START = "<!-- DATAHUB_AUTO_PROCESSING_DOC_START -->"
-_AUTO_DOC_END = "<!-- DATAHUB_AUTO_PROCESSING_DOC_END -->"
-_GENERATED_DOC_REQUIRED_SECTIONS = (
-    "## 表加工逻辑说明",
-    "### 1. 表用途概览",
-    "### 2. 表结构 DDL",
-    "### 4. 数据来源",
-    "### 5. 使用到的上游表字段",
-)
-
 # 属性显示名（和 DataHub UI 一致）
 _LABEL_ETL_SCRIPT = "Etl Script"
 _LABEL_EXECUTE_SHELL = "Execute Shell"
@@ -410,13 +400,10 @@ def is_deprecated_dataset(gms_url: str, token: Optional[str], dataset_urn: str) 
 
 
 def is_llm_generated_description(description: str) -> bool:
-    """判断 editableDatasetProperties.description 是否为批量 Documentation 生成产物。"""
-    text = (description or "").strip()
-    if not text:
-        return False
-    if _AUTO_DOC_START in text and _AUTO_DOC_END in text:
-        return True
-    return all(section in text for section in _GENERATED_DOC_REQUIRED_SECTIONS)
+    """判断 description 是否含可解析的「4. 数据来源」小节（与血缘/可用性解析器一致）。"""
+    from .check_dataset_availability import description_has_data_source_section
+
+    return description_has_data_source_section(description)
 
 
 def is_llm_generated_documentation(gms_url: str, token: Optional[str], dataset_urn: str) -> bool:

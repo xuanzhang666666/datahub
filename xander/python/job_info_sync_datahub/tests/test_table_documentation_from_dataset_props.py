@@ -11,6 +11,7 @@ from job_info_sync_datahub.structured_properties import URN_ETL_SCRIPT, URN_EXEC
 from job_info_sync_datahub.table_documentation_from_dataset_props import (
     AUTO_DOC_END,
     AUTO_DOC_START,
+    annotate_data_source_hive_existence,
     build_llm_user_message,
     decode_trino_ddl_unicode_comments,
     expand_generated_markdown_variables,
@@ -18,6 +19,7 @@ from job_info_sync_datahub.table_documentation_from_dataset_props import (
     documentation_default_database,
     merge_documentation,
     qualify_unqualified_markdown_table_names,
+    strip_database_speculation_disclaimers,
     prune_python_script_to_entrypoint,
     strip_commented_logic_for_prompt,
     sync_one_table_documentation,
@@ -105,6 +107,32 @@ def run_job():
     assert "unused_backup" not in pruned
 
 
+def test_prune_python_script_to_entrypoint_keeps_main_block_callees_with_hive_sql() -> None:
+    script = """
+def loadToLocal(output_path):
+    hql = '''
+        SELECT * FROM data_smartorder.dm_warehouse_procurement_data_di
+        WHERE dt = 20240101
+    '''
+    os.system(hql)
+
+def main(output_path):
+    with open(output_path) as fh:
+        return fh.read()
+
+if __name__ == '__main__':
+    loadToLocal('./tmp_data')
+    main('./tmp_data')
+"""
+
+    pruned = prune_python_script_to_entrypoint(script, "python job.py 20240101")
+
+    assert "def loadToLocal" in pruned
+    assert "dm_warehouse_procurement_data_di" in pruned
+    assert "def main" in pruned
+    assert "if __name__ == '__main__'" in pruned
+
+
 def test_build_llm_user_message_contains_ddl_and_upstream_field_table_contract() -> None:
     msg = build_llm_user_message(
         table_name="dw.target",
@@ -125,9 +153,11 @@ def test_build_llm_user_message_contains_ddl_and_upstream_field_table_contract()
     assert "脚本中定义但最终写入未使用" in msg
     assert "not_verified_" in msg
     assert "不要放入 4. 数据来源" in msg
-    assert "如果脚本里有明确库名，按脚本里的库名" in msg
-    assert "如果脚本里有 `use xxx`" in msg
-    assert "如果表名没带库名且脚本里没有 `use xxx`，按 `default.表名` 补全" in msg
+    assert "脚本里已写 `库.表` 的，Documentation 中按原样写 `库.表`" in msg
+    assert "default.表名" in msg
+    assert "数仓层级前缀" in msg
+    assert "pdim" in msg
+    assert "禁止推测" in msg
     assert "### 5. 使用到的上游表字段" in msg
     assert "| 上游表 | 字段 | 在本表加工中的用途 | 相关逻辑/表达式 |" in msg
     assert "无法确认字段时填“未明确”" in msg
@@ -189,13 +219,13 @@ BEST_TABLE="${DATABASE}.dw_ordering_report_store_status_monitor_best_status_di"
     assert "${BEST_TABLE}" not in expanded
 
 
-def test_documentation_default_database_uses_use_statement() -> None:
+def test_documentation_default_database_ignores_use_statement() -> None:
     script = """
 use data_smartorder;
 select * from dim_sku_info;
 """
 
-    assert documentation_default_database(script) == "data_smartorder"
+    assert documentation_default_database(script) == "default"
 
 
 def test_documentation_default_database_falls_back_to_default_without_use() -> None:
@@ -217,7 +247,65 @@ def test_qualify_unqualified_markdown_table_names_uses_default_database() -> Non
 
     assert "`default.dim_sku_info`" in expanded
     assert "data_smartorder.dim_store_info" in expanded
-    assert "`default.not_verified_dim_sku_info`" in expanded
+    assert "`not_verified_dim_sku_info`" in expanded
+    assert "default.not_verified_dim_sku_info" not in expanded
+
+
+def test_qualify_unqualified_markdown_skips_tables_without_layer_prefix() -> None:
+    markdown = """
+| 上游表 | 用途 |
+| --- | --- |
+| `tmp_procurement_basic_data` | 临时 |
+| `pdw_order_detail_di` | 订单 |
+"""
+
+    expanded = qualify_unqualified_markdown_table_names(markdown, "default")
+
+    assert "`tmp_procurement_basic_data`" in expanded
+    assert "`default.pdw_order_detail_di`" in expanded
+
+
+def test_annotate_data_source_hive_existence_adds_hive_column() -> None:
+    markdown = "\n".join(
+        [
+            "## 表加工逻辑说明",
+            "### 4. 数据来源",
+            "",
+            "| 上游表 | 用途 |",
+            "| --- | --- |",
+            "| `default.pdw_order_detail_di` | 订单 |",
+            "| `default.ods_missing_table_di` | 缺失 |",
+            "",
+            "### 5. 使用到的上游表字段",
+        ]
+    )
+    existing = {"default.pdw_order_detail_di"}
+
+    with patch(
+        "job_info_sync_datahub.table_documentation_from_dataset_props.query_hive_existing_fqtns",
+        return_value=existing,
+    ):
+        annotated = annotate_data_source_hive_existence(markdown)
+
+    assert "| 上游表 | 用途 | 是否 Hive 表 |" in annotated
+    assert "| `default.pdw_order_detail_di` | 订单 | 是 |" in annotated
+    assert "| `default.ods_missing_table_di` | 缺失 | 否 |" in annotated
+    assert "### 5. 使用到的上游表字段" in annotated
+
+
+def test_strip_database_speculation_disclaimers_removes_guess_lines() -> None:
+    markdown = "\n".join(
+        [
+            "### 9. 注意事项",
+            "- dim_store_info表在ETL脚本中未带库名前缀，根据脚本解析规则，此处保留原样dim_store_info，"
+            "但根据现有数仓规范推测其实际库名可能为data_smartorder.dim_store_info。",
+            "- 分区字段为 dt。",
+        ]
+    )
+    cleaned = strip_database_speculation_disclaimers(markdown)
+    assert "推测" not in cleaned
+    assert "保留原样" not in cleaned
+    assert "分区字段为 dt" in cleaned
 
 
 def test_strip_commented_logic_for_prompt_removes_commented_sql_sources() -> None:
@@ -323,6 +411,10 @@ def test_sync_one_table_documentation_dry_run_exports_markdown_and_does_not_writ
 def test_sync_one_table_documentation_skips_when_no_source_and_no_ddl() -> None:
     with (
         patch(
+            "job_info_sync_datahub.table_documentation_from_dataset_props.fetch_existing_editable_description",
+            return_value="",
+        ),
+        patch(
             "job_info_sync_datahub.table_documentation_from_dataset_props.fetch_structured_properties",
             return_value=_structured_properties_payload(),
         ),
@@ -349,3 +441,42 @@ def test_sync_one_table_documentation_skips_when_no_source_and_no_ddl() -> None:
 
     assert result["status"] == "SKIP"
     assert result["documentation_status"] == "SKIP_NO_DOC_SOURCE"
+
+
+def test_sync_one_table_documentation_skips_when_llm_doc_exists_and_flag_on() -> None:
+    existing_llm_doc = f"{AUTO_DOC_START}\n## 表加工逻辑说明\n{AUTO_DOC_END}"
+
+    with (
+        patch(
+            "job_info_sync_datahub.table_documentation_from_dataset_props.is_view_dataset",
+            return_value=False,
+        ),
+        patch(
+            "job_info_sync_datahub.table_documentation_from_dataset_props.fetch_existing_editable_description",
+            return_value=existing_llm_doc,
+        ),
+        patch(
+            "job_info_sync_datahub.table_documentation_from_dataset_props.fetch_structured_properties",
+        ) as fetch_props,
+        patch(
+            "job_info_sync_datahub.table_documentation_from_dataset_props.call_llm_generate_documentation",
+        ) as call_llm,
+    ):
+        result = sync_one_table_documentation(
+            "dw.target",
+            gms_url="http://localhost:8080",
+            token=None,
+            platform_instance="blf-prod-hive",
+            env="PROD",
+            dry_run=False,
+            action="append",
+            llm_timeout_sec=1,
+            output_dir=None,
+            skip_if_llm_doc_exists=True,
+        )
+
+    assert result["status"] == "SKIP"
+    assert result["documentation_status"] == "SKIP_LLM_DOC_EXISTS"
+    assert result["write_documentation"] is False
+    fetch_props.assert_not_called()
+    call_llm.assert_not_called()

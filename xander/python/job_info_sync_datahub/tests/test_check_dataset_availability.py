@@ -34,7 +34,7 @@ def test_table_basic_check_rejects_empty_structured_property() -> None:
         dataset_urn="urn:dataset:dw.target",
         is_view=False,
         structured_values={
-            mod.URN_ETL_SCRIPT: "无",
+            mod.URN_ETL_SCRIPT: "null",
             mod.URN_SCHEDULE_URL: "https://schedule/job/dw.target",
             mod.URN_EXECUTE_SHELL: "sh run.sh",
         },
@@ -173,6 +173,24 @@ def test_table_lineage_parser_ignores_api_names_and_urls_in_data_sources() -> No
     assert result.lineage_documented_upstreams == ["data_takeaway.pdw_takeaway_store_operating_state_info_di"]
     assert result.lineage_missing_upstreams == []
     assert result.lineage_extra_upstreams == []
+
+
+def test_parse_documented_upstreams_unescapes_markdown_table_cells() -> None:
+    _, upstreams = mod.parse_documented_upstreams(
+        """
+### 4\\. 数据来源
+
+| 上游表 | 用途 | 是否 Hive 表 |
+| --- | --- | --- |
+| data\_md.dm\_md\_dim\_base\_sku\_info\_base\_sku\_v1 | 商品维表 | 是 |
+| <span style="font-size:13px">data\_md.dm\_md\_features\_12\_class\_sku\_tag\_info\_sku\_v1</span> | 标签 | 是 |
+"""
+    )
+
+    assert upstreams == {
+        "data_md.dm_md_dim_base_sku_info_base_sku_v1",
+        "data_md.dm_md_features_12_class_sku_tag_info_sku_v1",
+    }
 
 
 def test_parse_documented_upstreams_defaults_db_and_rejects_invalid_table_names() -> None:

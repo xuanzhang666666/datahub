@@ -137,7 +137,7 @@ def discover_table_names_by_prefix_from_mysql(
 
 def is_meaningful_text(value: str) -> bool:
     text = strip_markdown_code_fence(value or "").strip()
-    return bool(text) and text.lower() not in {"无", "null", "none"}
+    return bool(text) and text.lower() not in {"null", "none"}
 
 
 def diagnose_structured_property_value(raw: str) -> tuple[str, str]:
@@ -147,7 +147,7 @@ def diagnose_structured_property_value(raw: str) -> tuple[str, str]:
     text = strip_markdown_code_fence(str(raw)).strip()
     if not text:
         return "EMPTY", "属性存在但 string 值为空"
-    if text.lower() in {"无", "null", "none"}:
+    if text.lower() in {"null", "none"}:
         return "PLACEHOLDER", f"值为占位符「{text}」，视为无效"
     return "OK", f"已填写（{len(text)} 字符）"
 
@@ -407,33 +407,55 @@ def upstream_tables_from_payload(
     return out
 
 
+# DataHub / LLM Markdown may escape numbered headings as ``### 4\. 数据来源``.
+_SECTION_4_HEADING_LINE_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s*4(?:\\?\.|[.、])\s*数据来源\s*$"
+)
+_SECTION_4_INLINE_RE = re.compile(r"4(?:\\?\.|[.、])\s*数据来源")
+_SECTION_NEXT_NUMBERED_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s*\d+(?:\\?\.|[.、])\s+"
+)
+
+
 def extract_data_source_section(description: str) -> str:
     lines = (description or "").splitlines()
     start: Optional[int] = None
     for idx, line in enumerate(lines):
-        if re.match(r"^\s{0,3}#{1,6}\s*4[.、]\s*数据来源\s*$", line.strip()):
+        if _SECTION_4_HEADING_LINE_RE.match(line.strip()):
             start = idx
             break
     if start is None:
         for idx, line in enumerate(lines):
-            if re.search(r"4[.、]\s*数据来源", line):
+            if _SECTION_4_INLINE_RE.search(line):
                 start = idx
                 break
     if start is None:
         return ""
     end = len(lines)
     for idx in range(start + 1, len(lines)):
-        if re.match(r"^\s{0,3}#{1,6}\s*\d+[.、]\s+", lines[idx].strip()):
+        if _SECTION_NEXT_NUMBERED_HEADING_RE.match(lines[idx].strip()):
             end = idx
             break
     return "\n".join(lines[start:end]).strip()
 
 
+def description_has_data_source_section(description: str) -> bool:
+    """True when Markdown contains a parseable「4. 数据来源」小节（含 ``4\\.`` 转义标题）。"""
+    return bool(extract_data_source_section(description))
+
+
 def _clean_table_token(value: str) -> str:
     text = value.strip().strip("`").strip()
+    text = re.sub(r"<[^>]+>", "", text, flags=re.I)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = text.replace(r"\_", "_").replace(r"\.", ".")
     text = re.sub(r"\s+", " ", text)
     return text.lower()
+
+
+def normalize_upstream_table_ref(value: str) -> str:
+    """将 Markdown/列表中的表名 token 规范为 ``db.table``（非 Hive 形态则返回空串）。"""
+    return _normalize_table_token(value)
 
 
 def _normalize_table_token(value: str) -> str:
