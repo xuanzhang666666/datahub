@@ -74,6 +74,46 @@ export DATAHUB_GMS_URL=http://localhost:8080
 sh /data/datahub/scripts/run_jenkins_hive_table_ingest_from_jobs.sh
 ```
 
+### 1d）Jenkins/CLI：MySQL 库表元数据 → DataHub
+
+- **入口脚本**：`[python/scripts/run_mysql_ingest.sh](python/scripts/run_mysql_ingest.sh)`
+  服务器路径：`/data/datahub/scripts/run_mysql_ingest.sh`
+- **Python 包依赖**：同目录 `job_info_sync_datahub/mysql_ingest_recipe.py`；运行环境需安装 `acryl-datahub[mysql]`。
+- **参考 recipe**：`[recipes/mysql_ingest_example.yml](recipes/mysql_ingest_example.yml)`；实际运行时脚本会按环境变量生成临时 recipe。
+- **必填 Jenkins 参数 / 环境变量**：
+  - `MYSQL_SOURCE_NAME`：公司 MySQL 集群名，用于生成 recipe 文件名；默认也作为 DataHub `platform_instance`，如 `mysql_bach_inventory`
+  - `MYSQL_HOST_PORT`：MySQL 地址，如 `mysql.example.com:3306`
+  - `MYSQL_USERNAME` / `MYSQL_PASSWORD`：MySQL 只读账号密码，建议放 Jenkins 凭据或 `lineage.env`
+- **批量集群参数**：
+  - `CLUSTER_INFOS`：多行 CSV 参数，格式为 `集群名,服务器名称,IP,端口,角色`；设置后脚本会忽略单集群的 `MYSQL_SOURCE_NAME` / `MYSQL_HOST_PORT`，逐行按集群执行。
+  - 批量模式下每个集群的 `platform_instance` 默认等于集群名，recipe 文件会分别写入 `mysql_<集群名>_to_datahub.yml`。
+- **常用可选参数**：
+  - `MYSQL_DATABASE_ALLOW`：database allow 正则，支持逗号或多行；不设置时同步所有业务库
+  - `MYSQL_DATABASE_DENY`：database deny 正则；默认排除 `information_schema` / `mysql` / `performance_schema` / `sys`
+  - `MYSQL_TABLE_ALLOW`：table allow 正则，支持逗号或多行，如 `^app_db\..*$`
+  - `MYSQL_PLATFORM_INSTANCE`：DataHub platform instance；默认使用 `MYSQL_SOURCE_NAME`
+  - `MYSQL_INCLUDE_VIEWS=0`：不采集 view；默认采集
+  - `MYSQL_PROFILING_ENABLED=1`：开启 profiling；默认关闭，避免扫数据
+  - `DRY_RUN=1`：执行 `datahub ingest --preview`，不写 DataHub
+- **DataHub 组织方式**：`platform=mysql`；集群名写入 `platform_instance`；数据库写为 database container；表/视图写为 dataset，名称为 `<database>.<table>`。
+
+**Jenkins Execute shell 示例**：
+
+```bash
+export LINEAGE_PYTHON=/opt/anaconda3/bin/python
+export DATAHUB_GMS_URL=http://localhost:8080
+
+export MYSQL_USERNAME=canaler
+export MYSQL_PASSWORD='******'
+
+export CLUSTER_INFOS='集群名,服务器名称,IP,端口,角色
+mysql_bach_inventory,inventory2.w.mysql.bj1,10.253.2.222,33008,从库'
+
+# export DRY_RUN=1
+
+sh /data/datahub/scripts/run_mysql_ingest.sh
+```
+
 ### 2）Hive 表清单 xlsx → 切分 → 串行 ingest
 
 - **入口脚本**：`[run/ingest_hive_table_list_serial_from_xlsx.sh](run/ingest_hive_table_list_serial_from_xlsx.sh)`  
