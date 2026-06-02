@@ -95,6 +95,102 @@ if ! grep -q '\-\-force' "$PKG_DIR/batch_sync.py"; then
 fi
 echo "[INFO] batch_sync.py 版本验证通过"
 
+_BATCH_SYNC_ENTRY="$REPORT_DIR/batch_sync_job_list_entry.py"
+cat > "$_BATCH_SYNC_ENTRY" <<'PY'
+#!/usr/bin/env python3
+"""Jenkins job-list batch_sync entrypoint with .job wrapper Python resolution."""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from job_info_sync_datahub import batch_sync
+
+_ORIGINAL_DOWNLOAD_ETL_FILE = batch_sync.download_etl_file
+_PYTHON_ENTRYPOINT_RE = re.compile(
+    r"(?:\$PYTHON|\bpython(?:\d(?:\.\d+)?)?)\s+([^\s;&|]+\.py)\b"
+)
+
+
+def _entrypoint_python_candidate(
+    rel_path: str,
+    content: str,
+    candidate_paths: List[str],
+) -> Optional[str]:
+    if not rel_path.endswith(".job"):
+        return None
+    match = _PYTHON_ENTRYPOINT_RE.search(content)
+    if not match:
+        return None
+    py_path = match.group(1).strip("'\"")
+    if not py_path or py_path.startswith(("/", "$")) or "://" in py_path:
+        return None
+    py_rel = (Path(rel_path).parent / py_path).as_posix()
+    if py_rel in candidate_paths:
+        return None
+    return py_rel
+
+
+def _resolved_relative_path(display_path: str) -> str:
+    if display_path.startswith("gitlab:"):
+        return display_path.split(":", 1)[1].lstrip("/")
+    if display_path.startswith("localfolder:"):
+        parts = display_path.split(":", 1)[1].lstrip("/").split("/", 1)
+        return parts[1] if len(parts) == 2 else parts[0]
+    return display_path
+
+
+def _download_etl_file_job_list(
+    gitlab_name: str,
+    project_path: str,
+    candidate_paths: List[str],
+    job_file_name: str,
+    ref: str = "master",
+    explicit_path: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    display_path, content, source = _ORIGINAL_DOWNLOAD_ETL_FILE(
+        gitlab_name=gitlab_name,
+        project_path=project_path,
+        candidate_paths=candidate_paths,
+        job_file_name=job_file_name,
+        ref=ref,
+        explicit_path=explicit_path,
+        token=token,
+    )
+    rel_path = _resolved_relative_path(display_path)
+    py_rel = _entrypoint_python_candidate(rel_path, content, candidate_paths)
+    if py_rel is None:
+        return display_path, content, source
+    try:
+        return _ORIGINAL_DOWNLOAD_ETL_FILE(
+            gitlab_name=gitlab_name,
+            project_path=project_path,
+            candidate_paths=[py_rel],
+            job_file_name=Path(py_rel).name,
+            ref=ref,
+            token=token,
+        )
+    except Exception as exc:
+        batch_sync.logger.warning(
+            "job-list .job 壳脚本引用 Python 文件但解析失败，继续使用 .job 内容: job=%s python=%s err=%s",
+            rel_path,
+            py_rel,
+            exc,
+        )
+        return display_path, content, source
+
+
+batch_sync.download_etl_file = _download_etl_file_job_list
+
+if __name__ == "__main__":
+    sys.exit(batch_sync.main())
+PY
+chmod +x "$_BATCH_SYNC_ENTRY"
+echo "[INFO] job-list Python entrypoint: $_BATCH_SYNC_ENTRY"
+
 # ── 解析作业名单 ───────────────────────────────────────────────────────────────
 _RESOLVED_JOB_FILE=""
 if [[ -n "${JOBS:-}" ]]; then
@@ -134,9 +230,11 @@ ARGS="$ARGS --concurrency $CONCURRENCY"
 ARGS="$ARGS --llm-timeout $LLM_TIMEOUT"
 [[ "$DRY_RUN" == "1" ]] && ARGS="$ARGS --dry-run"
 
-echo "[INFO] running: $PYTHON -m job_info_sync_datahub.batch_sync $ARGS"
+echo "[INFO] running: $PYTHON $_BATCH_SYNC_ENTRY $ARGS"
+# 强制在仓库根运行，避免 bastion/cwd 下旧的 /root/job_info_sync_datahub 抢占导入路径
+cd "$PYTHONPATH_ROOT"
 PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
-  "$PYTHON" -m job_info_sync_datahub.batch_sync $ARGS
+  "$PYTHON" "$_BATCH_SYNC_ENTRY" $ARGS
 
 echo "[INFO] exporting Excel report..."
 PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \

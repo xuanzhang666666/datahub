@@ -45,6 +45,7 @@ from .etl_source_fallback import (
     load_existing_structured_etl_source,
     looks_like_inline_etl,
 )
+from .query_upstream_lineage import read_upstream_structured_status
 from .runtime_parser import (
     candidate_gitlab_paths,
     extract_gitlab_name,
@@ -52,6 +53,7 @@ from .runtime_parser import (
     get_job_dir_name,
     has_real_w_run_task,
     job_file_name,
+    prefer_job_display_case_file_name,
     parse_runtime_context,
     resolve_project_path,
 )
@@ -76,12 +78,80 @@ _TRINO_HOST = os.getenv("TRINO_HOST", "10.253.7.167")
 _TRINO_PORT = int(os.getenv("TRINO_PORT", "8081"))
 _TRINO_USER = os.getenv("TRINO_USER", "xuan.zhang")
 _DMP_TABLE = "default.ods_data_platform_dmp_schedule_job_basic_info"
+_SHELL_ASSIGN_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.+)$")
+
+
+def read_target_data_availability_flags(
+    table_lineages: List,
+    *,
+    gms_url: str,
+    token: Optional[str],
+    platform_instance: str,
+    env: str,
+) -> Dict[str, str]:
+    """Return existing Data Availability Flag values for target tables."""
+    flags: Dict[str, str] = {}
+    for tl in table_lineages:
+        dataset_urn = make_dataset_urn_from_ref(tl.target, platform_instance, env)
+        _has_etl, _has_schedule, _has_shell, flag, _other_remark = (
+            read_upstream_structured_status(gms_url, token, dataset_urn)
+        )
+        if flag.strip():
+            flags[tl.target.full_name] = flag.strip()
+    return flags
 
 
 def _safe_snapshot_name(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     safe = safe.strip("._")
     return safe or "unknown"
+
+
+def extract_shell_assignments(shell_command: str) -> Dict[str, str]:
+    """Extract simple KEY=VALUE / export KEY=VALUE assignments from shell_command."""
+    assignments: Dict[str, str] = {}
+    for raw_line in shell_command.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _SHELL_ASSIGN_RE.match(line)
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2).strip()
+        # Skip command substitutions / complex runtime expressions.
+        if "$(" in value or "`" in value:
+            continue
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        assignments[key] = value
+    return assignments
+
+
+def substitute_shell_vars_in_etl(etl_content: str, shell_command: str) -> tuple[str, int]:
+    """Substitute ${VAR}/$VAR in ETL text with assignments from shell_command.
+
+    Matching is case-insensitive on variable names to handle scripts where
+    ``export ORDER_PREFIX=...`` is referenced as ``${order_prefix}``.
+    """
+    if "$" not in etl_content:
+        return etl_content, 0
+    assignments = extract_shell_assignments(shell_command)
+    if not assignments:
+        return etl_content, 0
+
+    rendered = etl_content
+    replaced = 0
+    for key, value in assignments.items():
+        rendered, c1 = re.subn(
+            rf"\$\{{{re.escape(key)}\}}", value, rendered, flags=re.IGNORECASE
+        )
+        rendered, c2 = re.subn(
+            rf"\${re.escape(key)}\b", value, rendered, flags=re.IGNORECASE
+        )
+        replaced += c1 + c2
+    return rendered, replaced
 
 
 def export_etl_script_snapshot(
@@ -274,6 +344,7 @@ def sync_one(
         "etl_file_source": None,
         "etl_file_export_path": None,
         "llm_raw_export_path": None,
+        "data_availability_flags": {},
     }
     t0 = time.time()
     try:
@@ -324,6 +395,7 @@ def sync_one(
             project_path = resolve_project_path(gitlab_name)
             job_path, kind = extract_job_path_and_type(metadata.shell_command)
             jfn = job_file_name(job_path, kind)
+            jfn = prefer_job_display_case_file_name(job_display_name, jfn, kind)
             job_dir = get_job_dir_name(metadata.shell_command)
             candidates = candidate_gitlab_paths(job_path, jfn, job_dir)
             used_path, etl_content, etl_source = download_etl_file(
@@ -336,6 +408,16 @@ def sync_one(
             )
             result["etl_file_path"] = used_path
             result["etl_file_source"] = etl_source
+
+        etl_content, replaced_count = substitute_shell_vars_in_etl(
+            etl_content, metadata.shell_command
+        )
+        if replaced_count:
+            logger.info(
+                "已按 shell_command 变量替换 ETL 内容中的占位符: job=%s replacements=%d",
+                job_display_name,
+                replaced_count,
+            )
 
         result["etl_file_export_path"] = export_etl_script_snapshot(
             batch_output_dir=batch_output_dir,
@@ -438,6 +520,31 @@ def sync_one(
             result["elapsed"] = round(time.time() - t0, 1)
             return result
 
+        result["target_table"] = table_lineages[0].target.full_name
+        result["upstream_count"] = sum(len(tl.upstreams) for tl in table_lineages)
+        result["field_count"] = len(field_lineages)
+
+        existing_availability_flags = read_target_data_availability_flags(
+            table_lineages,
+            gms_url=gms_url,
+            token=gms_token,
+            platform_instance=platform_instance,
+            env=env,
+        )
+        result["data_availability_flags"] = existing_availability_flags
+        if existing_availability_flags:
+            result["status"] = "SKIP"
+            result["fail_category"] = None
+            result["error"] = (
+                "目标表已存在 Data Availability Flag，跳过 DataHub 写入: "
+                + "; ".join(
+                    f"{table}={flag}"
+                    for table, flag in sorted(existing_availability_flags.items())
+                )
+            )
+            result["elapsed"] = round(time.time() - t0, 1)
+            return result
+
         # 4. 结构化属性
         ctx = JobContext(metadata=metadata)
         ctx.runtime = parse_runtime_context(job_display_name, metadata.shell_command, etl_content, used_path)
@@ -473,10 +580,6 @@ def sync_one(
             result["error"] = "DataHub write partial failure"
         else:
             result["status"] = "OK"
-
-        result["target_table"] = table_lineages[0].target.full_name if table_lineages else None
-        result["upstream_count"] = sum(len(tl.upstreams) for tl in table_lineages)
-        result["field_count"] = len(field_lineages)
 
     except Exception as exc:
         result["status"] = "FAIL"

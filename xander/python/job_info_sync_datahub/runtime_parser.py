@@ -224,6 +224,24 @@ def job_file_name(job_path: str, kind: str) -> str:
     return f"{base}.py" if kind == "python" else f"{base}.job"
 
 
+def prefer_job_display_case_file_name(job_display_name: str, parsed_job_file_name: str, kind: str) -> str:
+    """When only case differs, prefer job_display_name-derived filename for .job lookup.
+
+    Some DMP shell_command rows are lowercased while job_display_name keeps original case.
+    If both names are equal case-insensitively, use job_display_name casing so GitLab
+    lookups can hit mixed-case filenames.
+    """
+    if kind != "job":
+        return parsed_job_file_name
+    display_name = (job_display_name or "").strip()
+    if not display_name:
+        return parsed_job_file_name
+    display_job_file_name = f"{display_name}.job"
+    if display_job_file_name.lower() == parsed_job_file_name.lower():
+        return display_job_file_name
+    return parsed_job_file_name
+
+
 def resolve_project_path(gitlab_name: str) -> str:
     """返回 GitLab ``group/project``；未映射时若 localfolder 下存在同名目录则返回空串（仅走本地源）。
 

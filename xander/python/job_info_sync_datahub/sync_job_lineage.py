@@ -58,6 +58,7 @@ from .runtime_parser import (
     get_job_dir_name,
     has_real_w_run_task,
     job_file_name,
+    prefer_job_display_case_file_name,
     parse_runtime_context,
     resolve_project_path,
 )
@@ -216,6 +217,7 @@ def run(
             project_path = resolve_project_path(gitlab_name)
             job_path, kind = extract_job_path_and_type(metadata.shell_command)
             jfn = job_file_name(job_path, kind)
+        jfn = prefer_job_display_case_file_name(job_display_name, jfn, kind)
             job_dir = get_job_dir_name(metadata.shell_command)
             candidates = candidate_gitlab_paths(job_path, jfn, job_dir)
 

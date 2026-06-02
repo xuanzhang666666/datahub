@@ -8,8 +8,10 @@ from job_info_sync_datahub.batch_sync import (
     describe_final_etl_choice,
     describe_etl_source,
     etl_file_locations,
+    extract_shell_assignments,
     export_etl_script_snapshot,
     export_llm_raw_snapshot,
+    substitute_shell_vars_in_etl,
 )
 from job_info_sync_datahub.export_lineage_excel import build_rows
 
@@ -144,3 +146,35 @@ def test_etl_file_locations_include_gitlab_and_local_paths(monkeypatch) -> None:
             "dw_sku_store_sku_inventory_history_v1.job"
         ),
     }
+
+
+def test_extract_shell_assignments_reads_export_lines() -> None:
+    shell = """
+export ORDER_PREFIX=398
+/home/w/analysis-jobs/bin/w-run-task.sh pdw_order_store/xxx_order_detail
+""".strip()
+    assert extract_shell_assignments(shell) == {"ORDER_PREFIX": "398"}
+
+
+def test_substitute_shell_vars_in_etl() -> None:
+    shell = "export ORDER_PREFIX=398"
+    etl = (
+        'TABLE_NAME="pdw_order_store_${ORDER_PREFIX}_order_detail"\n'
+        'SOURCE_TABLE_NAME="ods_order_store_${ORDER_PREFIX}_order_detail_di"\n'
+    )
+    rendered, count = substitute_shell_vars_in_etl(etl, shell)
+    assert count == 2
+    assert 'TABLE_NAME="pdw_order_store_398_order_detail"' in rendered
+    assert 'SOURCE_TABLE_NAME="ods_order_store_398_order_detail_di"' in rendered
+
+
+def test_substitute_shell_vars_in_etl_case_insensitive_var_name() -> None:
+    shell = "export ORDER_PREFIX=398"
+    etl = (
+        'TABLE_NAME="pdw_order_store_${order_prefix}_order_detail"\n'
+        'SOURCE_TABLE_NAME="ods_order_store_${order_prefix}_order_detail_di"\n'
+    )
+    rendered, count = substitute_shell_vars_in_etl(etl, shell)
+    assert count == 2
+    assert 'TABLE_NAME="pdw_order_store_398_order_detail"' in rendered
+    assert 'SOURCE_TABLE_NAME="ods_order_store_398_order_detail_di"' in rendered
