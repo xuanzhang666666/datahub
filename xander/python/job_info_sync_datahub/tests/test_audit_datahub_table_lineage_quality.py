@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 from job_info_sync_datahub.audit_datahub_table_lineage_quality import (
+    FLAG_DDL,
+    FLAG_TABLE_LINEAGE,
+    ISSUE_DOCUMENTATION_LINEAGE_MISMATCH,
     ISSUE_ETL_SCRIPT_NO_UPSTREAM,
+    ISSUE_FLAG_CLAIMS_LINEAGE_BUT_NO_UPSTREAM,
+    ISSUE_FLAG_MISSING_LINEAGE_BUT_HAS_UPSTREAM,
     ISSUE_MISSING_ETL_SCRIPT,
     ISSUE_SELF_DEPENDENCY,
     ISSUE_TARGET_NOT_IN_HIVE,
     ISSUE_UPSTREAM_DATAHUB_ENTITY_NOT_FOUND,
     ISSUE_UPSTREAM_NOT_IN_HIVE,
+    ISSUE_VIEW_DEFINITION_NO_UPSTREAM,
+    ISSUE_VIEW_FLAG_INCOMPLETE,
+    ISSUE_VIEW_MISSING_DEFINITION,
     ISSUE_VIEW_NO_UPSTREAM,
     evaluate_lineage_quality,
 )
@@ -50,6 +58,10 @@ def test_evaluate_lineage_quality_classifies_missing_and_invalid_edges() -> None
     assert result.summary["lineage_target_count"] == 1
     assert result.summary["upstream_edge_count"] == 4
     assert result.summary["issue_count"] == 4
+    assert result.summary["issue_counts_by_severity"] == {"P0": 2, "P1": 2}
+    assert result.issues[0].severity
+    assert result.issues[0].fix_hint
+    assert result.issues[0].evidence
 
 
 def test_evaluate_lineage_quality_reports_target_missing_from_hive_once() -> None:
@@ -133,3 +145,78 @@ def test_evaluate_lineage_quality_reports_required_etl_table_without_upstream() 
 
     assert [row.issue_type for row in result.issues] == [ISSUE_ETL_SCRIPT_NO_UPSTREAM]
     assert result.issues[0].target_table == "data_dw.dw_required"
+
+
+def test_evaluate_lineage_quality_reports_documentation_lineage_mismatch() -> None:
+    target = make_hive_dataset_urn("data_dm.dm_target")
+    upstream = make_hive_dataset_urn("data_ods.ods_actual")
+    description = """
+### 4. 数据来源
+
+| 表名 | 说明 |
+| --- | --- |
+| data_ods.ods_doc | 文档上游 |
+"""
+
+    result = evaluate_lineage_quality(
+        dataset_urns={target, upstream},
+        upstreams_by_target={target: [upstream]},
+        hive_existing_fqtns={"data_dm.dm_target", "data_ods.ods_actual", "data_ods.ods_doc"},
+        etl_script_dataset_urns={target},
+        documentation_by_urn={target: description},
+    )
+
+    assert ISSUE_DOCUMENTATION_LINEAGE_MISMATCH in [row.issue_type for row in result.issues]
+
+
+def test_evaluate_lineage_quality_reports_availability_flag_mismatches() -> None:
+    no_upstream = make_hive_dataset_urn("data_dm.dm_no_upstream")
+    has_upstream = make_hive_dataset_urn("data_dm.dm_has_upstream")
+    upstream = make_hive_dataset_urn("data_ods.ods_source")
+
+    result = evaluate_lineage_quality(
+        dataset_urns={no_upstream, has_upstream, upstream},
+        upstreams_by_target={has_upstream: [upstream]},
+        hive_existing_fqtns={"data_dm.dm_no_upstream", "data_dm.dm_has_upstream", "data_ods.ods_source"},
+        data_availability_flags_by_urn={
+            no_upstream: {FLAG_TABLE_LINEAGE},
+            has_upstream: {FLAG_DDL},
+        },
+        schema_field_count_by_urn={no_upstream: 1, has_upstream: 1, upstream: 1},
+    )
+
+    issue_types = [row.issue_type for row in result.issues]
+    assert ISSUE_FLAG_CLAIMS_LINEAGE_BUT_NO_UPSTREAM in issue_types
+    assert ISSUE_FLAG_MISSING_LINEAGE_BUT_HAS_UPSTREAM in issue_types
+
+
+def test_evaluate_lineage_quality_reports_view_definition_issues() -> None:
+    missing_definition = make_hive_dataset_urn("data_dw.dw_missing_definition")
+    definition_no_upstream = make_hive_dataset_urn("data_dw.dw_definition_no_upstream")
+    complete_view = make_hive_dataset_urn("data_dw.dw_complete_view")
+    upstream = make_hive_dataset_urn("data_ods.ods_source")
+
+    result = evaluate_lineage_quality(
+        dataset_urns={missing_definition, definition_no_upstream, complete_view, upstream},
+        upstreams_by_target={complete_view: [upstream]},
+        hive_existing_fqtns={
+            "data_dw.dw_missing_definition",
+            "data_dw.dw_definition_no_upstream",
+            "data_dw.dw_complete_view",
+            "data_ods.ods_source",
+        },
+        view_dataset_urns={missing_definition, definition_no_upstream, complete_view},
+        view_logic_by_urn={
+            missing_definition: "",
+            definition_no_upstream: "select * from data_ods.ods_source",
+            complete_view: "select * from data_ods.ods_source",
+        },
+        data_availability_flags_by_urn={
+            complete_view: {FLAG_DDL, FLAG_TABLE_LINEAGE},
+        },
+    )
+
+    issue_types = [row.issue_type for row in result.issues]
+    assert ISSUE_VIEW_MISSING_DEFINITION in issue_types
+    assert ISSUE_VIEW_DEFINITION_NO_UPSTREAM in issue_types
+    assert ISSUE_VIEW_FLAG_INCOMPLETE in issue_types

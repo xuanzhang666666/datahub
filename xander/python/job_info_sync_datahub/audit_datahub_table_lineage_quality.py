@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,10 +22,22 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 from .field_lineage_datahub_reader import make_hive_dataset_urn
 from .hive_table_existence import query_hive_existing_fqtns
 from .query_upstream_lineage import urn_to_table_name
-from .structured_properties import URN_ETL_SCRIPT
+from .check_dataset_availability import (
+    is_meaningful_text,
+    parse_documented_upstreams,
+)
+from .field_lineage_datahub_reader import strip_markdown_code_fence
+from .structured_properties import (
+    URN_DATA_AVAILABILITY_FLAG,
+    URN_ETL_SCRIPT,
+    sort_data_availability_flags,
+)
 
 DEFAULT_PLATFORM_INSTANCE = "blf-prod-hive"
 DEFAULT_ENV = "PROD"
+FLAG_DDL = "DDL"
+FLAG_TABLE_LINEAGE = "表血缘"
+FLAG_FIELD_LINEAGE = "字段血缘"
 
 ISSUE_TARGET_NOT_IN_HIVE = "target_not_in_hive"
 ISSUE_UPSTREAM_DATAHUB_ENTITY_NOT_FOUND = "upstream_datahub_entity_not_found"
@@ -35,6 +48,19 @@ ISSUE_NON_ODS_NO_UPSTREAM = "non_ods_no_upstream"
 ISSUE_MISSING_ETL_SCRIPT = "missing_etl_script"
 ISSUE_VIEW_NO_UPSTREAM = "view_no_upstream"
 ISSUE_ETL_SCRIPT_NO_UPSTREAM = "etl_script_no_upstream"
+ISSUE_DOCUMENTATION_MISSING_DATA_SOURCE_SECTION = "documentation_missing_data_source_section"
+ISSUE_DOCUMENTATION_SOURCE_PARSE_EMPTY = "documentation_source_parse_empty"
+ISSUE_DOCUMENTATION_LINEAGE_MISMATCH = "documentation_lineage_mismatch"
+ISSUE_DOCUMENTATION_UPSTREAM_NOT_IN_HIVE = "documentation_upstream_not_in_hive"
+ISSUE_ETL_SCRIPT_PLACEHOLDER = "etl_script_placeholder"
+ISSUE_ETL_SCRIPT_HAS_UNRESOLVED_VARS = "etl_script_has_unresolved_vars"
+ISSUE_ETL_SCRIPT_HAS_NO_DOCUMENTATION = "etl_script_has_no_documentation"
+ISSUE_FLAG_CLAIMS_LINEAGE_BUT_NO_UPSTREAM = "flag_claims_lineage_but_no_upstream"
+ISSUE_FLAG_MISSING_LINEAGE_BUT_HAS_UPSTREAM = "flag_missing_lineage_but_has_upstream"
+ISSUE_FLAG_CLAIMS_DDL_BUT_NO_SCHEMA_OR_VIEW_LOGIC = "flag_claims_ddl_but_no_schema_or_view_logic"
+ISSUE_VIEW_FLAG_INCOMPLETE = "view_flag_incomplete"
+ISSUE_VIEW_MISSING_DEFINITION = "view_missing_definition"
+ISSUE_VIEW_DEFINITION_NO_UPSTREAM = "view_definition_no_upstream"
 
 _LINEAGE_TABLE_PREFIXES_WITH_UPSTREAM = (
     "app_",
@@ -49,6 +75,31 @@ _LINEAGE_TABLE_PREFIXES_WITH_UPSTREAM = (
 _TABLE_PREFIXES_ALLOW_MISSING_ETL = ("ods", "ai", "app")
 _TABLE_PREFIXES_REQUIRE_ETL = ("dwa", "dwd", "pdim", "dim", "pdw", "mid", "dm", "dw")
 
+_ISSUE_DEFAULTS: Dict[str, tuple[str, str]] = {
+    ISSUE_TARGET_NOT_IN_HIVE: ("P0", "先确认该 DataHub dataset 是否已废弃；若仍在线，重跑 Hive ingest。"),
+    ISSUE_SELF_DEPENDENCY: ("P0", "检查 LLM/手工血缘输出，移除目标表指向自身的 upstreamLineage。"),
+    ISSUE_VIEW_NO_UPSTREAM: ("P0", "对该 view 重跑 Hive ingest/full lineage，或手工补充 upstreamLineage。"),
+    ISSUE_VIEW_DEFINITION_NO_UPSTREAM: ("P0", "view 有定义但无上游，优先用 View Definition 重建 upstreamLineage。"),
+    ISSUE_NON_ODS_NO_UPSTREAM: ("P0", "非源层表应有上游；重跑作业血缘同步或手工补血缘。"),
+    ISSUE_ETL_SCRIPT_NO_UPSTREAM: ("P1", "Etl Script 已存在但无血缘，重跑 job 血缘同步并检查 LLM/raw 报告。"),
+    ISSUE_UPSTREAM_NOT_IN_HIVE: ("P1", "确认上游表是否已下线或表名解析错误；必要时从 DataHub 血缘中移除。"),
+    ISSUE_UPSTREAM_DATAHUB_ENTITY_NOT_FOUND: ("P1", "对上游表执行 Hive ingest，或修正上游 URN。"),
+    ISSUE_UPSTREAM_NOT_HIVE_PLATFORM: ("P1", "检查上游平台/env 是否写错，保持 Hive platform instance 一致。"),
+    ISSUE_DOCUMENTATION_LINEAGE_MISMATCH: ("P1", "对齐 Documentation「4. 数据来源」与 DataHub upstreamLineage。"),
+    ISSUE_DOCUMENTATION_UPSTREAM_NOT_IN_HIVE: ("P1", "修正文档中的上游表，或先同步该 Hive 表。"),
+    ISSUE_FLAG_CLAIMS_LINEAGE_BUT_NO_UPSTREAM: ("P1", "data_availability_flag 声称有表血缘但 upstreamLineage 为空，重建血缘或修正 flag。"),
+    ISSUE_FLAG_CLAIMS_DDL_BUT_NO_SCHEMA_OR_VIEW_LOGIC: ("P1", "flag 声称有 DDL，但 schema/viewLogic 缺失，重跑 Hive ingest 或修正 flag。"),
+    ISSUE_MISSING_ETL_SCRIPT: ("P2", "按作业重跑血缘同步，写入 Etl Script structured property。"),
+    ISSUE_DOCUMENTATION_MISSING_DATA_SOURCE_SECTION: ("P2", "重跑 Documentation 生成，确保包含「4. 数据来源」小节。"),
+    ISSUE_DOCUMENTATION_SOURCE_PARSE_EMPTY: ("P2", "检查 Documentation 第 4 节表格格式，第一列应为 db.table。"),
+    ISSUE_ETL_SCRIPT_PLACEHOLDER: ("P2", "Etl Script 是占位符，重新解析调度作业并写入真实脚本。"),
+    ISSUE_ETL_SCRIPT_HAS_UNRESOLVED_VARS: ("P2", "Etl Script 仍含 ${VAR}，需要从 shell_command 参数渲染后重跑血缘。"),
+    ISSUE_ETL_SCRIPT_HAS_NO_DOCUMENTATION: ("P2", "Etl Script 已有但 Documentation 缺失，重跑文档生成任务。"),
+    ISSUE_FLAG_MISSING_LINEAGE_BUT_HAS_UPSTREAM: ("P2", "已有 upstreamLineage 但 flag 缺表血缘，重跑 availability flag 更新。"),
+    ISSUE_VIEW_FLAG_INCOMPLETE: ("P2", "view 已有 View Definition 与上游，更新 flag 为 DDL/表血缘/字段血缘。"),
+    ISSUE_VIEW_MISSING_DEFINITION: ("P2", "对该 view 执行 Hive ingest full 模式，补齐 viewProperties.viewLogic。"),
+}
+
 
 @dataclass(frozen=True)
 class QualityIssue:
@@ -59,6 +110,22 @@ class QualityIssue:
     upstream_urn: str = ""
     reason: str = ""
     detail: str = ""
+    severity: str = ""
+    fix_hint: str = ""
+    evidence: str = ""
+
+    def __post_init__(self) -> None:
+        severity, fix_hint = _ISSUE_DEFAULTS.get(
+            self.issue_type,
+            ("P3", "根据 issue_type 检查对应 DataHub aspect 并修复。"),
+        )
+        if not self.severity:
+            object.__setattr__(self, "severity", severity)
+        if not self.fix_hint:
+            object.__setattr__(self, "fix_hint", fix_hint)
+        if not self.evidence:
+            evidence = self.detail or self.upstream_urn or self.target_urn
+            object.__setattr__(self, "evidence", evidence)
 
 
 @dataclass(frozen=True)
@@ -123,6 +190,98 @@ def _has_meaningful_etl_script(metadata: str) -> bool:
     return False
 
 
+def _has_meaningful_etl_script_value(etl_script: str) -> bool:
+    stripped = strip_markdown_code_fence(etl_script or "").strip()
+    return is_meaningful_text(etl_script) and stripped != "无"
+
+
+def _metadata_aspect(metadata: str) -> Dict[str, Any]:
+    try:
+        payload = json.loads(metadata)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    value = payload.get("value")
+    return value if isinstance(value, dict) else payload
+
+
+def _first_string_value(prop: Mapping[str, Any]) -> str:
+    values = prop.get("values")
+    if not isinstance(values, list):
+        return ""
+    for item in values:
+        if isinstance(item, dict):
+            text = item.get("string")
+        else:
+            text = item
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""
+
+
+def _all_string_values(prop: Mapping[str, Any]) -> List[str]:
+    values = prop.get("values")
+    if not isinstance(values, list):
+        return []
+    out: List[str] = []
+    for item in values:
+        if isinstance(item, dict):
+            text = item.get("string")
+        else:
+            text = item
+        if isinstance(text, str) and text.strip():
+            out.append(text.strip())
+    return out
+
+
+def _structured_property_values(metadata: str) -> Dict[str, List[str]]:
+    aspect = _metadata_aspect(metadata)
+    props = aspect.get("properties")
+    if not isinstance(props, list):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for prop in props:
+        if not isinstance(prop, dict):
+            continue
+        urn = prop.get("propertyUrn")
+        if isinstance(urn, str) and urn:
+            out[urn] = _all_string_values(prop)
+    return out
+
+
+def _extract_etl_script(metadata: str) -> str:
+    values = _structured_property_values(metadata).get(URN_ETL_SCRIPT, [])
+    return values[0] if values else ""
+
+
+def _extract_data_availability_flags(metadata: str) -> Set[str]:
+    values = _structured_property_values(metadata).get(URN_DATA_AVAILABILITY_FLAG, [])
+    return set(sort_data_availability_flags(values))
+
+
+def _extract_editable_description(metadata: str) -> str:
+    aspect = _metadata_aspect(metadata)
+    description = aspect.get("description")
+    return description if isinstance(description, str) else ""
+
+
+def _extract_view_logic(metadata: str) -> str:
+    aspect = _metadata_aspect(metadata)
+    view_logic = aspect.get("viewLogic")
+    return view_logic if isinstance(view_logic, str) else ""
+
+
+def _extract_schema_field_count(metadata: str) -> int:
+    aspect = _metadata_aspect(metadata)
+    fields = aspect.get("fields")
+    return len(fields) if isinstance(fields, list) else 0
+
+
+def _contains_unresolved_shell_vars(text: str) -> bool:
+    return bool(re.search(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*\b", text or ""))
+
+
 def _collect_needed_hive_tables(
     dataset_urns: Set[str],
     upstreams_by_target: Mapping[str, Sequence[str]],
@@ -141,6 +300,18 @@ def _collect_needed_hive_tables(
     return {x for x in needed if "." in x}
 
 
+def _collect_documented_hive_tables(documentation_by_urn: Mapping[str, str]) -> Set[str]:
+    needed: Set[str] = set()
+    for description in documentation_by_urn.values():
+        section_found, upstreams = parse_documented_upstreams(description)
+        if not section_found:
+            continue
+        for upstream in upstreams:
+            if "." in upstream:
+                needed.add(upstream.lower())
+    return needed
+
+
 def evaluate_lineage_quality(
     dataset_urns: Set[str],
     upstreams_by_target: Mapping[str, Sequence[str]],
@@ -152,18 +323,44 @@ def evaluate_lineage_quality(
     check_datahub_entity_existence: bool = True,
     view_dataset_urns: Optional[Set[str]] = None,
     etl_script_dataset_urns: Optional[Set[str]] = None,
+    documentation_by_urn: Optional[Mapping[str, str]] = None,
+    data_availability_flags_by_urn: Optional[Mapping[str, Set[str]]] = None,
+    view_logic_by_urn: Optional[Mapping[str, str]] = None,
+    schema_field_count_by_urn: Optional[Mapping[str, int]] = None,
+    etl_script_by_urn: Optional[Mapping[str, str]] = None,
 ) -> AuditResult:
     """Classify lineage quality issues from already fetched DataHub/Hive facts."""
     normalized_dataset_urns = {urn.strip() for urn in dataset_urns if urn and urn.strip()}
     normalized_hive = {name.strip().lower() for name in hive_existing_fqtns if name.strip()}
     normalized_views = {urn.strip() for urn in (view_dataset_urns or set()) if urn and urn.strip()}
     normalized_etl = {urn.strip() for urn in (etl_script_dataset_urns or set()) if urn and urn.strip()}
+    has_documentation_facts = documentation_by_urn is not None
+    has_flag_facts = data_availability_flags_by_urn is not None
+    has_view_logic_facts = view_logic_by_urn is not None
+    has_schema_facts = schema_field_count_by_urn is not None
+    has_etl_script_values = etl_script_by_urn is not None
+    documentation = documentation_by_urn or {}
+    data_flags = data_availability_flags_by_urn or {}
+    view_logic = view_logic_by_urn or {}
+    schema_field_counts = schema_field_count_by_urn or {}
+    etl_scripts = etl_script_by_urn or {}
     issues: List[QualityIssue] = []
     upstream_edge_count = 0
 
     for target_urn in sorted(normalized_dataset_urns):
         target_table = urn_to_table_name(target_urn, platform_instance).lower()
         upstreams = list(upstreams_by_target.get(target_urn, []))
+        upstream_tables = {
+            urn_to_table_name(upstream_urn, platform_instance).lower()
+            for upstream_urn in upstreams
+            if _is_hive_dataset_urn(upstream_urn, platform_instance, env)
+        }
+        target_is_view = target_urn in normalized_views
+        target_has_upstream = bool(upstreams)
+        target_flags = data_flags.get(target_urn, set())
+        target_view_logic = view_logic.get(target_urn, "")
+        target_schema_field_count = schema_field_counts.get(target_urn, 0)
+        target_etl_script = etl_scripts.get(target_urn, "")
 
         if target_table not in normalized_hive:
             issues.append(
@@ -177,7 +374,7 @@ def evaluate_lineage_quality(
 
         if (
             etl_script_dataset_urns is not None
-            and target_urn not in normalized_views
+            and not target_is_view
             and _should_expect_etl_script(target_table)
             and target_urn not in normalized_etl
         ):
@@ -191,7 +388,7 @@ def evaluate_lineage_quality(
                 )
             )
 
-        if target_urn in normalized_views and not upstreams:
+        if target_is_view and not upstreams:
             issues.append(
                 QualityIssue(
                     issue_type=ISSUE_VIEW_NO_UPSTREAM,
@@ -203,7 +400,7 @@ def evaluate_lineage_quality(
 
         if (
             etl_script_dataset_urns is not None
-            and target_urn not in normalized_views
+            and not target_is_view
             and target_urn in normalized_etl
             and not upstreams
             and _should_expect_etl_script(target_table)
@@ -225,6 +422,193 @@ def evaluate_lineage_quality(
                     target_table=target_table,
                     target_urn=target_urn,
                     reason="非 ODS/源层表没有 DataHub 表级上游血缘",
+                )
+            )
+
+        if target_is_view and has_view_logic_facts:
+            if not is_meaningful_text(target_view_logic):
+                issues.append(
+                    QualityIssue(
+                        issue_type=ISSUE_VIEW_MISSING_DEFINITION,
+                        target_table=target_table,
+                        target_urn=target_urn,
+                        reason="view dataset 缺少 View Definition（viewProperties.viewLogic 为空）",
+                        detail="viewProperties.viewLogic",
+                    )
+                )
+            elif not target_has_upstream:
+                issues.append(
+                    QualityIssue(
+                        issue_type=ISSUE_VIEW_DEFINITION_NO_UPSTREAM,
+                        target_table=target_table,
+                        target_urn=target_urn,
+                        reason="view 有 View Definition，但没有 DataHub 表级上游血缘",
+                        detail="viewProperties.viewLogic 已填写；upstreamLineage.upstreams 为空",
+                    )
+                )
+
+        if has_etl_script_values and target_etl_script:
+            stripped_etl = strip_markdown_code_fence(target_etl_script).strip()
+            if not is_meaningful_text(target_etl_script) or stripped_etl == "无":
+                issues.append(
+                    QualityIssue(
+                        issue_type=ISSUE_ETL_SCRIPT_PLACEHOLDER,
+                        target_table=target_table,
+                        target_urn=target_urn,
+                        reason="Etl Script 内容为空或为占位符",
+                        detail=f"Etl Script={stripped_etl[:100]!r}",
+                    )
+                )
+            elif _contains_unresolved_shell_vars(stripped_etl):
+                issues.append(
+                    QualityIssue(
+                        issue_type=ISSUE_ETL_SCRIPT_HAS_UNRESOLVED_VARS,
+                        target_table=target_table,
+                        target_urn=target_urn,
+                        reason="Etl Script 中仍存在未替换 shell 变量，可能导致 LLM 解析出无效表名",
+                        detail="检测到 ${VAR} 或 $VAR",
+                    )
+                )
+            if has_documentation_facts and not is_meaningful_text(documentation.get(target_urn, "")):
+                issues.append(
+                    QualityIssue(
+                        issue_type=ISSUE_ETL_SCRIPT_HAS_NO_DOCUMENTATION,
+                        target_table=target_table,
+                        target_urn=target_urn,
+                        reason="Etl Script 有有效内容，但 Documentation 为空",
+                        detail="editableDatasetProperties.description",
+                    )
+                )
+
+        description = documentation.get(target_urn, "")
+        if (
+            has_documentation_facts
+            and description
+            and not target_is_view
+            and (target_urn in normalized_etl or _should_expect_etl_script(target_table))
+        ):
+            section_found, documented_upstreams = parse_documented_upstreams(description)
+            if not section_found:
+                issues.append(
+                    QualityIssue(
+                        issue_type=ISSUE_DOCUMENTATION_MISSING_DATA_SOURCE_SECTION,
+                        target_table=target_table,
+                        target_urn=target_urn,
+                        reason="Documentation 缺少「4. 数据来源」小节",
+                        detail='editableDatasetProperties.description / "4. 数据来源"',
+                    )
+                )
+            elif not documented_upstreams:
+                issues.append(
+                    QualityIssue(
+                        issue_type=ISSUE_DOCUMENTATION_SOURCE_PARSE_EMPTY,
+                        target_table=target_table,
+                        target_urn=target_urn,
+                        reason="Documentation「4. 数据来源」存在但未解析到上游表",
+                        detail='第 4 节第一列应填写 `db.table`',
+                    )
+                )
+            else:
+                documented_norm = {item.lower() for item in documented_upstreams}
+                missing_in_lineage = sorted(documented_norm - upstream_tables)
+                extra_in_lineage = sorted(upstream_tables - documented_norm)
+                if not target_has_upstream:
+                    issues.append(
+                        QualityIssue(
+                            issue_type=ISSUE_DOCUMENTATION_LINEAGE_MISMATCH,
+                            target_table=target_table,
+                            target_urn=target_urn,
+                            reason="Documentation 写了上游表，但 DataHub upstreamLineage 为空",
+                            detail=f"documented={missing_in_lineage[:20]}",
+                            evidence=json.dumps(
+                                {"documented": missing_in_lineage[:50], "lineage": []},
+                                ensure_ascii=False,
+                            ),
+                        )
+                    )
+                elif missing_in_lineage or extra_in_lineage:
+                    issues.append(
+                        QualityIssue(
+                            issue_type=ISSUE_DOCUMENTATION_LINEAGE_MISMATCH,
+                            target_table=target_table,
+                            target_urn=target_urn,
+                            reason="Documentation「4. 数据来源」与 DataHub upstreamLineage 不一致",
+                            detail=f"missing={missing_in_lineage[:10]} extra={extra_in_lineage[:10]}",
+                            evidence=json.dumps(
+                                {
+                                    "missing_in_lineage": missing_in_lineage[:50],
+                                    "extra_in_lineage": extra_in_lineage[:50],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                    )
+                for documented_table in sorted(documented_norm):
+                    if "." in documented_table and documented_table not in normalized_hive:
+                        issues.append(
+                            QualityIssue(
+                                issue_type=ISSUE_DOCUMENTATION_UPSTREAM_NOT_IN_HIVE,
+                                target_table=target_table,
+                                upstream_table=documented_table,
+                                target_urn=target_urn,
+                                reason="Documentation「4. 数据来源」中的上游表在 Hive information_schema 中不存在",
+                            )
+                        )
+
+        if has_flag_facts and FLAG_TABLE_LINEAGE in target_flags and not target_has_upstream:
+            issues.append(
+                QualityIssue(
+                    issue_type=ISSUE_FLAG_CLAIMS_LINEAGE_BUT_NO_UPSTREAM,
+                    target_table=target_table,
+                    target_urn=target_urn,
+                    reason="data_availability_flag 包含「表血缘」，但 upstreamLineage 为空",
+                    detail=f"flags={sorted(target_flags)}",
+                )
+            )
+        if has_flag_facts and FLAG_TABLE_LINEAGE not in target_flags and target_has_upstream:
+            issues.append(
+                QualityIssue(
+                    issue_type=ISSUE_FLAG_MISSING_LINEAGE_BUT_HAS_UPSTREAM,
+                    target_table=target_table,
+                    target_urn=target_urn,
+                    reason="DataHub 已有上游血缘，但 data_availability_flag 缺少「表血缘」",
+                    detail=f"flags={sorted(target_flags)} upstream_count={len(upstreams)}",
+                )
+            )
+        if has_flag_facts and FLAG_DDL in target_flags:
+            has_ddl = (
+                is_meaningful_text(target_view_logic)
+                if target_is_view
+                else target_schema_field_count > 0
+            )
+            if (
+                (target_is_view and has_view_logic_facts)
+                or (not target_is_view and has_schema_facts)
+            ) and not has_ddl:
+                issues.append(
+                    QualityIssue(
+                        issue_type=ISSUE_FLAG_CLAIMS_DDL_BUT_NO_SCHEMA_OR_VIEW_LOGIC,
+                        target_table=target_table,
+                        target_urn=target_urn,
+                        reason="data_availability_flag 包含 DDL，但 schemaMetadata/viewLogic 不完整",
+                        detail=f"schema_fields={target_schema_field_count} viewLogic_len={len(target_view_logic)}",
+                    )
+                )
+        if (
+            has_flag_facts
+            and has_view_logic_facts
+            and target_is_view
+            and is_meaningful_text(target_view_logic)
+            and target_has_upstream
+            and not {FLAG_DDL, FLAG_TABLE_LINEAGE, FLAG_FIELD_LINEAGE}.issubset(target_flags)
+        ):
+            issues.append(
+                QualityIssue(
+                    issue_type=ISSUE_VIEW_FLAG_INCOMPLETE,
+                    target_table=target_table,
+                    target_urn=target_urn,
+                    reason="view 已有 View Definition 和上游血缘，但 data_availability_flag 未标齐三项",
+                    detail=f"flags={sorted(target_flags)}",
                 )
             )
 
@@ -285,16 +669,25 @@ def evaluate_lineage_quality(
                 )
 
     issue_counts = Counter(issue.issue_type for issue in issues)
+    severity_counts = Counter(issue.severity for issue in issues)
     summary: Dict[str, Any] = {
         "scanned_dataset_count": len(normalized_dataset_urns),
         "lineage_target_count": len(upstreams_by_target),
         "upstream_edge_count": upstream_edge_count,
         "issue_count": len(issues),
         "issue_counts_by_type": dict(sorted(issue_counts.items())),
+        "issue_counts_by_severity": dict(sorted(severity_counts.items())),
         "datahub_entity_existence_check_complete": check_datahub_entity_existence,
         "etl_script_presence_check_complete": etl_script_dataset_urns is not None,
+        "documentation_check_complete": documentation_by_urn is not None,
+        "availability_flag_check_complete": data_availability_flags_by_urn is not None,
+        "view_definition_check_complete": view_logic_by_urn is not None,
+        "schema_metadata_check_complete": schema_field_count_by_urn is not None,
         "view_dataset_count": len(normalized_views),
         "dataset_with_etl_script_count": len(normalized_etl),
+        "dataset_with_documentation_count": len(documentation),
+        "dataset_with_availability_flag_count": len(data_flags),
+        "dataset_with_view_definition_count": sum(1 for value in view_logic.values() if is_meaningful_text(value)),
     }
     return AuditResult(summary=summary, issues=issues)
 
@@ -402,6 +795,77 @@ def fetch_etl_script_dataset_urns_from_mysql(platform_instance: str, env: str) -
     return out
 
 
+def fetch_structured_properties_from_mysql(
+    platform_instance: str,
+    env: str,
+) -> tuple[Dict[str, str], Dict[str, Set[str]]]:
+    sql = (
+        "select urn, metadata "
+        "from metadata_aspect_v2 "
+        "where aspect='structuredProperties' "
+        "and version=0 "
+        "and urn like 'urn:li:dataset:(urn:li:dataPlatform:hive,"
+        f"{platform_instance}.%,{env})'"
+    )
+    etl_by_urn: Dict[str, str] = {}
+    flags_by_urn: Dict[str, Set[str]] = {}
+    for urn, metadata in _parse_tab_rows(_run_mysql_query(sql), 2):
+        etl_script = _extract_etl_script(metadata)
+        if etl_script:
+            etl_by_urn[urn] = etl_script
+        flags = _extract_data_availability_flags(metadata)
+        if flags:
+            flags_by_urn[urn] = flags
+    return etl_by_urn, flags_by_urn
+
+
+def fetch_documentation_from_mysql(platform_instance: str, env: str) -> Dict[str, str]:
+    sql = (
+        "select urn, metadata "
+        "from metadata_aspect_v2 "
+        "where aspect='editableDatasetProperties' "
+        "and version=0 "
+        "and urn like 'urn:li:dataset:(urn:li:dataPlatform:hive,"
+        f"{platform_instance}.%,{env})'"
+    )
+    out: Dict[str, str] = {}
+    for urn, metadata in _parse_tab_rows(_run_mysql_query(sql), 2):
+        description = _extract_editable_description(metadata)
+        if description:
+            out[urn] = description
+    return out
+
+
+def fetch_view_logic_from_mysql(platform_instance: str, env: str) -> Dict[str, str]:
+    sql = (
+        "select urn, metadata "
+        "from metadata_aspect_v2 "
+        "where aspect='viewProperties' "
+        "and version=0 "
+        "and urn like 'urn:li:dataset:(urn:li:dataPlatform:hive,"
+        f"{platform_instance}.%,{env})'"
+    )
+    out: Dict[str, str] = {}
+    for urn, metadata in _parse_tab_rows(_run_mysql_query(sql), 2):
+        out[urn] = _extract_view_logic(metadata)
+    return out
+
+
+def fetch_schema_field_counts_from_mysql(platform_instance: str, env: str) -> Dict[str, int]:
+    sql = (
+        "select urn, metadata "
+        "from metadata_aspect_v2 "
+        "where aspect='schemaMetadata' "
+        "and version=0 "
+        "and urn like 'urn:li:dataset:(urn:li:dataPlatform:hive,"
+        f"{platform_instance}.%,{env})'"
+    )
+    out: Dict[str, int] = {}
+    for urn, metadata in _parse_tab_rows(_run_mysql_query(sql), 2):
+        out[urn] = _extract_schema_field_count(metadata)
+    return out
+
+
 def _make_graph(gms_url: str, token: Optional[str]) -> Any:
     try:
         from datahub.ingestion.graph.client import DataHubGraph, DatahubClientConfig
@@ -492,11 +956,14 @@ def write_xlsx(path: Path, result: AuditResult) -> None:
 
     ws_issues = wb.create_sheet("issues")
     headers = [
+        "优先级",
         "问题类型",
         "目标表",
         "上游表",
         "原因",
         "明细",
+        "修复建议",
+        "证据",
         "目标URN",
         "上游URN",
     ]
@@ -504,11 +971,14 @@ def write_xlsx(path: Path, result: AuditResult) -> None:
     for issue in result.issues:
         ws_issues.append(
             [
+                issue.severity,
                 issue.issue_type,
                 issue.target_table,
                 issue.upstream_table,
                 issue.reason,
                 issue.detail,
+                issue.fix_hint,
+                issue.evidence,
                 issue.target_urn,
                 issue.upstream_urn,
             ]
@@ -563,15 +1033,31 @@ def run(
 
     try:
         view_dataset_urns = fetch_view_dataset_urns_from_mysql(platform_instance, env)
-        etl_script_dataset_urns = fetch_etl_script_dataset_urns_from_mysql(platform_instance, env)
+        etl_script_by_urn, data_availability_flags_by_urn = fetch_structured_properties_from_mysql(
+            platform_instance,
+            env,
+        )
+        etl_script_dataset_urns = {
+            urn for urn, etl_script in etl_script_by_urn.items() if _has_meaningful_etl_script_value(etl_script)
+        }
+        documentation_by_urn = fetch_documentation_from_mysql(platform_instance, env)
+        view_logic_by_urn = fetch_view_logic_from_mysql(platform_instance, env)
+        schema_field_count_by_urn = fetch_schema_field_counts_from_mysql(platform_instance, env)
         print(
-            f"[INFO] Etl Script 结构化属性检查: views={len(view_dataset_urns)} "
-            f"datasets_with_etl_script={len(etl_script_dataset_urns)}"
+            f"[INFO] MySQL aspect 检查: views={len(view_dataset_urns)} "
+            f"datasets_with_etl_script={len(etl_script_dataset_urns)} "
+            f"documentation={len(documentation_by_urn)} flags={len(data_availability_flags_by_urn)} "
+            f"view_logic={len(view_logic_by_urn)} schema={len(schema_field_count_by_urn)}"
         )
     except Exception as exc:
-        print(f"[WARN] Etl Script 结构化属性检查准备失败，跳过该检查: {exc}", file=sys.stderr)
+        print(f"[WARN] MySQL aspect 检查准备失败，跳过增强检查: {exc}", file=sys.stderr)
         view_dataset_urns = None
         etl_script_dataset_urns = None
+        etl_script_by_urn = None
+        data_availability_flags_by_urn = None
+        documentation_by_urn = None
+        view_logic_by_urn = None
+        schema_field_count_by_urn = None
 
     needed_hive_tables = _collect_needed_hive_tables(
         dataset_urns,
@@ -579,6 +1065,8 @@ def run(
         platform_instance,
         env,
     )
+    if documentation_by_urn is not None:
+        needed_hive_tables.update(_collect_documented_hive_tables(documentation_by_urn))
     print(f"[INFO] Hive information_schema 待校验表数量: {len(needed_hive_tables)}")
     hive_existing = query_hive_existing_fqtns(needed_hive_tables, chunk_size=hive_chunk_size)
     print(f"[INFO] Hive information_schema 存在表数量: {len(hive_existing)}")
@@ -593,6 +1081,11 @@ def run(
         check_datahub_entity_existence=max_datasets <= 0,
         view_dataset_urns=view_dataset_urns,
         etl_script_dataset_urns=etl_script_dataset_urns,
+        documentation_by_urn=documentation_by_urn,
+        data_availability_flags_by_urn=data_availability_flags_by_urn,
+        view_logic_by_urn=view_logic_by_urn,
+        schema_field_count_by_urn=schema_field_count_by_urn,
+        etl_script_by_urn=etl_script_by_urn,
     )
     write_jsonl(jsonl_path, result)
     write_xlsx(xlsx_path, result)

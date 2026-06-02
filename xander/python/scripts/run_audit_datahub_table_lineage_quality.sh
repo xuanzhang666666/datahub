@@ -69,11 +69,28 @@ fi
 if [[ "${CHECK_NO_UPSTREAM:-0}" == "1" ]]; then
     EXTRA_ARGS+=(--include-no-upstream)
 fi
+EXTRA_ARGS+=(--query "${LINEAGE_QUALITY_QUERY:-*}")
+EXTRA_ARGS+=(--batch-size "${BATCH_SIZE:-2000}")
+EXTRA_ARGS+=(--max-datasets "${MAX_DATASETS:-0}")
+EXTRA_ARGS+=(--hive-chunk-size "${HIVE_CHUNK_SIZE:-1000}")
+if [[ -n "${BLF_DATAHUB_PLATFORM_INSTANCE:-}" ]]; then
+    EXTRA_ARGS+=(--platform-instance "$BLF_DATAHUB_PLATFORM_INSTANCE")
+fi
+if [[ -n "${DATAHUB_ENV:-}" ]]; then
+    EXTRA_ARGS+=(--env "$DATAHUB_ENV")
+fi
 
 echo "[INFO] audit DataHub table lineage quality started at $(date -Iseconds)"
 echo "[INFO] gms url: $GMS_URL"
 echo "[INFO] report dir: $REPORT_DIR"
 echo "[INFO] python: $PYTHON"
+echo "[INFO] query: ${LINEAGE_QUALITY_QUERY:-*}"
+echo "[INFO] batch_size: ${BATCH_SIZE:-2000}"
+echo "[INFO] max_datasets: ${MAX_DATASETS:-0}"
+echo "[INFO] hive_chunk_size: ${HIVE_CHUNK_SIZE:-1000}"
+echo "[INFO] check_no_upstream: ${CHECK_NO_UPSTREAM:-0}"
+echo "[INFO] platform_instance: ${BLF_DATAHUB_PLATFORM_INSTANCE:-blf-prod-hive}"
+echo "[INFO] env: ${DATAHUB_ENV:-PROD}"
 echo "[INFO] ----------------------------------------"
 
 (
