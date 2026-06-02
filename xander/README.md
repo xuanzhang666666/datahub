@@ -97,7 +97,7 @@ sh /data/datahub/scripts/run_jenkins_hive_table_ingest_from_jobs.sh
 | `in/`                           | Hive 表清单 **xlsx 输入**（与线上 `/data/datahub/in/` 对应，见 `[in/README.md](in/README.md)`） |
 | `recipes/`                      | 参考用 Hive ingest YAML                                                              |
 | `archive/`                      | 已下线脚本、旧文档、gms-es 实验、迁出的单测等（见 `[archive/README.md](archive/README.md)`）            |
-| `docs/`                         | 方案调研（如 [自环表级血缘计划](docs/datahub-self-loop-lineage-plan.md)，**已搁置**）                    |
+| `docs/`                         | 方案调研（如 [自环表级血缘计划](plans/datahub-self-loop-lineage-plan.md)，**已搁置**）                    |
 
 
 ## 兼容根脚本
