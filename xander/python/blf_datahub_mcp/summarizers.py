@@ -11,8 +11,36 @@ URN_SCHEDULE_URL = "urn:li:structuredProperty:blf.data.schedule.schedule_url"
 URN_DATA_AVAILABILITY_FLAG = (
     "urn:li:structuredProperty:blf.data.warehouse.data_availability_flag"
 )
+URN_OTHER_REMARK = "urn:li:structuredProperty:blf.data.warehouse.other_remark"
 
 DATA_AVAILABILITY_FLAG_ORDER = ("DDL", "表血缘", "字段血缘")
+STRUCTURED_PROPERTY_DEFINITIONS: dict[str, dict[str, Any]] = {
+    "etl_script": {
+        "urn": URN_ETL_SCRIPT,
+        "display_name": "Etl Script",
+        "strip_code_fence": True,
+    },
+    "execute_shell": {
+        "urn": URN_EXECUTE_SHELL,
+        "display_name": "Execute Shell",
+        "strip_code_fence": True,
+    },
+    "schedule_url": {
+        "urn": URN_SCHEDULE_URL,
+        "display_name": "Schedule URL",
+        "strip_code_fence": False,
+    },
+    "data_availability_flag": {
+        "urn": URN_DATA_AVAILABILITY_FLAG,
+        "display_name": "Data Availability Flag",
+        "strip_code_fence": False,
+    },
+    "other_remark": {
+        "urn": URN_OTHER_REMARK,
+        "display_name": "Other Remark",
+        "strip_code_fence": False,
+    },
+}
 
 _CODE_FENCE_RE = re.compile(r"^\s*```[^\n`]*\n(?P<body>[\s\S]*?)\n?```\s*$")
 _TABLE_REF_RE = re.compile(
@@ -85,6 +113,91 @@ def first_string_value(assignment: dict[str, Any]) -> str:
 
 def extract_structured_properties(payload: dict[str, Any]) -> dict[str, Any]:
     """Extract known BLF structured properties into a compact dict."""
+    all_properties = extract_all_structured_properties(payload)
+    etl_script = all_properties["known"]["etl_script"]["first_value"]
+    execute_shell = all_properties["known"]["execute_shell"]["first_value"]
+    flags = sort_data_availability_flags(
+        all_properties["known"]["data_availability_flag"]["values"]
+    )
+    schedule_url = all_properties["known"]["schedule_url"]["first_value"]
+    other_remark = all_properties["known"]["other_remark"]["first_value"]
+    return {
+        "etl_script": etl_script,
+        "execute_shell": execute_shell,
+        "data_availability_flags": flags,
+        "schedule_url": schedule_url,
+        "other_remark": other_remark,
+        "known_properties": all_properties["known"],
+        "raw_property_urns": all_properties["raw_property_urns"],
+    }
+
+
+def extract_all_structured_properties(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extract every known BLF structured property and preserve unknown URNs."""
+    by_urn = _structured_properties_by_urn(payload)
+    known: dict[str, dict[str, Any]] = {}
+    for name, definition in STRUCTURED_PROPERTY_DEFINITIONS.items():
+        urn = str(definition["urn"])
+        raw_values = by_urn.get(urn, [])
+        values = [
+            strip_markdown_code_fence(value)
+            if definition.get("strip_code_fence")
+            else value.strip()
+            for value in raw_values
+        ]
+        known[name] = {
+            "property_name": name,
+            "property_urn": urn,
+            "display_name": definition["display_name"],
+            "values": values,
+            "first_value": values[0] if values else "",
+            "exists": bool(values),
+            "raw_value_count": len(raw_values),
+        }
+    known_urns = {
+        str(item["urn"]) for item in STRUCTURED_PROPERTY_DEFINITIONS.values()
+    }
+    unknown_urns = sorted(set(by_urn) - known_urns)
+    return {
+        "known": known,
+        "unknown": {urn: by_urn[urn] for urn in unknown_urns},
+        "raw_property_urns": sorted(by_urn),
+    }
+
+
+def normalize_structured_property_name(property_name: str) -> str:
+    """Normalize a user/tool property name or URN to a known BLF property key."""
+    token = (property_name or "").strip()
+    aliases = {
+        "etl": "etl_script",
+        "script": "etl_script",
+        "shell": "execute_shell",
+        "execute": "execute_shell",
+        "schedule": "schedule_url",
+        "url": "schedule_url",
+        "availability": "data_availability_flag",
+        "availability_flag": "data_availability_flag",
+        "data_availability_flags": "data_availability_flag",
+        "flag": "data_availability_flag",
+        "remark": "other_remark",
+        "other": "other_remark",
+    }
+    if token in STRUCTURED_PROPERTY_DEFINITIONS:
+        return token
+    if token in aliases:
+        return aliases[token]
+    for name, definition in STRUCTURED_PROPERTY_DEFINITIONS.items():
+        if token == definition["urn"]:
+            return name
+        if token.endswith(str(definition["urn"]).split(":")[-1]):
+            return name
+    raise ValueError(
+        "property_name must be one of: "
+        + ", ".join(sorted(STRUCTURED_PROPERTY_DEFINITIONS))
+    )
+
+
+def _structured_properties_by_urn(payload: dict[str, Any]) -> dict[str, list[str]]:
     by_urn: dict[str, list[str]] = {}
     for assignment in iter_structured_property_assignments(payload):
         property_urn = assignment.get("propertyUrn")
@@ -99,22 +212,7 @@ def extract_structured_properties(payload: dict[str, Any]) -> dict[str, Any]:
                 elif isinstance(value, str):
                     values.append(value)
         by_urn[property_urn] = values
-
-    etl_script = strip_markdown_code_fence(
-        by_urn.get(URN_ETL_SCRIPT, [""])[0] if by_urn.get(URN_ETL_SCRIPT) else ""
-    )
-    execute_shell = strip_markdown_code_fence(
-        by_urn.get(URN_EXECUTE_SHELL, [""])[0] if by_urn.get(URN_EXECUTE_SHELL) else ""
-    )
-    flags = sort_data_availability_flags(by_urn.get(URN_DATA_AVAILABILITY_FLAG, []))
-    schedule_url = by_urn.get(URN_SCHEDULE_URL, [""])[0] if by_urn.get(URN_SCHEDULE_URL) else ""
-    return {
-        "etl_script": etl_script,
-        "execute_shell": execute_shell,
-        "data_availability_flags": flags,
-        "schedule_url": schedule_url,
-        "raw_property_urns": sorted(by_urn),
-    }
+    return by_urn
 
 
 def extract_table_refs(text: str, limit: int = 30) -> list[str]:
@@ -205,4 +303,3 @@ def governance_gaps(
         if flag not in flags:
             gaps.append(f"availability flag 缺少 {flag}")
     return gaps
-

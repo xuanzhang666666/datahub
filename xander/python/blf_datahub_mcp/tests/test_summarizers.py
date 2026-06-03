@@ -4,9 +4,13 @@ from blf_datahub_mcp.summarizers import (
     URN_DATA_AVAILABILITY_FLAG,
     URN_ETL_SCRIPT,
     URN_EXECUTE_SHELL,
+    URN_OTHER_REMARK,
+    URN_SCHEDULE_URL,
+    extract_all_structured_properties,
     extract_structured_properties,
     extract_table_refs,
     governance_gaps,
+    normalize_structured_property_name,
     strip_markdown_code_fence,
 )
 
@@ -32,6 +36,14 @@ def test_extract_structured_properties() -> None:
                         "propertyUrn": URN_DATA_AVAILABILITY_FLAG,
                         "values": [{"string": "表血缘"}, {"string": "DDL"}],
                     },
+                    {
+                        "propertyUrn": URN_SCHEDULE_URL,
+                        "values": [{"string": "https://schedule/job/a"}],
+                    },
+                    {
+                        "propertyUrn": URN_OTHER_REMARK,
+                        "values": [{"string": "owner remark"}],
+                    },
                 ]
             }
         }
@@ -42,6 +54,38 @@ def test_extract_structured_properties() -> None:
     assert result["etl_script"] == "select * from ods.t"
     assert result["execute_shell"] == "sh run.sh"
     assert result["data_availability_flags"] == ["DDL", "表血缘"]
+    assert result["schedule_url"] == "https://schedule/job/a"
+    assert result["other_remark"] == "owner remark"
+
+
+def test_extract_all_structured_properties_keeps_known_and_unknown() -> None:
+    payload = {
+        "structuredProperties": {
+            "value": {
+                "properties": [
+                    {
+                        "propertyUrn": URN_ETL_SCRIPT,
+                        "values": [{"string": "```sql\nselect 1\n```"}],
+                    },
+                    {
+                        "propertyUrn": "urn:li:structuredProperty:custom.extra",
+                        "values": [{"string": "x"}],
+                    },
+                ]
+            }
+        }
+    }
+
+    result = extract_all_structured_properties(payload)
+
+    assert result["known"]["etl_script"]["first_value"] == "select 1"
+    assert result["known"]["execute_shell"]["exists"] is False
+    assert result["unknown"] == {"urn:li:structuredProperty:custom.extra": ["x"]}
+
+
+def test_normalize_structured_property_name_accepts_aliases_and_urns() -> None:
+    assert normalize_structured_property_name("shell") == "execute_shell"
+    assert normalize_structured_property_name(URN_OTHER_REMARK) == "other_remark"
 
 
 def test_extract_table_refs() -> None:
@@ -63,4 +107,3 @@ def test_governance_gaps_reports_missing_availability() -> None:
 
     assert "availability flag 缺少 表血缘" in gaps
     assert "availability flag 缺少 字段血缘" in gaps
-

@@ -16,8 +16,15 @@ from .hive import DEFAULT_PUBLIC_BASE_URL
 from .tools import (
     audit_hive_table,
     explain_hive_table_context,
+    get_hive_data_availability_flag,
+    get_hive_etl_script,
     get_hive_etl_context,
+    get_hive_execute_shell,
     get_hive_lineage,
+    get_hive_other_remark,
+    get_hive_schedule_url,
+    get_hive_structured_properties,
+    get_hive_structured_property,
     get_hive_table_profile,
     search_hive_assets,
 )
@@ -30,70 +37,258 @@ ToolHandler = Callable[..., JSON]
 
 TOOL_SPECS: dict[str, dict[str, Any]] = {
     "blf_get_hive_table_profile": {
-        "description": "Get BLF Hive table profile from DataHub metadata.",
+        "description": "从 DataHub 读取 BLF Hive 表画像，包括表说明、字段、owner、标签、结构化属性和治理缺口。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "table": {"type": "string"},
-                "include_fields": {"type": "boolean", "default": True},
-                "field_limit": {"type": "integer", "default": 80},
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "include_fields": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否返回字段列表和字段说明；表很宽时可设为 false 只看表级信息。",
+                },
+                "field_limit": {
+                    "type": "integer",
+                    "default": 80,
+                    "description": "最多返回多少个字段，默认 80；超过数量会标记为截断。",
+                },
             },
             "required": ["table"],
         },
     },
     "blf_get_hive_etl_context": {
-        "description": "Get Execute Shell and Etl Script structured properties for a BLF Hive table.",
+        "description": "读取 Hive 表在 DataHub 中的加工上下文，主要包括 Execute Shell 和 Etl Script 两个结构化属性。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "table": {"type": "string"},
-                "max_script_chars": {"type": "integer", "default": 8000},
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "max_script_chars": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "每段脚本最多返回的字符数，用于避免超长脚本撑爆上下文。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
+    "blf_get_hive_structured_properties": {
+        "description": "一次性读取 Hive 表在 DataHub 中的全部已知 BLF 结构化属性。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 4000,
+                    "description": "每个属性值最多返回的字符数，超出会截断并标记 omitted_chars。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
+    "blf_get_hive_structured_property": {
+        "description": "按属性名读取 Hive 表在 DataHub 中的一个 BLF 结构化属性。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "property_name": {
+                    "type": "string",
+                    "description": "要读取的结构化属性名。",
+                    "enum": [
+                        "etl_script",
+                        "execute_shell",
+                        "schedule_url",
+                        "data_availability_flag",
+                        "other_remark",
+                    ],
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "属性值最多返回的字符数，超出会截断并标记 omitted_chars。",
+                },
+            },
+            "required": ["table", "property_name"],
+        },
+    },
+    "blf_get_hive_etl_script": {
+        "description": "读取 Hive 表的 Etl Script 结构化属性，即 DataHub 中保存的 ETL 脚本内容。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "脚本最多返回的字符数，超出会截断并标记 omitted_chars。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
+    "blf_get_hive_execute_shell": {
+        "description": "读取 Hive 表的 Execute Shell 结构化属性，即调度执行入口或 shell 命令内容。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "执行命令最多返回的字符数，超出会截断并标记 omitted_chars。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
+    "blf_get_hive_schedule_url": {
+        "description": "读取 Hive 表的 Schedule URL 结构化属性，即调度系统任务链接。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 2000,
+                    "description": "URL 属性最多返回的字符数，通常保持默认即可。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
+    "blf_get_hive_data_availability_flag": {
+        "description": "读取 Hive 表的 Data Availability Flag 结构化属性，用于判断 DDL、表血缘、字段血缘等元数据是否已入库。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 2000,
+                    "description": "属性值最多返回的字符数，通常保持默认即可。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
+    "blf_get_hive_other_remark": {
+        "description": "读取 Hive 表的 Other Remark 结构化属性，即 DataHub 中保存的其他备注信息。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "备注内容最多返回的字符数，超出会截断并标记 omitted_chars。",
+                },
             },
             "required": ["table"],
         },
     },
     "blf_get_hive_lineage": {
-        "description": "Get table-level upstream/downstream DataHub lineage for a BLF Hive table.",
+        "description": "读取 Hive 表在 DataHub 中的表级上游、下游血缘和影响面。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "table": {"type": "string"},
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
                 "direction": {
                     "type": "string",
+                    "description": "血缘方向：upstream 查上游，downstream 查下游，both 同时查上下游。",
                     "enum": ["upstream", "downstream", "both"],
                     "default": "both",
                 },
-                "max_hops": {"type": "integer", "default": 1},
-                "max_results": {"type": "integer", "default": 50},
+                "max_hops": {
+                    "type": "integer",
+                    "default": 1,
+                    "description": "最大血缘跳数；跳数越大结果越多，实际可返回范围可能受 DataHub 服务端支持的 degree 过滤影响。",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "每个方向请求返回的血缘实体数量；MCP 不再做 100 条硬限制，实际返回量可能受 DataHub 服务端分页或响应大小限制。",
+                },
             },
             "required": ["table"],
         },
     },
     "blf_search_hive_assets": {
-        "description": "Search BLF Hive datasets in DataHub and return compact recommendations.",
+        "description": "在 DataHub 中搜索 BLF Hive 表，并返回候选表、说明和可用性标记。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
-                "only_available": {"type": "boolean", "default": True},
-                "limit": {"type": "integer", "default": 10},
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键词，可以是表名片段、中文说明或业务关键词。",
+                },
+                "only_available": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否只返回带 Data Availability Flag 的候选表。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "最多返回多少个候选表。",
+                },
             },
             "required": ["query"],
         },
     },
     "blf_audit_hive_table": {
-        "description": "Audit DataHub metadata completeness for one BLF Hive table.",
+        "description": "审计单张 Hive 表在 DataHub 中的元数据完整性，包括 schema、文档、ETL、血缘、owner、tag 和可用性标记。",
         "inputSchema": {
             "type": "object",
-            "properties": {"table": {"type": "string"}},
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                }
+            },
             "required": ["table"],
         },
     },
     "blf_explain_hive_table_context": {
-        "description": "Return profile, ETL, lineage, and risk context for one BLF Hive table.",
+        "description": "一次性读取 Hive 表画像、ETL、血缘和风险缺口，供 AI Agent 生成表解释或加工逻辑说明。",
         "inputSchema": {
             "type": "object",
-            "properties": {"table": {"type": "string"}},
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                }
+            },
             "required": ["table"],
         },
     },
@@ -133,6 +328,13 @@ class BlfMcpApplication:
         self.handlers: dict[str, ToolHandler] = {
             "blf_get_hive_table_profile": get_hive_table_profile,
             "blf_get_hive_etl_context": get_hive_etl_context,
+            "blf_get_hive_structured_properties": get_hive_structured_properties,
+            "blf_get_hive_structured_property": get_hive_structured_property,
+            "blf_get_hive_etl_script": get_hive_etl_script,
+            "blf_get_hive_execute_shell": get_hive_execute_shell,
+            "blf_get_hive_schedule_url": get_hive_schedule_url,
+            "blf_get_hive_data_availability_flag": get_hive_data_availability_flag,
+            "blf_get_hive_other_remark": get_hive_other_remark,
             "blf_get_hive_lineage": get_hive_lineage,
             "blf_search_hive_assets": search_hive_assets,
             "blf_audit_hive_table": audit_hive_table,
@@ -188,7 +390,7 @@ class BlfMcpApplication:
             "content": [
                 {
                     "type": "text",
-                    "text": json.dumps(result, ensure_ascii=False, indent=2),
+                    "text": _format_tool_text(result),
                 }
             ],
             "isError": not bool(result.get("success", True)),
@@ -201,6 +403,16 @@ class BlfMcpApplication:
             "id": rpc_id,
             "error": {"code": code, "message": message},
         }
+
+
+def _format_tool_text(result: JSON) -> str:
+    """Format tool output as non-JSON text so Dify exposes it via the text field."""
+    return (
+        "DataHub MCP 工具返回如下。请按其中 JSON 证据回答用户，不要编造未返回的信息。\n\n"
+        "```json\n"
+        f"{json.dumps(result, ensure_ascii=False, indent=2)}\n"
+        "```"
+    )
 
 
 def make_handler(app: BlfMcpApplication) -> type[BaseHTTPRequestHandler]:
@@ -301,4 +513,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

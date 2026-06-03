@@ -28,8 +28,14 @@ def test_tools_list_contains_blf_tools() -> None:
     names = {tool["name"] for tool in response["result"]["tools"]}
     assert "blf_get_hive_table_profile" in names
     assert "blf_get_hive_etl_context" in names
+    assert "blf_get_hive_structured_properties" in names
+    assert "blf_get_hive_structured_property" in names
+    assert "blf_get_hive_etl_script" in names
+    assert "blf_get_hive_execute_shell" in names
+    assert "blf_get_hive_schedule_url" in names
+    assert "blf_get_hive_data_availability_flag" in names
+    assert "blf_get_hive_other_remark" in names
     assert "blf_get_hive_lineage" in names
     assert "blf_search_hive_assets" in names
     assert "blf_audit_hive_table" in names
     assert "blf_explain_hive_table_context" in names
-

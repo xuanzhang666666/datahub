@@ -7,10 +7,13 @@ from typing import Any, Literal
 from .datahub_client import DataHubClient, DataHubClientError
 from .hive import make_datahub_dataset_url, make_hive_dataset_urn, normalize_hive_table
 from .summarizers import (
+    STRUCTURED_PROPERTY_DEFINITIONS,
     aspect_value,
+    extract_all_structured_properties,
     extract_structured_properties,
     extract_table_refs,
     governance_gaps,
+    normalize_structured_property_name,
     summarize_schema_fields,
     truncate_text,
 )
@@ -197,8 +200,19 @@ def get_hive_table_profile(
             "fields": fields,
             "structured_properties": {
                 "available_property_urns": structured["raw_property_urns"],
+                "known_properties": {
+                    name: {
+                        "property_urn": payload["property_urn"],
+                        "display_name": payload["display_name"],
+                        "exists": payload["exists"],
+                        "value_count": len(payload["values"]),
+                    }
+                    for name, payload in structured["known_properties"].items()
+                },
                 "has_etl_script": bool(structured["etl_script"]),
                 "has_execute_shell": bool(structured["execute_shell"]),
+                "has_schedule_url": bool(structured["schedule_url"]),
+                "has_other_remark": bool(structured["other_remark"]),
             },
             "risks": gaps,
             "evidence": {
@@ -265,6 +279,197 @@ def get_hive_etl_context(
         return _error_response(exc, **base)
 
 
+def get_hive_structured_properties(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    max_value_chars: int = 4000,
+) -> dict[str, Any]:
+    """Return all known BLF structured properties for one Hive table."""
+    try:
+        base = _base(table, public_base_url)
+        payload = client.get_structured_properties(base["dataset_urn"])
+        structured = extract_all_structured_properties(payload)
+        properties = {}
+        for name, property_payload in structured["known"].items():
+            first_value = str(property_payload.get("first_value") or "")
+            properties[name] = {
+                **property_payload,
+                "first_value": truncate_text(first_value, max_value_chars),
+                "values": [
+                    truncate_text(str(value), max_value_chars)
+                    for value in property_payload.get("values", [])
+                ],
+                "value_count": len(property_payload.get("values", [])),
+            }
+        missing = [
+            item["display_name"]
+            for item in properties.values()
+            if not item.get("exists")
+        ]
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "properties": properties,
+                "missing_properties": missing,
+                "unknown_property_urns": sorted(structured["unknown"]),
+            },
+            "risks": [
+                f"缺少 {name} structured property" for name in missing
+            ],
+            "evidence": {
+                "interface": "OpenAPI structuredProperties",
+                "known_property_urns": {
+                    name: definition["urn"]
+                    for name, definition in STRUCTURED_PROPERTY_DEFINITIONS.items()
+                },
+                "raw_property_urns": structured["raw_property_urns"],
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _base(table, public_base_url)
+        except Exception:
+            base = {"table": table}
+        return _error_response(exc, **base)
+
+
+def get_hive_structured_property(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    property_name: str,
+    max_value_chars: int = 8000,
+) -> dict[str, Any]:
+    """Return one BLF structured property for one Hive table."""
+    try:
+        normalized_property_name = normalize_structured_property_name(property_name)
+        base = _base(table, public_base_url)
+        payload = client.get_structured_properties(base["dataset_urn"])
+        structured = extract_all_structured_properties(payload)
+        property_payload = structured["known"][normalized_property_name]
+        values = [
+            truncate_text(str(value), max_value_chars)
+            for value in property_payload.get("values", [])
+        ]
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "property_name": normalized_property_name,
+                "property_urn": property_payload["property_urn"],
+                "display_name": property_payload["display_name"],
+                "exists": property_payload["exists"],
+                "value_count": len(values),
+                "first_value": values[0]
+                if values
+                else truncate_text("", max_value_chars),
+                "values": values,
+            },
+            "risks": []
+            if property_payload["exists"]
+            else [f"缺少 {property_payload['display_name']} structured property"],
+            "evidence": {
+                "interface": "OpenAPI structuredProperties",
+                "raw_property_urns": structured["raw_property_urns"],
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _base(table, public_base_url)
+        except Exception:
+            base = {"table": table}
+        return _error_response(exc, **base)
+
+
+def get_hive_etl_script(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    max_value_chars: int = 8000,
+) -> dict[str, Any]:
+    """Return Etl Script structured property for one Hive table."""
+    return get_hive_structured_property(
+        client,
+        public_base_url=public_base_url,
+        table=table,
+        property_name="etl_script",
+        max_value_chars=max_value_chars,
+    )
+
+
+def get_hive_execute_shell(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    max_value_chars: int = 8000,
+) -> dict[str, Any]:
+    """Return Execute Shell structured property for one Hive table."""
+    return get_hive_structured_property(
+        client,
+        public_base_url=public_base_url,
+        table=table,
+        property_name="execute_shell",
+        max_value_chars=max_value_chars,
+    )
+
+
+def get_hive_schedule_url(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    max_value_chars: int = 2000,
+) -> dict[str, Any]:
+    """Return Schedule URL structured property for one Hive table."""
+    return get_hive_structured_property(
+        client,
+        public_base_url=public_base_url,
+        table=table,
+        property_name="schedule_url",
+        max_value_chars=max_value_chars,
+    )
+
+
+def get_hive_data_availability_flag(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    max_value_chars: int = 2000,
+) -> dict[str, Any]:
+    """Return Data Availability Flag structured property for one Hive table."""
+    return get_hive_structured_property(
+        client,
+        public_base_url=public_base_url,
+        table=table,
+        property_name="data_availability_flag",
+        max_value_chars=max_value_chars,
+    )
+
+
+def get_hive_other_remark(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    max_value_chars: int = 8000,
+) -> dict[str, Any]:
+    """Return Other Remark structured property for one Hive table."""
+    return get_hive_structured_property(
+        client,
+        public_base_url=public_base_url,
+        table=table,
+        property_name="other_remark",
+        max_value_chars=max_value_chars,
+    )
+
+
 def get_hive_lineage(
     client: DataHubClient,
     *,
@@ -279,8 +484,8 @@ def get_hive_lineage(
         base = _base(table, public_base_url)
         if direction not in {"upstream", "downstream", "both"}:
             raise ValueError("direction must be upstream, downstream, or both")
-        max_hops = min(max(int(max_hops), 1), 3)
-        max_results = min(max(int(max_results), 1), 100)
+        max_hops = max(int(max_hops), 1)
+        max_results = max(int(max_results), 1)
         result: dict[str, Any] = {}
         totals: dict[str, int] = {}
         for label, gql_direction in _lineage_directions(direction):
@@ -357,16 +562,16 @@ def search_hive_assets(
             entity = item.get("entity") or {}
             urn = entity.get("urn") or ""
             flags: list[str] = []
-            if only_available and urn:
+            if urn:
                 try:
                     structured = extract_structured_properties(
                         client.get_structured_properties(urn)
                     )
                     flags = structured["data_availability_flags"]
-                    if not flags:
-                        continue
                 except Exception:
-                    continue
+                    flags = []
+            if only_available and not flags:
+                continue
             candidates.append(
                 {
                     "urn": urn,
@@ -437,6 +642,8 @@ def audit_hive_table(
                 "documentation": not any("表文档" in risk for risk in risks),
                 "etl_script": profile["structured_properties"]["has_etl_script"],
                 "execute_shell": profile["structured_properties"]["has_execute_shell"],
+                "schedule_url": profile["structured_properties"]["has_schedule_url"],
+                "other_remark": profile["structured_properties"]["has_other_remark"],
                 "lineage": any(totals.values()),
                 "owner": not any("owner" in risk for risk in risks),
                 "governance_tags": not any("治理标记" in risk for risk in risks),

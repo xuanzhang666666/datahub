@@ -43,6 +43,7 @@ else
   echo "[INFO] 默认门禁 → runtime_parser + manual_upstream + hive ingest + table_doc_discovery + ..."
   "$PYTHON" -m pytest \
     blf_datahub_mcp/tests \
+    blf_trino_mcp/tests \
     job_info_sync_datahub/tests/test_runtime_parser.py \
     job_info_sync_datahub/tests/test_manual_upstream_lineage.py \
     job_info_sync_datahub/tests/test_hive_single_table_ingest.py \
