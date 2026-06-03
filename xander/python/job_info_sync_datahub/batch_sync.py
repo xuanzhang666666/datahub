@@ -62,7 +62,21 @@ from .schedule_client import (
     fetch_all_job_metadata,
     fetch_job_metadata,
 )
-from .structured_properties import collect_structured_properties_for_sync
+from .structured_properties import (
+    ExecuteShellExtractor,
+    collect_structured_properties_for_sync,
+    run_all_extractors,
+)
+from .sqoop_lineage import (
+    build_sqoop_documentation,
+    detect_sqoop_import,
+    sqoop_audit_extra,
+)
+from .table_documentation_from_dataset_props import (
+    fetch_existing_editable_description,
+    merge_documentation,
+    write_editable_description,
+)
 
 logger = get_logger("batch")
 
@@ -465,6 +479,131 @@ def sync_one(
             ),
             result["etl_file_export_path"] or "-",
         )
+
+        from .lineage_write_policy import (
+            LineageWriteDecision,
+            append_lineage_audit_jsonl,
+            default_audit_log_path,
+        )
+
+        sqoop_info = detect_sqoop_import(etl_content)
+        if sqoop_info is not None:
+            reason = (
+                "Sqoop MySQL -> Hive 作业：保守方案只识别目标表，"
+                "MySQL 来源写入 Documentation / 审计报告，不写 upstreamLineage"
+            )
+            decision = LineageWriteDecision(
+                write_upstream_lineage=False,
+                status="SQOOP_DOCUMENTED",
+                reason=reason,
+                trust_score=90,
+                selected_targets={sqoop_info.target.full_name},
+                selected_upstreams={sqoop_info.source_display},
+                deepseek_targets={sqoop_info.target.full_name},
+                deepseek_upstreams=set(),
+            )
+            result["target_table"] = sqoop_info.target.full_name
+            result["upstream_count"] = 0
+            result["field_count"] = 0
+            result["lineage_status"] = decision.status
+            result["lineage_reason"] = decision.reason
+            result["write_upstream_lineage"] = False
+            result["lineage_targets_chosen"] = sorted(decision.selected_targets)
+            result["lineage_sources_chosen"] = sorted(decision.selected_upstreams)
+            result["trust_score"] = decision.trust_score
+            sqoop_raw = {
+                "source": "sqoop_parser",
+                "lineage": [
+                    {
+                        "target": {
+                            "db": sqoop_info.target.db,
+                            "table": sqoop_info.target.table,
+                        },
+                        "upstreams": [],
+                    }
+                ],
+                "mysql_source": {
+                    "connect": sqoop_info.source_connect,
+                    "table": sqoop_info.source_table,
+                    "columns": sqoop_info.columns,
+                },
+                "notes": reason,
+            }
+            result["llm_raw_export_path"] = export_llm_raw_snapshot(
+                batch_output_dir=batch_output_dir,
+                job_display_name=job_display_name,
+                llm_raw=sqoop_raw,
+            )
+            audit_path = (
+                Path(audit_jsonl)
+                if audit_jsonl
+                else (Path(discrepancy_log) if discrepancy_log else default_audit_log_path(batch_output_dir))
+            )
+            append_lineage_audit_jsonl(
+                audit_path,
+                job_display_name,
+                decision,
+                extra=sqoop_audit_extra(sqoop_info),
+            )
+
+            dataset_urn = make_dataset_urn_from_ref(
+                sqoop_info.target,
+                platform_instance,
+                env,
+            )
+            ctx = JobContext(metadata=metadata)
+            ctx.runtime = parse_runtime_context(
+                job_display_name,
+                metadata.shell_command,
+                etl_content,
+                used_path,
+            )
+            props = run_all_extractors(ctx)
+            props.extend(ExecuteShellExtractor().extract(ctx))
+            writer = DatahubWriter(
+                gms_url=gms_url,
+                token=gms_token,
+                platform_instance=platform_instance,
+                env=env,
+                dry_run=dry_run,
+            )
+            if not writer.write_structured_properties(
+                dataset_urn,
+                props,
+                job_display_name,
+                logger,
+            ):
+                result["status"] = "FAIL"
+                result["fail_category"] = FAIL_WRITE
+                result["error"] = "DataHub structuredProperties write failed"
+                result["elapsed"] = round(time.time() - t0, 1)
+                return result
+
+            markdown = build_sqoop_documentation(sqoop_info)
+            if dry_run:
+                logger.info(
+                    "DRY_RUN: Sqoop 来源说明不会写入 Documentation: job=%s target=%s source=%s",
+                    job_display_name,
+                    sqoop_info.target.full_name,
+                    sqoop_info.source_display or "-",
+                )
+            else:
+                existing_doc = fetch_existing_editable_description(
+                    gms_url,
+                    dataset_urn,
+                    gms_token,
+                )
+                final_doc = merge_documentation(existing_doc, markdown, action="append")
+                write_editable_description(gms_url, dataset_urn, final_doc, gms_token)
+                logger.info(
+                    "Sqoop 来源说明已写入 Documentation: job=%s target=%s source=%s",
+                    job_display_name,
+                    sqoop_info.target.full_name,
+                    sqoop_info.source_display or "-",
+                )
+            result["status"] = "OK"
+            result["elapsed"] = round(time.time() - t0, 1)
+            return result
 
         # 3. LLM 表级血缘提取
         from .lineage_write_policy import (

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# run_batch_lineage_sync_job_list.sh — 按作业名单重跑血缘（Jenkins Multi-line JOBS 或文件）
-# 与 run_batch_lineage_sync.sh 逻辑相同，但不用 PREFIX；独立报告文件；默认 --force。
+# run_batch_lineage_sync_job_list.sh — 按作业名单或作业名前缀重跑血缘
+# 支持 Jenkins Multi-line JOBS、文件，或 JOB_PREFIX/PREFIX；独立报告文件；默认 --force。
 set -euo pipefail
 
 # ── 参数（环境变量）───────────────────────────────────────────────────────────
 # JOBS              Jenkins Multi-line：每行一个 job_display_name（优先）
 # JOB_FILE          作业名单文件路径（次优先；未设 JOBS 时可用）
+# JOB_PREFIX        作业名前缀；未设 JOBS/JOB_FILE 时从 DMP 查询该前缀作业
+# PREFIX            JOB_PREFIX 的兼容别名
 # JOB_LIST_FILE     JOBS 落盘路径（默认 $REPORT_DIR/jobs_to_rerun.txt）
 # JOB_LIST_REPORT   名单批次报告 jsonl（默认 $REPORT_DIR/batch_report_job_list.jsonl）
 # JOB_LIST_CLEAR    1=本次运行前清空独立报告（默认 1）；0=断点续跑
@@ -19,6 +21,7 @@ CONCURRENCY="${CONCURRENCY:-10}"
 DRY_RUN="${DRY_RUN:-0}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-90}"
 JOB_FILE="${JOB_FILE:-}"
+JOB_PREFIX="${JOB_PREFIX:-${PREFIX:-}}"
 JOB_LIST_CLEAR="${JOB_LIST_CLEAR:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -68,6 +71,10 @@ for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WO
     break
   fi
 done
+
+DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
+export DATAHUB_GMS_URL
+echo "[INFO] DATAHUB_GMS_URL=$DATAHUB_GMS_URL"
 
 if ! "$PYTHON" -c "import trino, openpyxl; from datahub.emitter.rest_emitter import DatahubRestEmitter" 2>/dev/null; then
   echo "ERROR: 依赖 import 失败（解释器: $PYTHON，用户: $(id -un)）。" >&2
@@ -193,6 +200,7 @@ echo "[INFO] job-list Python entrypoint: $_BATCH_SYNC_ENTRY"
 
 # ── 解析作业名单 ───────────────────────────────────────────────────────────────
 _RESOLVED_JOB_FILE=""
+_RESOLVED_JOB_PREFIX=""
 if [[ -n "${JOBS:-}" ]]; then
   printf '%s\n' "$JOBS" > "$_JOBS_SNAPSHOT"
   _RESOLVED_JOB_FILE="$_JOBS_SNAPSHOT"
@@ -201,12 +209,15 @@ elif [[ -n "$JOB_FILE" ]]; then
   _RESOLVED_JOB_FILE="$JOB_FILE"
 elif [[ $# -ge 1 && -f "$1" ]]; then
   _RESOLVED_JOB_FILE="$1"
+elif [[ -n "$JOB_PREFIX" ]]; then
+  _RESOLVED_JOB_PREFIX="$JOB_PREFIX"
+  echo "[INFO] 从 DMP 查询作业名前缀: $_RESOLVED_JOB_PREFIX"
 else
-  echo "ERROR: 请设置 Jenkins 参数 JOBS（Multi-line，每行一个 job_display_name），或 JOB_FILE，或传入名单文件路径。" >&2
+  echo "ERROR: 请设置 Jenkins 参数 JOBS（Multi-line，每行一个 job_display_name）、JOB_FILE、传入名单文件路径，或设置 JOB_PREFIX/PREFIX。" >&2
   exit 1
 fi
 
-if [[ ! -f "$_RESOLVED_JOB_FILE" ]]; then
+if [[ -n "$_RESOLVED_JOB_FILE" && ! -f "$_RESOLVED_JOB_FILE" ]]; then
   echo "ERROR: 作业名单文件不存在: $_RESOLVED_JOB_FILE" >&2
   exit 1
 fi
@@ -224,10 +235,15 @@ fi
 
 ARGS="--report $_BATCH_REPORT"
 ARGS="$ARGS --audit-jsonl $_AUDIT_JSONL"
-ARGS="$ARGS --job-file $_RESOLVED_JOB_FILE"
+if [[ -n "$_RESOLVED_JOB_PREFIX" ]]; then
+  ARGS="$ARGS --prefix $_RESOLVED_JOB_PREFIX"
+else
+  ARGS="$ARGS --job-file $_RESOLVED_JOB_FILE"
+fi
 ARGS="$ARGS --force"
 ARGS="$ARGS --concurrency $CONCURRENCY"
 ARGS="$ARGS --llm-timeout $LLM_TIMEOUT"
+ARGS="$ARGS --datahub-gms $DATAHUB_GMS_URL"
 [[ "$DRY_RUN" == "1" ]] && ARGS="$ARGS --dry-run"
 
 echo "[INFO] running: $PYTHON $_BATCH_SYNC_ENTRY $ARGS"
