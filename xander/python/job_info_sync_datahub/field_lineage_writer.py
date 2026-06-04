@@ -157,9 +157,32 @@ def _field_name_from_schema_field_urn(urn: str) -> Optional[str]:
 def merge_fine_grained_lineages(
     existing: Optional[List[FineGrainedLineageClass]],
     new_entries: List[FineGrainedLineageClass],
+    *,
+    clear_existing: bool = True,
 ) -> List[FineGrainedLineageClass]:
-    """Excel 导入以本次审核结果为准，清空目标表旧字段血缘后再写入。"""
-    return list(new_entries)
+    """Merge or replace fine-grained lineage entries from reviewed Excel rows."""
+    if clear_existing:
+        return list(new_entries)
+    merged = list(existing or [])
+    seen = {
+        (
+            tuple(entry.upstreams or []),
+            tuple(entry.downstreams or []),
+            entry.transformOperation or "",
+        )
+        for entry in merged
+    }
+    for entry in new_entries:
+        key = (
+            tuple(entry.upstreams or []),
+            tuple(entry.downstreams or []),
+            entry.transformOperation or "",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+    return merged
 
 
 def write_approved_field_lineages(
@@ -170,6 +193,7 @@ def write_approved_field_lineages(
     env: str = "PROD",
     *,
     dry_run: bool = False,
+    clear_existing: bool = True,
 ) -> Dict[str, object]:
     """将审核通过的 Excel 行写入各目标表的 fineGrainedLineages。"""
     if not dry_run and not _SDK_AVAILABLE:
@@ -188,7 +212,11 @@ def write_approved_field_lineages(
             "downstream_urn": downstream_urn,
             "field_count": len(groups),
             "with_transform_operation": sum(1 for g in groups if g.transform_operation),
-            "replacement_mode": "replace_all_fine_grained_lineages_for_table",
+            "replacement_mode": (
+                "replace_all_fine_grained_lineages_for_table"
+                if clear_existing
+                else "merge_existing_fine_grained_lineages_for_table"
+            ),
             "fields": [
                 {
                     "target_field": g.target_field,
@@ -225,6 +253,7 @@ def write_approved_field_lineages(
         merged_fg = merge_fine_grained_lineages(
             list(existing.fineGrainedLineages) if existing and existing.fineGrainedLineages else None,
             new_entries,
+            clear_existing=clear_existing,
         )
         table_result["cleared_existing_fine_grained_count"] = existing_fg_count
 

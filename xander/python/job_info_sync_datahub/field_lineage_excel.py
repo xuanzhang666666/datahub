@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -84,6 +84,7 @@ def write_candidate_workbook(
     candidates: Iterable[FieldLineageCandidate],
     unresolved_fields: Iterable[UnresolvedField],
     llm_model: str,
+    debug_dir: Optional[Path] = None,
 ) -> None:
     """Write reviewable field-lineage candidates to an Excel workbook."""
     wb = Workbook()
@@ -108,6 +109,8 @@ def write_candidate_workbook(
     context_ws.append(["execute_shell_chars", str(len(source_input.execute_shell))])
     context_ws.append(["execute_shell", source_input.execute_shell])
     context_ws.append(["llm_model", llm_model])
+    if debug_dir is not None:
+        context_ws.append(["debug_artifacts_dir", str(debug_dir)])
     context_ws.append(["generated_at", datetime.now(timezone.utc).isoformat()])
     _style_sheet(context_ws)
 

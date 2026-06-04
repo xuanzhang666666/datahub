@@ -49,6 +49,7 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
 规则:
 - 只生成候选结果，宁可把不确定字段放到 unresolved_fields，也不要编造来源。
 - Python 脚本中的 SQL 字符串、临时表、多段 SQL 可综合判断，但 evidence_sql 必须回指到原始脚本片段。
+- 如果 ETL 脚本是 Python 文件，必须按 Python 初始化与执行顺序分析：先看 import、全局变量、配置读取、函数/类定义，再看 `if __name__ == "__main__"`、main()/run() 调用链、spark.sql/cursor.execute 等实际执行点；不要只解析最后一个 SQL 字符串。
 - **每条 mapping 必须填写 transform_expression**（如 `coalesce(a,b)`、`cast(x as bigint)`、或直接列名），用于 DataHub UI 展示 LOGIC。
 - **每条 mapping 必须填写 transform_explanation**（中文，面向业务同学），固定两段信息：
   1. **来源**：写清楚数据来自哪些表的哪些字段（用反引号标出 `库.表` 与字段名）。

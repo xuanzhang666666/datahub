@@ -16,16 +16,20 @@ if __name__ == "__main__" and __package__ is None:
     __package__ = "job_info_sync_datahub"
 
 from .field_lineage_datahub_reader import (
-    extract_field_lineage_input,
+    extract_field_lineage_input_with_debug,
     fetch_structured_properties,
+    has_confirmed_field_lineage,
     make_hive_dataset_urn,
     missing_field_lineage_source_reason,
+    write_field_lineage_debug_artifacts,
 )
 
 # 无 Etl Script / structured property 内容时跳过 LLM（shell 脚本据此汇总）
 EXIT_SKIP_NO_SOURCE = 3
 # --write 时 Excel 无 APPROVED 行
 EXIT_NO_APPROVED_ROWS = 4
+# --write 时目标表已被 Data Availability Flag 标记为字段血缘已确认
+EXIT_CONFIRMED_FIELD_LINEAGE = 5
 from .field_lineage_excel import load_approved_review_rows, write_candidate_workbook
 from .field_lineage_llm import call_llm_extract_field_lineage
 from .field_lineage_writer import write_approved_field_lineages
@@ -45,6 +49,10 @@ def _preview(text: str, max_chars: int) -> str:
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
+    if args.llm_provider:
+        os.environ["LLM_PROVIDER"] = args.llm_provider
+    if args.llm_model:
+        os.environ["LLM_MODEL"] = args.llm_model
     dataset_urn = make_hive_dataset_urn(args.table, args.platform_instance, args.env)
     _log("export started")
     _log(f"table={args.table}")
@@ -64,10 +72,24 @@ def _cmd_export(args: argparse.Namespace) -> int:
         _log(f"SKIP: {skip_reason}")
         print(f"FIELD_LINEAGE_SKIP_REASON={skip_reason}", flush=True)
         return EXIT_SKIP_NO_SOURCE
-    source_input = extract_field_lineage_input(dataset_urn, args.table, payload)
+    source_input, preparation_debug = extract_field_lineage_input_with_debug(
+        dataset_urn,
+        args.table,
+        payload,
+    )
+    debug_dir = args.debug_dir or args.output.with_suffix("").with_name(
+        f"{args.output.stem}_debug"
+    )
+    written_debug_files = write_field_lineage_debug_artifacts(
+        debug_dir,
+        source_input,
+        preparation_debug,
+    )
     _log("structuredProperties loaded")
     _log(f"etl_script_chars={len(source_input.etl_script)}")
     _log(f"execute_shell_chars={len(source_input.execute_shell)}")
+    _log(f"debug artifacts dir={debug_dir}")
+    _log(f"debug artifacts files={','.join(written_debug_files)}")
     if source_input.execute_shell:
         _log("execute_shell begin")
         print(source_input.execute_shell, flush=True)
@@ -93,6 +115,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         candidates=parsed.mappings,
         unresolved_fields=parsed.unresolved_fields,
         llm_model=model,
+        debug_dir=debug_dir,
     )
     _log(f"export finished: {len(parsed.mappings)} candidates -> {args.output}")
     return 0
@@ -132,6 +155,29 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
             + ", ".join(missing_explanation[:20])
         )
 
+    if args.write:
+        protected_tables = []
+        target_tables = sorted({row.target_table for row in approved if row.target_table})
+        for target_table in target_tables:
+            dataset_urn = make_hive_dataset_urn(
+                target_table,
+                args.platform_instance,
+                args.env,
+            )
+            payload = fetch_structured_properties(
+                args.gms_url,
+                dataset_urn,
+                token=args.gms_token,
+            )
+            if has_confirmed_field_lineage(payload):
+                protected_tables.append(target_table)
+        if protected_tables:
+            _log(
+                "ERROR: 以下表 Data Availability Flag 已包含「字段血缘」，视为已确认，禁止修改: "
+                + ", ".join(protected_tables)
+            )
+            return EXIT_CONFIRMED_FIELD_LINEAGE
+
     result = write_approved_field_lineages(
         args.gms_url,
         approved,
@@ -139,11 +185,13 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
         platform_instance=args.platform_instance,
         env=args.env,
         dry_run=not args.write,
+        clear_existing=args.clear_existing,
     )
     summary = {
         "input": str(args.input),
         "approved_rows": len(approved),
         "dry_run": not args.write,
+        "clear_existing": args.clear_existing,
         "rows": [
             {
                 "target_table": row.target_table,
@@ -177,6 +225,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     export.add_argument("--table", required=True, help="目标表，例如 default.dim_store_info")
     export.add_argument("--output", required=True, type=Path, help="输出 .xlsx 路径")
     export.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=None,
+        help="保存变量替换、裁剪后脚本等中间产物；默认写到 Excel 同目录的 *_debug",
+    )
+    export.add_argument(
         "--gms-url",
         default=os.getenv("DATAHUB_GMS_URL", "http://datahub-gms:8080"),
         help="DataHub GMS URL",
@@ -185,6 +239,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     export.add_argument("--platform-instance", default="blf-prod-hive")
     export.add_argument("--env", default="PROD")
     export.add_argument("--llm-timeout-sec", type=int, default=180)
+    export.add_argument("--llm-provider", default=os.getenv("LLM_PROVIDER", ""))
+    export.add_argument("--llm-model", default=os.getenv("LLM_MODEL", ""))
     export.add_argument(
         "--preview-chars",
         type=int,
@@ -210,6 +266,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--write",
         action="store_true",
         help="写入 DataHub fineGrainedLineages（含 transformOperation）；默认仅 dry-run",
+    )
+    import_reviewed.add_argument(
+        "--clear-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="导入前清空目标表已有 fineGrainedLineages；默认开启。关闭时合并已有字段血缘",
     )
     import_reviewed.set_defaults(func=_cmd_import_reviewed)
 

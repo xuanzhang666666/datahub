@@ -17,8 +17,9 @@
 #
 # ── 可选 ─────────────────────────────────────────────────────────────────────
 # FIELD_LINEAGE_INPUT_DIR   默认 /data/datahub/out/field_lineage_export
-# DATAHUB_GMS_URL           默认 http://localhost:8080
+# DATAHUB_GMS_URL / DATAHUB_GMS_TOKEN
 # LINEAGE_PYTHON            默认 /opt/anaconda3/bin/python
+# FIELD_LINEAGE_CLEAR_EXISTING 默认 1；1=导入前清空旧字段血缘，0=合并已有字段血缘
 #
 # Jenkins：BATCH_CODE + TABLES（Multi-line String Parameter），Execute shell 直接引用即可
 #   sh /data/datahub/scripts/run_field_lineage_import_to_datahub.sh
@@ -45,9 +46,9 @@ else
 fi
 
 INPUT_DIR="${FIELD_LINEAGE_INPUT_DIR:-/data/datahub/out/field_lineage_export}"
-GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
 BATCH_CODE="${BATCH_CODE:-}"
 DRY_RUN_FLAG="${FIELD_LINEAGE_DRY_RUN:-${DRY_RUN:-0}}"
+CLEAR_EXISTING_FLAG="${FIELD_LINEAGE_CLEAR_EXISTING:-1}"
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
   [[ -z "$_cand" ]] && continue
@@ -60,6 +61,9 @@ for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WO
     break
   fi
 done
+
+export DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
+export DATAHUB_GMS_TOKEN="${DATAHUB_GMS_TOKEN:-eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImRhdGFodWIiLCJ0eXBlIjoiUEVSU09OQUwiLCJ2ZXJzaW9uIjoiMiIsImp0aSI6IjgxMDY0Zjk0LWNmOWEtNGMzZS04MDU5LTExMzc5OTU1MzM5MCIsInN1YiI6ImRhdGFodWIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.pPRncAU5T3P2PeP78q1f53KdS56rNZpeQJ8AUMjSbrw}"
 
 if [[ -z "${BATCH_CODE//[[:space:]]/}" ]]; then
   echo "ERROR: BATCH_CODE 为空，请填写导出任务日志中的批次号（YYYYMMDDHHmm，12 位数字）。" >&2
@@ -107,6 +111,16 @@ case "$(echo "$DRY_RUN_FLAG" | tr '[:upper:]' '[:lower:]')" in
     ;;
 esac
 
+IMPORT_CLEAR_EXISTING=1
+case "$(echo "$CLEAR_EXISTING_FLAG" | tr '[:upper:]' '[:lower:]')" in
+  1 | true | yes) IMPORT_CLEAR_EXISTING=1 ;;
+  0 | false | no) IMPORT_CLEAR_EXISTING=0 ;;
+  *)
+    echo "ERROR: FIELD_LINEAGE_CLEAR_EXISTING 无法识别: $CLEAR_EXISTING_FLAG" >&2
+    exit 2
+    ;;
+esac
+
 if [[ ! -d "$INPUT_DIR" ]]; then
   echo "ERROR: Excel 目录不存在: $INPUT_DIR" >&2
   exit 1
@@ -119,9 +133,11 @@ echo "[INFO] batch code: $BATCH_CODE"
 echo "[INFO] input root: $INPUT_DIR"
 echo "[INFO] batch input dir: $BATCH_INPUT_DIR"
 echo "[INFO] write to datahub: $([[ "$IMPORT_WRITE" -eq 1 ]] && echo yes || echo no)"
+echo "[INFO] clear existing fineGrainedLineages: $([[ "$IMPORT_CLEAR_EXISTING" -eq 1 ]] && echo yes || echo no)"
 echo "[INFO] table count: ${#TABLE_LIST[@]}"
 echo "[INFO] tables: ${TABLE_LIST[*]}"
-echo "[INFO] gms url: $GMS_URL"
+echo "[INFO] gms url: $DATAHUB_GMS_URL"
+echo "[INFO] gms token: $([[ -n "${DATAHUB_GMS_TOKEN:-}" ]] && echo set || echo empty)"
 echo "[INFO] python: $PYTHON"
 
 _run_cli() {
@@ -166,10 +182,13 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
     import-reviewed
     --input "$EXCEL_FILE"
     --output "$PLAN_FILE"
-    --gms-url "$GMS_URL"
+    --gms-url "$DATAHUB_GMS_URL"
   )
   if [[ "$IMPORT_WRITE" -eq 1 ]]; then
     IMPORT_ARGS+=(--write)
+  fi
+  if [[ "$IMPORT_CLEAR_EXISTING" -eq 0 ]]; then
+    IMPORT_ARGS+=(--no-clear-existing)
   fi
 
   if ! _run_cli "${IMPORT_ARGS[@]}"; then

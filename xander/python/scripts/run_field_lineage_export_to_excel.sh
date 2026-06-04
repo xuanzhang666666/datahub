@@ -10,6 +10,9 @@
 # 默认根目录：/data/datahub/out/field_lineage_export
 # 每次运行写入子目录：{根目录}/{批次号}/（不存在则自动创建）
 # 文件命名：{批次号}_{库.表}.xlsx，例如 .../202605181331/202605181331_default.dim_store_info.xlsx
+# Debug 中间产物默认写入 Jenkins WORKSPACE：
+#   $WORKSPACE/field_lineage_debug/{批次号}/{库.表}/
+# 未设置 WORKSPACE 时使用 CLI 默认值：Excel 同目录的 *_debug/
 #   批次号每次运行自动生成 YYYYMMDDHHmm，仅打印在日志中
 #
 # ── 并发与重试 ───────────────────────────────────────────────────────────────
@@ -17,7 +20,8 @@
 # FIELD_LINEAGE_RETRY_COUNT    失败后额外重试次数，默认 1（共最多 2 次）
 #
 # ── 可选 ─────────────────────────────────────────────────────────────────────
-# DATAHUB_GMS_URL / LINEAGE_PYTHON / FIELD_LINEAGE_PREVIEW_CHARS / FIELD_LINEAGE_LLM_TIMEOUT_SEC
+# DATAHUB_GMS_URL / DATAHUB_GMS_TOKEN / LINEAGE_PYTHON / FIELD_LINEAGE_PREVIEW_CHARS / FIELD_LINEAGE_LLM_TIMEOUT_SEC
+# LLM_PROVIDER / LLM_MODEL   LLM 切换参数，兼容 run_batch_lineage_sync_job_list.sh
 #
 # Jenkins：TABLES 使用 Multi-line String Parameter，Execute shell 直接引用 $TABLES 即可
 #   sh /data/datahub/scripts/run_field_lineage_export_to_excel.sh
@@ -45,7 +49,7 @@ fi
 
 OUTPUT_DIR="${FIELD_LINEAGE_OUTPUT_DIR:-/data/datahub/out/field_lineage_export}"
 BATCH_ID="$(date +%Y%m%d%H%M)"
-GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
+DEBUG_ROOT="${FIELD_LINEAGE_DEBUG_DIR:-${WORKSPACE:+$WORKSPACE/field_lineage_debug}}"
 PREVIEW_CHARS="${FIELD_LINEAGE_PREVIEW_CHARS:-8000}"
 LLM_TIMEOUT="${FIELD_LINEAGE_LLM_TIMEOUT_SEC:-240}"
 CONCURRENCY="${FIELD_LINEAGE_CONCURRENCY:-10}"
@@ -71,6 +75,11 @@ for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WO
     break
   fi
 done
+
+export DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
+export DATAHUB_GMS_TOKEN="${DATAHUB_GMS_TOKEN:-eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImRhdGFodWIiLCJ0eXBlIjoiUEVSU09OQUwiLCJ2ZXJzaW9uIjoiMiIsImp0aSI6IjgxMDY0Zjk0LWNmOWEtNGMzZS04MDU5LTExMzc5OTU1MzM5MCIsInN1YiI6ImRhdGFodWIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.pPRncAU5T3P2PeP78q1f53KdS56rNZpeQJ8AUMjSbrw}"
+LLM_PROVIDER="${LLM_PROVIDER:-${BLF_ACTIVE_LLM:-deepseek}}"
+LLM_MODEL="${LLM_MODEL:-}"
 
 # Jenkins multi-line string parameter：一行一个 库.表
 _parse_tables_multiline() {
@@ -108,11 +117,15 @@ echo "[INFO] field lineage export started at $(date -Iseconds)"
 echo "[INFO] batch id (auto): $BATCH_ID"
 echo "[INFO] output root: $OUTPUT_DIR"
 echo "[INFO] batch output dir: $BATCH_OUTPUT_DIR"
+echo "[INFO] debug root: ${DEBUG_ROOT:-<excel-sibling-default>}"
 echo "[INFO] concurrency: $CONCURRENCY"
 echo "[INFO] retry on failure: $RETRY_COUNT"
 echo "[INFO] table count: ${#TABLE_LIST[@]}"
 echo "[INFO] tables: ${TABLE_LIST[*]}"
-echo "[INFO] gms url: $GMS_URL"
+echo "[INFO] gms url: $DATAHUB_GMS_URL"
+echo "[INFO] gms token: $([[ -n "${DATAHUB_GMS_TOKEN:-}" ]] && echo set || echo empty)"
+echo "[INFO] llm provider: $LLM_PROVIDER"
+echo "[INFO] llm model: ${LLM_MODEL:-<provider-default>}"
 echo "[INFO] python: $PYTHON"
 echo "[INFO] pythonpath: $PYTHONPATH_ROOT"
 
@@ -146,6 +159,7 @@ _export_one_table() {
   local max_attempts=$((RETRY_COUNT + 1))
   local attempt=1
   local _cli_out _cli_rc _skip_reason
+  local DEBUG_DIR
 
   rm -f "$OUTPUT_FILE" "${STATUS_FILE}.skip_reason"
   while [[ "$attempt" -le "$max_attempts" ]]; do
@@ -158,12 +172,24 @@ _export_one_table() {
 
     _cli_out="$(mktemp "${TMPDIR:-/tmp}/field_lineage_cli.XXXXXX")"
     set +e
-    _run_cli export \
+    _export_args=(
+      export
       --table "$TABLE_NAME" \
       --output "$OUTPUT_FILE" \
-      --gms-url "$GMS_URL" \
+      --gms-url "$DATAHUB_GMS_URL" \
       --llm-timeout-sec "$LLM_TIMEOUT" \
-      --preview-chars "$PREVIEW_CHARS" >"$_cli_out" 2>&1
+      --preview-chars "$PREVIEW_CHARS" \
+      --llm-provider "$LLM_PROVIDER"
+    )
+    if [[ -n "$LLM_MODEL" ]]; then
+      _export_args+=(--llm-model "$LLM_MODEL")
+    fi
+    if [[ -n "$DEBUG_ROOT" ]]; then
+      DEBUG_DIR="$DEBUG_ROOT/$BATCH_ID/$TABLE_NAME"
+      mkdir -p "$DEBUG_DIR"
+      _export_args+=(--debug-dir "$DEBUG_DIR")
+    fi
+    _run_cli "${_export_args[@]}" >"$_cli_out" 2>&1
     _cli_rc=$?
     set -e
     cat "$_cli_out"
