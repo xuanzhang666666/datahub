@@ -76,10 +76,48 @@ for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WO
   fi
 done
 
+_load_script_env_for_missing_llm_key() {
+  local _provider="$1"
+  local _env_file="$SCRIPT_DIR/lineage.env"
+  [[ -r "$_env_file" ]] || return 0
+  case "$_provider" in
+    blf | token-pool | token_pool)
+      [[ -n "${BLF_LLM_API_KEY:-}" ]] && return 0
+      ;;
+    deepseek)
+      [[ -n "${DEEPSEEK_API_KEY:-}" ]] && return 0
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  set -a
+  # shellcheck disable=SC1090
+  source "$_env_file"
+  set +a
+  echo "[INFO] loaded fallback env for LLM key: $_env_file"
+}
+
 export DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
 export DATAHUB_GMS_TOKEN="${DATAHUB_GMS_TOKEN:-eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImRhdGFodWIiLCJ0eXBlIjoiUEVSU09OQUwiLCJ2ZXJzaW9uIjoiMiIsImp0aSI6IjgxMDY0Zjk0LWNmOWEtNGMzZS04MDU5LTExMzc5OTU1MzM5MCIsInN1YiI6ImRhdGFodWIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.pPRncAU5T3P2PeP78q1f53KdS56rNZpeQJ8AUMjSbrw}"
 LLM_PROVIDER="${LLM_PROVIDER:-${BLF_ACTIVE_LLM:-deepseek}}"
 LLM_MODEL="${LLM_MODEL:-}"
+_load_script_env_for_missing_llm_key "$LLM_PROVIDER"
+
+case "$LLM_PROVIDER" in
+  blf | token-pool | token_pool)
+    if [[ -z "${BLF_LLM_API_KEY:-}" ]]; then
+      echo "ERROR: LLM_PROVIDER=$LLM_PROVIDER 但 BLF_LLM_API_KEY 为空；请在 Jenkins 凭据、LINEAGE_ENV_FILE 或 $SCRIPT_DIR/lineage.env 中配置。" >&2
+      exit 2
+    fi
+    ;;
+  deepseek)
+    if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+      echo "ERROR: LLM_PROVIDER=deepseek 但 DEEPSEEK_API_KEY 为空；请在 Jenkins 凭据、LINEAGE_ENV_FILE 或 $SCRIPT_DIR/lineage.env 中配置。" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 # Jenkins multi-line string parameter：一行一个 库.表
 _parse_tables_multiline() {
@@ -126,6 +164,7 @@ echo "[INFO] gms url: $DATAHUB_GMS_URL"
 echo "[INFO] gms token: $([[ -n "${DATAHUB_GMS_TOKEN:-}" ]] && echo set || echo empty)"
 echo "[INFO] llm provider: $LLM_PROVIDER"
 echo "[INFO] llm model: ${LLM_MODEL:-<provider-default>}"
+echo "[INFO] llm api key: $([[ "$LLM_PROVIDER" == "deepseek" ]] && { [[ -n "${DEEPSEEK_API_KEY:-}" ]] && echo set || echo empty; } || { [[ -n "${BLF_LLM_API_KEY:-}" ]] && echo set || echo empty; })"
 echo "[INFO] python: $PYTHON"
 echo "[INFO] pythonpath: $PYTHONPATH_ROOT"
 
