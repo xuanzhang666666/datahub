@@ -19,7 +19,9 @@
 # FIELD_LINEAGE_INPUT_DIR   默认 /data/datahub/out/field_lineage_export
 # DATAHUB_GMS_URL / DATAHUB_GMS_TOKEN
 # LINEAGE_PYTHON            默认 /opt/anaconda3/bin/python
-# FIELD_LINEAGE_CLEAR_EXISTING 默认 1；1=导入前清空旧字段血缘，0=合并已有字段血缘
+# FIELD_LINEAGE_CLEAR_EXISTING 默认 1；1=清空导入，0=合并更新（替换本次字段，保留其它旧字段）
+# FIELD_LINEAGE_IMPORT_STATUSES 默认 AUTO_APPROVED,APPROVED；可设为 APPROVED 只导入人工审核行
+# FIELD_LINEAGE_REQUIRE_FULL_AUTO_APPROVED 默认 1；1=仅当 AUTO_APPROVED=100% 且 unresolved=0 才自动导入
 #
 # Jenkins：BATCH_CODE + TABLES（Multi-line String Parameter），Execute shell 直接引用即可
 #   sh /data/datahub/scripts/run_field_lineage_import_to_datahub.sh
@@ -49,6 +51,8 @@ INPUT_DIR="${FIELD_LINEAGE_INPUT_DIR:-/data/datahub/out/field_lineage_export}"
 BATCH_CODE="${BATCH_CODE:-}"
 DRY_RUN_FLAG="${FIELD_LINEAGE_DRY_RUN:-${DRY_RUN:-0}}"
 CLEAR_EXISTING_FLAG="${FIELD_LINEAGE_CLEAR_EXISTING:-1}"
+IMPORT_STATUSES="${FIELD_LINEAGE_IMPORT_STATUSES:-AUTO_APPROVED,APPROVED}"
+REQUIRE_FULL_AUTO_APPROVED_FLAG="${FIELD_LINEAGE_REQUIRE_FULL_AUTO_APPROVED:-1}"
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
   [[ -z "$_cand" ]] && continue
@@ -121,6 +125,16 @@ case "$(echo "$CLEAR_EXISTING_FLAG" | tr '[:upper:]' '[:lower:]')" in
     ;;
 esac
 
+IMPORT_REQUIRE_FULL_AUTO_APPROVED=1
+case "$(echo "$REQUIRE_FULL_AUTO_APPROVED_FLAG" | tr '[:upper:]' '[:lower:]')" in
+  1 | true | yes) IMPORT_REQUIRE_FULL_AUTO_APPROVED=1 ;;
+  0 | false | no) IMPORT_REQUIRE_FULL_AUTO_APPROVED=0 ;;
+  *)
+    echo "ERROR: FIELD_LINEAGE_REQUIRE_FULL_AUTO_APPROVED 无法识别: $REQUIRE_FULL_AUTO_APPROVED_FLAG" >&2
+    exit 2
+    ;;
+esac
+
 if [[ ! -d "$INPUT_DIR" ]]; then
   echo "ERROR: Excel 目录不存在: $INPUT_DIR" >&2
   exit 1
@@ -133,7 +147,9 @@ echo "[INFO] batch code: $BATCH_CODE"
 echo "[INFO] input root: $INPUT_DIR"
 echo "[INFO] batch input dir: $BATCH_INPUT_DIR"
 echo "[INFO] write to datahub: $([[ "$IMPORT_WRITE" -eq 1 ]] && echo yes || echo no)"
-echo "[INFO] clear existing fineGrainedLineages: $([[ "$IMPORT_CLEAR_EXISTING" -eq 1 ]] && echo yes || echo no)"
+echo "[INFO] import mode: $([[ "$IMPORT_CLEAR_EXISTING" -eq 1 ]] && echo clear_import || echo merge_update)"
+echo "[INFO] import statuses: $IMPORT_STATUSES"
+echo "[INFO] require full auto approved: $([[ "$IMPORT_REQUIRE_FULL_AUTO_APPROVED" -eq 1 ]] && echo yes || echo no)"
 echo "[INFO] table count: ${#TABLE_LIST[@]}"
 echo "[INFO] tables: ${TABLE_LIST[*]}"
 echo "[INFO] gms url: $DATAHUB_GMS_URL"
@@ -161,6 +177,8 @@ _resolve_excel_file() {
 }
 
 _fail=0
+_skip=0
+_skipped_tables=()
 for TABLE_NAME in "${TABLE_LIST[@]}"; do
   if ! EXCEL_FILE="$(_resolve_excel_file "$TABLE_NAME")"; then
     EXCEL_FILE="$BATCH_INPUT_DIR/${BATCH_CODE}_${TABLE_NAME}.xlsx"
@@ -183,6 +201,7 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
     --input "$EXCEL_FILE"
     --output "$PLAN_FILE"
     --gms-url "$DATAHUB_GMS_URL"
+    --import-statuses "$IMPORT_STATUSES"
   )
   if [[ "$IMPORT_WRITE" -eq 1 ]]; then
     IMPORT_ARGS+=(--write)
@@ -190,16 +209,29 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
   if [[ "$IMPORT_CLEAR_EXISTING" -eq 0 ]]; then
     IMPORT_ARGS+=(--no-clear-existing)
   fi
+  if [[ "$IMPORT_REQUIRE_FULL_AUTO_APPROVED" -eq 1 ]]; then
+    IMPORT_ARGS+=(--require-full-auto-approved)
+  fi
 
-  if ! _run_cli "${IMPORT_ARGS[@]}"; then
-    echo "[ERROR] import failed: $TABLE_NAME（若为 exit 4：Excel 无 APPROVED 行，请审核后填写 review_status=APPROVED）" >&2
+  set +e
+  _run_cli "${IMPORT_ARGS[@]}"
+  _cli_rc=$?
+  set -e
+  if [[ "$_cli_rc" -eq 6 ]]; then
+    echo "[WARN] import skipped: $TABLE_NAME（auto_approved_percent 不是 100% 或 unresolved_field_count 不为 0，请人工审核）" >&2
+    _skip=$((_skip + 1))
+    _skipped_tables+=("$TABLE_NAME")
+    continue
+  fi
+  if [[ "$_cli_rc" -ne 0 ]]; then
+    echo "[ERROR] import failed: $TABLE_NAME（若为 exit 4：Excel 无可导入行，请审核后填写 review_status=APPROVED）" >&2
     _fail=$((_fail + 1))
     continue
   fi
   if [[ "$IMPORT_WRITE" -eq 1 && -f "$PLAN_FILE" ]]; then
     _approved_count="$(PYTHONPATH="$PYTHONPATH_ROOT" "$PYTHON" -c "import json; print(json.load(open('$PLAN_FILE'))['approved_rows'])" 2>/dev/null || echo 0)"
     if [[ "${_approved_count:-0}" -eq 0 ]]; then
-      echo "[ERROR] $TABLE_NAME: approved_rows=0，未写入 DataHub；请将 Excel 中需导入行的 review_status 改为 APPROVED" >&2
+      echo "[ERROR] $TABLE_NAME: approved_rows=0，未写入 DataHub；请确认 Excel 中需导入行的 review_status 属于 $IMPORT_STATUSES" >&2
       _fail=$((_fail + 1))
       continue
     fi
@@ -209,10 +241,18 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
   fi
 done
 
-_ok=$((${#TABLE_LIST[@]} - _fail))
+_ok=$((${#TABLE_LIST[@]} - _fail - _skip))
 echo "[INFO] field lineage import finished at $(date -Iseconds)"
 echo "[INFO] batch code: $BATCH_CODE"
-echo "[INFO] succeeded: ${_ok}/${#TABLE_LIST[@]}"
+echo "[INFO] succeeded: ${_ok}/${#TABLE_LIST[@]}, skipped: ${_skip}, failed: ${_fail}"
+
+if [[ "$_skip" -gt 0 ]]; then
+  echo "[WARN] ========== 以下表未满足自动导入条件，需人工审核 =========="
+  for _entry in "${_skipped_tables[@]}"; do
+    echo "[WARN]   ${_entry}"
+  done
+  echo "[WARN] 自动导入条件：auto_approved_percent=100% 且 unresolved_field_count=0。"
+fi
 
 if [[ "$_fail" -gt 0 ]]; then
   exit 1

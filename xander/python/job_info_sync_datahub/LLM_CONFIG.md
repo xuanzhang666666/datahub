@@ -38,6 +38,7 @@ LLM_MODEL=gpt-5.5
 ```text
 blf
 deepseek
+openrouter
 ```
 
 `LLM_MODEL` 填具体模型名。
@@ -48,7 +49,7 @@ deepseek
 
 ```text
 LLM_PROVIDER > BLF_ACTIVE_LLM
-LLM_MODEL    > BLF_LLM_MODEL / DEEPSEEK_MODEL
+LLM_MODEL    > BLF_LLM_MODEL / DEEPSEEK_MODEL / OPENROUTER_MODEL
 ```
 
 也就是说，即使 `/data/datahub/scripts/lineage.env` 里写了：
@@ -125,6 +126,25 @@ DeepSeek base URL 来自：
 ```bash
 DEEPSEEK_OPENAI_BASE_URL=https://api.deepseek.com/v1
 ```
+
+## OpenRouter 切换
+
+OpenRouter 同样走 OpenAI-compatible `/v1/chat/completions`：
+
+```bash
+LLM_PROVIDER=openrouter
+LLM_MODEL=anthropic/claude-sonnet-4
+```
+
+环境变量（可写入 `lineage.env`）：
+
+```bash
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_OPENAI_BASE_URL=https://openrouter.ai/api   # 可选，有默认值
+OPENROUTER_MODEL=anthropic/claude-sonnet-4             # 未传 LLM_MODEL 时的默认模型
+```
+
+`run_field_lineage_export_to_excel.sh` 会在启动前检查 `OPENROUTER_API_KEY` 是否已配置。
 
 ## 常用模型名
 

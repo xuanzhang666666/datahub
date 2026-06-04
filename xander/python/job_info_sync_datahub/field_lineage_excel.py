@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -17,6 +18,7 @@ from .field_lineage_models import (
     UnresolvedField,
     review_status_from_confidence,
 )
+from .field_lineage_policy import is_partition_field
 
 CANDIDATE_HEADERS = [
     "review_status",
@@ -35,6 +37,13 @@ CANDIDATE_HEADERS = [
 
 UNRESOLVED_HEADERS = ["target_field", "reason"]
 CONTEXT_HEADERS = ["key", "value"]
+DEFAULT_IMPORT_STATUSES = {
+    FieldLineageReviewStatus.APPROVED,
+    FieldLineageReviewStatus.AUTO_APPROVED,
+}
+_UNRESOLVED_VARIABLE_RE = re.compile(
+    r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{\s*[^}]+\s*\}\}"
+)
 
 
 def _style_sheet(ws) -> None:
@@ -57,7 +66,37 @@ def _style_sheet(ws) -> None:
 def _effective_review_status(candidate: FieldLineageCandidate) -> FieldLineageReviewStatus:
     if candidate.review_status != FieldLineageReviewStatus.PENDING:
         return candidate.review_status
-    return review_status_from_confidence(candidate.confidence)
+    status = review_status_from_confidence(candidate.confidence)
+    if status != FieldLineageReviewStatus.AUTO_APPROVED:
+        return status
+    if _is_safe_for_auto_approval(candidate):
+        return status
+    return FieldLineageReviewStatus.NEEDS_REVIEW
+
+
+def _is_safe_for_auto_approval(candidate: FieldLineageCandidate) -> bool:
+    values = [
+        candidate.target_table,
+        candidate.target_field,
+        candidate.source_table,
+        candidate.source_field,
+        candidate.transform_expression,
+    ]
+    if any(not value.strip() for value in values):
+        return False
+    if "," in candidate.source_field:
+        return False
+    inspected_text = "\n".join(
+        [
+            candidate.target_table,
+            candidate.target_field,
+            candidate.source_table,
+            candidate.source_field,
+            candidate.transform_expression,
+            candidate.evidence_sql,
+        ]
+    )
+    return _UNRESOLVED_VARIABLE_RE.search(inspected_text) is None
 
 
 def _candidate_to_row(candidate: FieldLineageCandidate) -> List[str]:
@@ -77,6 +116,26 @@ def _candidate_to_row(candidate: FieldLineageCandidate) -> List[str]:
     ]
 
 
+def _unresolved_to_candidate_row(
+    source_input: FieldLineageInput,
+    unresolved: UnresolvedField,
+) -> List[str]:
+    return [
+        FieldLineageReviewStatus.NEEDS_REVIEW.value,
+        source_input.table_name,
+        unresolved.target_field,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        f"UNRESOLVED: {unresolved.reason}",
+        "",
+        "",
+    ]
+
+
 def write_candidate_workbook(
     path: Path,
     *,
@@ -92,12 +151,20 @@ def write_candidate_workbook(
     ws.title = "candidate_lineage"
     ws.append(CANDIDATE_HEADERS)
     for candidate in candidates:
+        if is_partition_field(candidate.target_field):
+            continue
         ws.append(_candidate_to_row(candidate))
+    for unresolved in unresolved_fields:
+        if is_partition_field(unresolved.target_field):
+            continue
+        ws.append(_unresolved_to_candidate_row(source_input, unresolved))
     _style_sheet(ws)
 
     unresolved_ws = wb.create_sheet("unresolved_fields")
     unresolved_ws.append(UNRESOLVED_HEADERS)
     for unresolved in unresolved_fields:
+        if is_partition_field(unresolved.target_field):
+            continue
         unresolved_ws.append([unresolved.target_field, unresolved.reason])
     _style_sheet(unresolved_ws)
 
@@ -146,12 +213,17 @@ def _expand_multi_source_tables(rec: Dict[str, str]) -> List[Dict[str, str]]:
     return expanded
 
 
-def load_approved_review_rows(path: Path) -> List[FieldLineageCandidate]:
-    """Read only APPROVED rows from a human-reviewed workbook.
+def load_approved_review_rows(
+    path: Path,
+    *,
+    import_statuses: Optional[Set[FieldLineageReviewStatus]] = None,
+) -> List[FieldLineageCandidate]:
+    """Read importable rows from a human-reviewed workbook.
 
     Rows whose ``source_table`` cell contains comma-separated table names are
     automatically expanded into one candidate per source table.
     """
+    statuses = import_statuses or DEFAULT_IMPORT_STATUSES
     wb = load_workbook(path)
     if "candidate_lineage" not in wb.sheetnames:
         raise RuntimeError("Excel 缺少 candidate_lineage 工作表")
@@ -160,8 +232,10 @@ def load_approved_review_rows(path: Path) -> List[FieldLineageCandidate]:
     approved: List[FieldLineageCandidate] = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         rec = _row_dict(headers, list(row))
-        status = rec.get("review_status", "").upper()
-        if status != FieldLineageReviewStatus.APPROVED.value:
+        status_value = rec.get("review_status", "").upper()
+        if status_value not in {status.value for status in statuses}:
+            continue
+        if is_partition_field(rec.get("target_field", "")):
             continue
         for expanded_rec in _expand_multi_source_tables(rec):
             approved.append(

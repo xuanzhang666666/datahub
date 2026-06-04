@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .field_lineage_datahub_reader import make_hive_dataset_urn
 from .field_lineage_models import FieldLineageCandidate
+from .field_lineage_policy import is_partition_field
 from .models import TableRef
 
 try:
@@ -84,6 +85,8 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
     """按 (target_table, target_field) 合并；多来源合成 FIELD_SET。"""
     buckets: Dict[Tuple[str, str], List[FieldLineageCandidate]] = {}
     for row in rows:
+        if is_partition_field(row.target_field):
+            continue
         key = (row.target_table.strip().lower(), row.target_field.strip().lower())
         buckets.setdefault(key, []).append(row)
 
@@ -163,7 +166,16 @@ def merge_fine_grained_lineages(
     """Merge or replace fine-grained lineage entries from reviewed Excel rows."""
     if clear_existing:
         return list(new_entries)
-    merged = list(existing or [])
+    new_downstreams = {
+        downstream
+        for entry in new_entries
+        for downstream in (entry.downstreams or [])
+    }
+    merged = [
+        entry
+        for entry in (existing or [])
+        if not set(entry.downstreams or []).intersection(new_downstreams)
+    ]
     seen = {
         (
             tuple(entry.upstreams or []),
@@ -213,9 +225,9 @@ def write_approved_field_lineages(
             "field_count": len(groups),
             "with_transform_operation": sum(1 for g in groups if g.transform_operation),
             "replacement_mode": (
-                "replace_all_fine_grained_lineages_for_table"
+                "clear_import_replace_all_fine_grained_lineages_for_table"
                 if clear_existing
-                else "merge_existing_fine_grained_lineages_for_table"
+                else "merge_update_replace_same_downstream_fields_keep_others"
             ),
             "fields": [
                 {

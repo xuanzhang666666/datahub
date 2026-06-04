@@ -15,15 +15,17 @@ class FieldLineageReviewStatus(str, Enum):
     """Excel 人工审核状态。"""
 
     PENDING = "PENDING"
+    AUTO_APPROVED = "AUTO_APPROVED"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
     NEEDS_FIX = "NEEDS_FIX"
 
 
 def review_status_from_confidence(confidence: str) -> FieldLineageReviewStatus:
-    """导出 Excel 时：LLM 标记为 HIGH 的候选默认视为已审核通过。"""
+    """导出 Excel 时：LLM 标记为 HIGH 的候选默认进入自动通过队列。"""
     if (confidence or "").strip().upper() == "HIGH":
-        return FieldLineageReviewStatus.APPROVED
+        return FieldLineageReviewStatus.AUTO_APPROVED
     return FieldLineageReviewStatus.PENDING
 
 

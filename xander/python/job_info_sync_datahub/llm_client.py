@@ -18,6 +18,7 @@ logger = get_logger("llm_client")
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
 DEFAULT_BLF_LLM_BASE_URL = "http://token-pool.vip.blibee.com/v1"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api"
 DEFAULT_ACTIVE_LLM = "deepseek"
 
 # OpenAI-compatible 模型 context 预算（可通过环境变量与 BLF_LLM_MODEL 对齐）
@@ -107,9 +108,23 @@ def get_llm_config() -> LlmConfig:
             model=model_override or blf_model or "gpt-5.5",
             provider="blf",
         )
+    if active == "openrouter":
+        openrouter_base = os.environ.get("OPENROUTER_OPENAI_BASE_URL", DEFAULT_OPENROUTER_BASE_URL)
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        openrouter_model = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4").strip()
+        if not openrouter_key:
+            raise RuntimeError(
+                "缺少 LLM API Key：当前 LLM_PROVIDER=openrouter；请设置 OPENROUTER_API_KEY"
+            )
+        return LlmConfig(
+            base_v1=normalize_openai_v1_base(openrouter_base),
+            api_key=openrouter_key,
+            model=model_override or openrouter_model,
+            provider="openrouter",
+        )
     if active != "deepseek":
         raise RuntimeError(
-            f"不支持的 BLF_ACTIVE_LLM={active!r}；当前支持 deepseek、blf"
+            f"不支持的 LLM_PROVIDER={active!r}；当前支持 blf、deepseek、openrouter"
         )
 
     deepseek_base = os.environ.get("DEEPSEEK_OPENAI_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL)
@@ -117,8 +132,8 @@ def get_llm_config() -> LlmConfig:
     deepseek_model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
     if not deepseek_key:
         raise RuntimeError(
-            "缺少 LLM API Key：当前 BLF_ACTIVE_LLM=deepseek 或未设置；"
-            "请设置 DEEPSEEK_API_KEY，或设置 BLF_ACTIVE_LLM=blf 并配置 BLF_LLM_API_KEY"
+            "缺少 LLM API Key：当前 LLM_PROVIDER=deepseek 或未设置；"
+            "请设置 DEEPSEEK_API_KEY，或改用 blf / openrouter 并配置对应 API Key"
         )
     return LlmConfig(
         base_v1=normalize_openai_v1_base(deepseek_base),

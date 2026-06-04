@@ -17,6 +17,7 @@ from job_info_sync_datahub.field_lineage_datahub_reader import (
     strip_markdown_code_fence,
     write_field_lineage_debug_artifacts,
 )
+from job_info_sync_datahub.field_lineage_batch_summary import write_batch_summary_workbook
 from job_info_sync_datahub.field_lineage_cli import main as field_lineage_cli_main
 from job_info_sync_datahub.field_lineage_excel import (
     load_approved_review_rows,
@@ -30,6 +31,7 @@ from job_info_sync_datahub.field_lineage_models import (
     FieldLineageCandidate,
     FieldLineageInput,
     FieldLineageReviewStatus,
+    UnresolvedField,
 )
 from job_info_sync_datahub.field_lineage_writer import (
     build_fine_grained_lineage_class,
@@ -290,7 +292,7 @@ def test_missing_field_lineage_source_reason_none_when_etl_present() -> None:
     assert missing_field_lineage_source_reason(payload) is None
 
 
-def test_parse_field_lineage_payload_high_confidence_is_approved() -> None:
+def test_parse_field_lineage_payload_high_confidence_is_auto_approved() -> None:
     payload = json.dumps(
         {
             "target_table": "default.dim_store_info",
@@ -324,7 +326,7 @@ def test_parse_field_lineage_payload_high_confidence_is_approved() -> None:
             evidence_sql="select cast(id as bigint) as store_id",
             confidence="HIGH",
             llm_notes="direct mapping",
-            review_status=FieldLineageReviewStatus.APPROVED,
+            review_status=FieldLineageReviewStatus.AUTO_APPROVED,
         )
     ]
     assert parsed.unresolved_fields[0].target_field == "store_name"
@@ -413,7 +415,7 @@ def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
         "source_field",
     ]
     assert "transform_explanation" in headers
-    assert ws["A2"].value == "APPROVED"
+    assert ws["A2"].value == "AUTO_APPROVED"
     assert ws["B2"].value == "default.dim_store_info"
     context_values = {
         row[0].value: row[1].value
@@ -422,7 +424,7 @@ def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
     assert context_values["debug_artifacts_dir"] == str(tmp_path / "debug")
 
 
-def test_load_approved_review_rows_only_returns_approved(tmp_path: Path) -> None:
+def test_load_review_rows_returns_approved_and_auto_approved_by_default(tmp_path: Path) -> None:
     output = tmp_path / "review.xlsx"
     source = FieldLineageInput(
         dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
@@ -433,10 +435,11 @@ def test_load_approved_review_rows_only_returns_approved(tmp_path: Path) -> None
     rows = [
         FieldLineageCandidate(
             target_table="default.dim_store_info",
-            target_field="approved_field",
+            target_field="auto_approved_field",
             source_table="ods.store_info",
             source_field="id",
             confidence="HIGH",
+            transform_expression="cast(id as bigint)",
         ),
         FieldLineageCandidate(
             target_table="default.dim_store_info",
@@ -444,6 +447,14 @@ def test_load_approved_review_rows_only_returns_approved(tmp_path: Path) -> None
             source_table="ods.store_info",
             source_field="name",
             confidence="MEDIUM",
+        ),
+        FieldLineageCandidate(
+            target_table="default.dim_store_info",
+            target_field="manual_approved_field",
+            source_table="ods.store_info",
+            source_field="code",
+            confidence="MEDIUM",
+            review_status=FieldLineageReviewStatus.APPROVED,
         ),
     ]
     write_candidate_workbook(
@@ -456,13 +467,284 @@ def test_load_approved_review_rows_only_returns_approved(tmp_path: Path) -> None
 
     wb = load_workbook(output)
     ws = wb["candidate_lineage"]
-    ws["A2"] = "APPROVED"
+    ws["A2"] = "AUTO_APPROVED"
     ws["A3"] = "PENDING"
+    ws["A4"] = "APPROVED"
     wb.save(output)
 
     approved = load_approved_review_rows(output)
 
-    assert [row.target_field for row in approved] == ["approved_field"]
+    assert [row.target_field for row in approved] == [
+        "auto_approved_field",
+        "manual_approved_field",
+    ]
+
+
+def test_load_review_rows_can_limit_import_statuses(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="auto_approved_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="manual_approved_field",
+                source_table="ods.store_info",
+                source_field="code",
+                transform_expression="code",
+                confidence="MEDIUM",
+                review_status=FieldLineageReviewStatus.APPROVED,
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    rows = load_approved_review_rows(
+        output,
+        import_statuses={FieldLineageReviewStatus.APPROVED},
+    )
+
+    assert [row.target_field for row in rows] == ["manual_approved_field"]
+
+
+def test_auto_review_marks_risky_high_confidence_rows_for_review(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="safe_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="bad_source_field",
+                source_table="ods.store_info",
+                source_field="id,name",
+                transform_expression="concat(id, name)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="unresolved_var_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(${SOURCE_ID} as bigint)",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    rows = list(wb["candidate_lineage"].iter_rows(min_row=2, max_col=2, values_only=True))
+
+    assert rows == [
+        ("AUTO_APPROVED", "default.dim_store_info"),
+        ("NEEDS_REVIEW", "default.dim_store_info"),
+        ("NEEDS_REVIEW", "default.dim_store_info"),
+    ]
+
+
+def test_write_candidate_workbook_excludes_partition_fields(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_id",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="dt",
+                source_table="ods.store_info",
+                source_field="dt",
+                transform_expression="'20260604'",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[
+            UnresolvedField(target_field="dt", reason="partition field"),
+            UnresolvedField(target_field="unknown_field", reason="dynamic SQL"),
+        ],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    fields = [
+        row[0]
+        for row in wb["candidate_lineage"].iter_rows(
+            min_row=2,
+            min_col=3,
+            max_col=3,
+            values_only=True,
+        )
+    ]
+    assert fields == ["store_id", "unknown_field"]
+    statuses = [
+        row[0]
+        for row in wb["candidate_lineage"].iter_rows(
+            min_row=2,
+            min_col=1,
+            max_col=1,
+            values_only=True,
+        )
+    ]
+    assert statuses == ["AUTO_APPROVED", "NEEDS_REVIEW"]
+    unresolved_fields = [
+        row[0]
+        for row in wb["unresolved_fields"].iter_rows(
+            min_row=2,
+            min_col=1,
+            max_col=1,
+            values_only=True,
+        )
+    ]
+    assert unresolved_fields == ["unknown_field"]
+
+
+def test_write_batch_summary_workbook_counts_review_statuses(tmp_path: Path) -> None:
+    batch_dir = tmp_path / "batch"
+    batch_dir.mkdir()
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    workbook = batch_dir / "202606041414_default.dim_store_info.xlsx"
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="safe_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="review_field",
+                source_table="ods.store_info",
+                source_field="id,name",
+                transform_expression="concat(id, name)",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[UnresolvedField(target_field="missing_field", reason="dynamic SQL")],
+        llm_model="deepseek-test",
+    )
+
+    summary = tmp_path / "summary.xlsx"
+    write_batch_summary_workbook(batch_dir, summary)
+
+    wb = load_workbook(summary)
+    ws = wb["table_summary"]
+    headers = [cell.value for cell in ws[1]]
+    row = {headers[idx]: value for idx, value in enumerate(next(ws.iter_rows(min_row=2, values_only=True)))}
+    assert row["table_name"] == "default.dim_store_info"
+    assert row["total_candidate_count"] == 3
+    assert row["auto_approved_count"] == 1
+    assert row["auto_approved_percent"] == 1 / 3
+    assert row["needs_review_count"] == 2
+    assert row["unresolved_field_count"] == 1
+
+
+def test_batch_summary_counts_candidate_lineage_rows_for_percent(tmp_path: Path) -> None:
+    batch_dir = tmp_path / "batch"
+    batch_dir.mkdir()
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    workbook = batch_dir / "202606041414_default.dim_store_info.xlsx"
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_address",
+                source_table="ods.store_a",
+                source_field="address",
+                transform_expression="coalesce(a.address, b.address)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_address",
+                source_table="ods.store_b",
+                source_field="address",
+                transform_expression="coalesce(a.address, b.address)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_name",
+                source_table="ods.store_a",
+                source_field="name,id",
+                transform_expression="concat(name, id)",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    summary = tmp_path / "summary.xlsx"
+    write_batch_summary_workbook(batch_dir, summary)
+
+    wb = load_workbook(summary)
+    ws = wb["table_summary"]
+    headers = [cell.value for cell in ws[1]]
+    row = {headers[idx]: value for idx, value in enumerate(next(ws.iter_rows(min_row=2, values_only=True)))}
+    assert row["total_candidate_count"] == 3
+    assert row["auto_approved_count"] == 2
+    assert row["auto_approved_percent"] == 2 / 3
 
 
 def test_group_coalesce_rows_merge_sources_and_transform() -> None:
@@ -506,6 +788,66 @@ def test_group_coalesce_rows_merge_sources_and_transform() -> None:
         "coalesce(bach.store_address, hd.store_address)"
     )
     assert grouped[0].transform_explanation == _coalesce_explanation
+
+
+def test_group_approved_rows_skips_partition_fields() -> None:
+    grouped = group_approved_rows(
+        [
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_id",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="dt",
+                source_table="ods.store_info",
+                source_field="dt",
+                transform_expression="'20260604'",
+            ),
+        ]
+    )
+
+    assert [item.target_field for item in grouped] == ["store_id"]
+
+
+class _FakeFineGrainedLineage:
+    def __init__(
+        self,
+        upstreams: list[str],
+        downstreams: list[str],
+        transform_operation: str = "",
+    ) -> None:
+        self.upstreams = upstreams
+        self.downstreams = downstreams
+        self.transformOperation = transform_operation
+
+
+def test_merge_fine_grained_lineages_updates_same_downstream_field() -> None:
+    existing_keep = _FakeFineGrainedLineage(
+        upstreams=["urn:li:schemaField:(source,old_keep)"],
+        downstreams=["urn:li:schemaField:(target,keep_field)"],
+    )
+    existing_replace = _FakeFineGrainedLineage(
+        upstreams=["urn:li:schemaField:(source,old_store_id)"],
+        downstreams=["urn:li:schemaField:(target,store_id)"],
+        transform_operation="old expression",
+    )
+    new_store_id = _FakeFineGrainedLineage(
+        upstreams=["urn:li:schemaField:(source,new_store_id)"],
+        downstreams=["urn:li:schemaField:(target,store_id)"],
+        transform_operation="new expression",
+    )
+
+    merged = merge_fine_grained_lineages(
+        [existing_keep, existing_replace],
+        [new_store_id],
+        clear_existing=False,
+    )
+
+    assert merged == [existing_keep, new_store_id]
 
 
 def test_build_transform_operation_for_ui() -> None:
@@ -563,6 +905,7 @@ def test_import_reviewed_cli_writes_approved_plan(tmp_path: Path) -> None:
                 target_field="store_id",
                 source_table="ods.store_info",
                 source_field="id",
+                transform_expression="cast(id as bigint)",
                 confidence="HIGH",
             )
         ],
@@ -584,7 +927,163 @@ def test_import_reviewed_cli_writes_approved_plan(tmp_path: Path) -> None:
     assert payload["rows"][0]["target_field"] == "store_id"
     assert "write_result" in payload
     table_result = payload["write_result"]["tables"]["default.dim_store_info"]
-    assert table_result["replacement_mode"] == "replace_all_fine_grained_lineages_for_table"
+    assert (
+        table_result["replacement_mode"]
+        == "clear_import_replace_all_fine_grained_lineages_for_table"
+    )
+
+
+def test_import_reviewed_cli_can_limit_import_statuses(tmp_path: Path) -> None:
+    workbook = tmp_path / "review.xlsx"
+    output = tmp_path / "import_plan.json"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="auto_approved_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="manual_approved_field",
+                source_table="ods.store_info",
+                source_field="code",
+                transform_expression="code",
+                confidence="MEDIUM",
+                review_status=FieldLineageReviewStatus.APPROVED,
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "import-reviewed",
+            "--input",
+            str(workbook),
+            "--output",
+            str(output),
+            "--import-statuses",
+            "APPROVED",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["import_statuses"] == ["APPROVED"]
+    assert payload["approved_rows"] == 1
+    assert payload["rows"][0]["target_field"] == "manual_approved_field"
+
+
+def test_import_reviewed_cli_requires_full_auto_approved(tmp_path: Path) -> None:
+    from job_info_sync_datahub.field_lineage_cli import EXIT_REQUIRES_REVIEW
+
+    workbook = tmp_path / "review.xlsx"
+    output = tmp_path / "import_plan.json"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="auto_approved_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="needs_review_field",
+                source_table="ods.store_info",
+                source_field="id,name",
+                transform_expression="concat(id, name)",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "import-reviewed",
+            "--input",
+            str(workbook),
+            "--output",
+            str(output),
+            "--import-statuses",
+            "AUTO_APPROVED",
+            "--require-full-auto-approved",
+        ]
+    )
+
+    assert exit_code == EXIT_REQUIRES_REVIEW
+    assert not output.exists()
+
+
+def test_import_reviewed_cli_allows_full_auto_approved(tmp_path: Path) -> None:
+    workbook = tmp_path / "review.xlsx"
+    output = tmp_path / "import_plan.json"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="auto_approved_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "import-reviewed",
+            "--input",
+            str(workbook),
+            "--output",
+            str(output),
+            "--import-statuses",
+            "AUTO_APPROVED",
+            "--require-full-auto-approved",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["approved_rows"] == 1
+    assert payload["auto_approved_percent"] == 1.0
+    assert payload["unresolved_field_count"] == 0
 
 
 def test_import_reviewed_write_without_approved_exits_4(tmp_path: Path) -> None:
@@ -647,6 +1146,7 @@ def test_import_reviewed_write_blocks_confirmed_field_lineage(
                 target_field="store_id",
                 source_table="ods.store_info",
                 source_field="id",
+                transform_expression="cast(id as bigint)",
                 confidence="HIGH",
             )
         ],

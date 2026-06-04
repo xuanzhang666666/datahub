@@ -10,6 +10,7 @@
 # 默认根目录：/data/datahub/out/field_lineage_export
 # 每次运行写入子目录：{根目录}/{批次号}/（不存在则自动创建）
 # 文件命名：{批次号}_{库.表}.xlsx，例如 .../202605181331/202605181331_default.dim_store_info.xlsx
+# 批次汇总：{批次号}_field_lineage_batch_summary.xlsx（汇总已成功导出的表；部分失败退出前也会生成）
 # Debug 中间产物默认写入 Jenkins WORKSPACE：
 #   $WORKSPACE/field_lineage_debug/{批次号}/{库.表}/
 # 未设置 WORKSPACE 时使用 CLI 默认值：Excel 同目录的 *_debug/
@@ -73,6 +74,12 @@ for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WO
     set +a
     echo "[INFO] loaded env: $_cand"
     break
+  elif [[ -e "$_cand" ]]; then
+    if command -v stat >/dev/null 2>&1; then
+      echo "[WARN] env file exists but is not readable: $_cand ($(stat -c '%a %U %G' "$_cand" 2>/dev/null || stat -f '%Lp %Su %Sg' "$_cand" 2>/dev/null || echo 'permission unknown'))" >&2
+    else
+      echo "[WARN] env file exists but is not readable: $_cand" >&2
+    fi
   fi
 done
 
@@ -86,6 +93,9 @@ _load_script_env_for_missing_llm_key() {
       ;;
     deepseek)
       [[ -n "${DEEPSEEK_API_KEY:-}" ]] && return 0
+      ;;
+    openrouter)
+      [[ -n "${OPENROUTER_API_KEY:-}" ]] && return 0
       ;;
     *)
       return 0
@@ -114,6 +124,12 @@ case "$LLM_PROVIDER" in
   deepseek)
     if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
       echo "ERROR: LLM_PROVIDER=deepseek 但 DEEPSEEK_API_KEY 为空；请在 Jenkins 凭据、LINEAGE_ENV_FILE 或 $SCRIPT_DIR/lineage.env 中配置。" >&2
+      exit 2
+    fi
+    ;;
+  openrouter)
+    if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+      echo "ERROR: LLM_PROVIDER=openrouter 但 OPENROUTER_API_KEY 为空；请在 Jenkins 凭据、LINEAGE_ENV_FILE 或 $SCRIPT_DIR/lineage.env 中配置。" >&2
       exit 2
     fi
     ;;
@@ -148,8 +164,50 @@ _parse_tables_multiline
 BATCH_OUTPUT_DIR="$OUTPUT_DIR/$BATCH_ID"
 mkdir -p "$BATCH_OUTPUT_DIR"
 STATUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/field_lineage_export.XXXXXX")"
+_BATCH_SUMMARY_DONE=0
+
+_has_batch_export_workbooks() {
+  local _path
+  while IFS= read -r _path; do
+    [[ "$_path" == *"_summary.xlsx" ]] && continue
+    return 0
+  done < <(find "$BATCH_OUTPUT_DIR" -maxdepth 1 -type f -name '*.xlsx' 2>/dev/null || true)
+  return 1
+}
+
+_write_batch_summary_once() {
+  [[ "$_BATCH_SUMMARY_DONE" -eq 1 ]] && return 0
+  [[ -z "${BATCH_OUTPUT_DIR:-}" || ! -d "$BATCH_OUTPUT_DIR" ]] && return 0
+  if ! _has_batch_export_workbooks; then
+    return 0
+  fi
+  local _summary_file="$BATCH_OUTPUT_DIR/${BATCH_ID}_field_lineage_batch_summary.xlsx"
+  set +e
+  PYTHONPATH="$PYTHONPATH_ROOT" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    "$PYTHON" -m job_info_sync_datahub.field_lineage_batch_summary \
+    --batch-dir "$BATCH_OUTPUT_DIR" \
+    --output "$_summary_file"
+  local _summary_rc=$?
+  set -e
+  if [[ "$_summary_rc" -eq 0 ]]; then
+    _BATCH_SUMMARY_DONE=1
+    echo "[INFO] batch summary: $_summary_file"
+    return 0
+  fi
+  echo "[WARN] batch summary generation failed: $_summary_file" >&2
+  return 1
+}
+
+_on_script_exit() {
+  local _exit_code=$?
+  _write_batch_summary_once || true
+  if [[ -n "${STATUS_DIR:-}" ]]; then
+    rm -rf "$STATUS_DIR"
+  fi
+  exit "$_exit_code"
+}
 # shellcheck disable=SC2064
-trap 'rm -rf "$STATUS_DIR"' EXIT
+trap _on_script_exit EXIT
 
 echo "[INFO] field lineage export started at $(date -Iseconds)"
 echo "[INFO] batch id (auto): $BATCH_ID"
@@ -164,7 +222,14 @@ echo "[INFO] gms url: $DATAHUB_GMS_URL"
 echo "[INFO] gms token: $([[ -n "${DATAHUB_GMS_TOKEN:-}" ]] && echo set || echo empty)"
 echo "[INFO] llm provider: $LLM_PROVIDER"
 echo "[INFO] llm model: ${LLM_MODEL:-<provider-default>}"
-echo "[INFO] llm api key: $([[ "$LLM_PROVIDER" == "deepseek" ]] && { [[ -n "${DEEPSEEK_API_KEY:-}" ]] && echo set || echo empty; } || { [[ -n "${BLF_LLM_API_KEY:-}" ]] && echo set || echo empty; })"
+_llm_key_status() {
+  case "$LLM_PROVIDER" in
+    deepseek) [[ -n "${DEEPSEEK_API_KEY:-}" ]] && echo set || echo empty ;;
+    openrouter) [[ -n "${OPENROUTER_API_KEY:-}" ]] && echo set || echo empty ;;
+    *) [[ -n "${BLF_LLM_API_KEY:-}" ]] && echo set || echo empty ;;
+  esac
+}
+echo "[INFO] llm api key: $(_llm_key_status)"
 echo "[INFO] python: $PYTHON"
 echo "[INFO] pythonpath: $PYTHONPATH_ROOT"
 
@@ -312,6 +377,8 @@ done
 echo "[INFO] field lineage export finished at $(date -Iseconds)"
 echo "[INFO] batch id (auto): $BATCH_ID"
 echo "[INFO] succeeded: ${_ok}/${#TABLE_LIST[@]}, skipped: ${_skip}, failed: ${_fail}"
+
+_write_batch_summary_once || true
 
 if [[ "$_skip" -gt 0 ]]; then
   echo "[WARN] ========== 以下表已跳过字段血缘解析（structured property 无内容）=========="

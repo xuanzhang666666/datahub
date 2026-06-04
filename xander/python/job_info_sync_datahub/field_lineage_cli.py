@@ -23,6 +23,7 @@ from .field_lineage_datahub_reader import (
     missing_field_lineage_source_reason,
     write_field_lineage_debug_artifacts,
 )
+from .field_lineage_batch_summary import summarize_review_workbook
 
 # 无 Etl Script / structured property 内容时跳过 LLM（shell 脚本据此汇总）
 EXIT_SKIP_NO_SOURCE = 3
@@ -30,22 +31,17 @@ EXIT_SKIP_NO_SOURCE = 3
 EXIT_NO_APPROVED_ROWS = 4
 # --write 时目标表已被 Data Availability Flag 标记为字段血缘已确认
 EXIT_CONFIRMED_FIELD_LINEAGE = 5
+# 自动导入模式下，Excel 未达到 100% AUTO_APPROVED 且 unresolved_field_count=0
+EXIT_REQUIRES_REVIEW = 6
 from .field_lineage_excel import load_approved_review_rows, write_candidate_workbook
 from .field_lineage_llm import call_llm_extract_field_lineage
+from .field_lineage_models import FieldLineageReviewStatus
 from .field_lineage_writer import write_approved_field_lineages
 
 
 def _log(message: str) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[FIELD_LINEAGE][{now}] {message}", flush=True)
-
-
-def _preview(text: str, max_chars: int) -> str:
-    if max_chars <= 0:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + f"\n... [truncated, total_chars={len(text)}]"
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
@@ -94,11 +90,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         _log("execute_shell begin")
         print(source_input.execute_shell, flush=True)
         _log("execute_shell end")
-    _log(f"etl_script preview begin max_chars={args.preview_chars}")
-    preview = _preview(source_input.etl_script, args.preview_chars)
-    if preview:
-        print(preview, flush=True)
-    _log("etl_script preview end")
+    _log("etl_script saved to debug artifacts; console preview disabled")
     _log("calling LLM for field lineage candidates ...")
     parsed, model = call_llm_extract_field_lineage(
         source_input,
@@ -122,8 +114,28 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 
 def _cmd_import_reviewed(args: argparse.Namespace) -> int:
-    approved = load_approved_review_rows(args.input)
-    _log(f"import-reviewed started: approved_rows={len(approved)} write={args.write}")
+    import_statuses = _parse_import_statuses(args.import_statuses)
+    workbook_summary = summarize_review_workbook(args.input)
+    if args.require_full_auto_approved and not workbook_summary.is_fully_auto_approved:
+        _log(
+            "SKIP_REQUIRES_REVIEW: "
+            f"auto_approved_percent={workbook_summary.auto_approved_percent:.2%} "
+            f"unresolved_field_count={workbook_summary.unresolved_field_count}"
+        )
+        print(
+            "FIELD_LINEAGE_SKIP_REASON="
+            "REQUIRES_REVIEW:"
+            f"auto_approved_percent={workbook_summary.auto_approved_percent:.2%},"
+            f"unresolved_field_count={workbook_summary.unresolved_field_count}",
+            flush=True,
+        )
+        return EXIT_REQUIRES_REVIEW
+    approved = load_approved_review_rows(args.input, import_statuses=import_statuses)
+    status_values = sorted(status.value for status in import_statuses)
+    _log(
+        "import-reviewed started: "
+        f"approved_rows={len(approved)} write={args.write} import_statuses={','.join(status_values)}"
+    )
     if not approved:
         _log("no APPROVED rows, nothing to import")
         if args.write:
@@ -190,6 +202,10 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
     summary = {
         "input": str(args.input),
         "approved_rows": len(approved),
+        "import_statuses": status_values,
+        "auto_approved_percent": workbook_summary.auto_approved_percent,
+        "unresolved_field_count": workbook_summary.unresolved_field_count,
+        "require_full_auto_approved": args.require_full_auto_approved,
         "dry_run": not args.write,
         "clear_existing": args.clear_existing,
         "rows": [
@@ -215,6 +231,22 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
     else:
         _log("import-reviewed dry-run finished (add --write to persist)")
     return 0
+
+
+def _parse_import_statuses(raw: str) -> set[FieldLineageReviewStatus]:
+    statuses: set[FieldLineageReviewStatus] = set()
+    for item in raw.split(","):
+        value = item.strip().upper()
+        if not value:
+            continue
+        try:
+            statuses.add(FieldLineageReviewStatus(value))
+        except ValueError as exc:
+            allowed = ", ".join(status.value for status in FieldLineageReviewStatus)
+            raise RuntimeError(f"无效 import status: {value}；允许值: {allowed}") from exc
+    if not statuses:
+        raise RuntimeError("import statuses 为空")
+    return statuses
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -245,7 +277,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--preview-chars",
         type=int,
         default=int(os.getenv("FIELD_LINEAGE_PREVIEW_CHARS", "4000")),
-        help="打印 ETL 脚本预览的最大字符数；0 表示不打印脚本内容",
+        help="兼容旧 Jenkins 参数；ETL 脚本正文不再打印到 console，只保存到 debug artifacts",
     )
     export.set_defaults(func=_cmd_export)
 
@@ -272,6 +304,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="导入前清空目标表已有 fineGrainedLineages；默认开启。关闭时合并已有字段血缘",
+    )
+    import_reviewed.add_argument(
+        "--import-statuses",
+        default=os.getenv("FIELD_LINEAGE_IMPORT_STATUSES", "AUTO_APPROVED,APPROVED"),
+        help="逗号分隔的可导入 review_status，默认 AUTO_APPROVED,APPROVED",
+    )
+    import_reviewed.add_argument(
+        "--require-full-auto-approved",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("FIELD_LINEAGE_REQUIRE_FULL_AUTO_APPROVED", "0").lower()
+        in {"1", "true", "yes"},
+        help="要求 auto_approved_percent=100%% 且 unresolved_field_count=0，否则跳过等待人工审核",
     )
     import_reviewed.set_defaults(func=_cmd_import_reviewed)
 

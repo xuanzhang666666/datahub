@@ -31,6 +31,9 @@ def _clear_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "DEEPSEEK_OPENAI_BASE_URL",
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_MODEL",
+        "OPENROUTER_OPENAI_BASE_URL",
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_MODEL",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -118,6 +121,33 @@ def test_get_llm_config_defaults_to_deepseek_even_when_blf_variables_exist(
         model="deepseek-v4-pro",
         provider="deepseek",
     )
+
+
+def test_get_llm_config_uses_openrouter_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    monkeypatch.setenv("OPENROUTER_MODEL", "google/gemini-2.5-pro-preview")
+    monkeypatch.setenv("LLM_MODEL", "anthropic/claude-sonnet-4")
+
+    cfg = get_llm_config()
+
+    assert cfg == LlmConfig(
+        base_v1="https://openrouter.ai/api/v1",
+        api_key="sk-or",
+        model="anthropic/claude-sonnet-4",
+        provider="openrouter",
+    )
+
+
+def test_get_llm_config_missing_openrouter_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+
+    with pytest.raises(RuntimeError) as exc:
+        get_llm_config()
+
+    assert "OPENROUTER_API_KEY" in str(exc.value)
 
 
 def test_get_llm_config_falls_back_to_deepseek(monkeypatch: pytest.MonkeyPatch) -> None:
