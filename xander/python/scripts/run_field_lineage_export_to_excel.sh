@@ -169,6 +169,9 @@ BATCH_OUTPUT_DIR="$OUTPUT_DIR/$BATCH_ID"
 mkdir -p "$BATCH_OUTPUT_DIR"
 STATUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/field_lineage_export.XXXXXX")"
 _BATCH_SUMMARY_DONE=0
+_WAIT_COMPLETED=0
+_FD7_OPEN=0
+_pids=()
 
 _has_batch_export_workbooks() {
   find "$BATCH_OUTPUT_DIR" -maxdepth 1 -type f -name '*.xlsx' 2>/dev/null \
@@ -201,6 +204,29 @@ _write_batch_summary_once() {
 
 _on_script_exit() {
   local _exit_code=$?
+  trap - EXIT
+  if [[ "$_WAIT_COMPLETED" -ne 1 && ${#_pids[@]} -gt 0 ]]; then
+    echo "[WARN] export script exiting before all workers finished; cleaning child processes ..." >&2
+    for _pid in "${_pids[@]}"; do
+      if kill -0 "$_pid" 2>/dev/null; then
+        pkill -TERM -P "$_pid" 2>/dev/null || true
+        kill -TERM "$_pid" 2>/dev/null || true
+      fi
+    done
+    sleep 1
+    for _pid in "${_pids[@]}"; do
+      if kill -0 "$_pid" 2>/dev/null; then
+        pkill -KILL -P "$_pid" 2>/dev/null || true
+        kill -KILL "$_pid" 2>/dev/null || true
+      fi
+      wait "$_pid" 2>/dev/null || true
+    done
+  fi
+  if [[ "$_FD7_OPEN" -eq 1 ]]; then
+    exec 7<&- 2>/dev/null || true
+    exec 7>&- 2>/dev/null || true
+    _FD7_OPEN=0
+  fi
   _write_batch_summary_once || true
   if [[ -n "${STATUS_DIR:-}" ]]; then
     rm -rf "$STATUS_DIR"
@@ -209,6 +235,8 @@ _on_script_exit() {
 }
 # shellcheck disable=SC2064
 trap _on_script_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "[INFO] field lineage export started at $(date -Iseconds)"
 echo "[INFO] batch id (auto): $BATCH_ID"
@@ -257,6 +285,36 @@ _error() {
   echo "[ERROR][$table] $*" >&2
 }
 
+_progress_status_count() {
+  local _status="$1"
+  find "$STATUS_DIR" -maxdepth 1 -type f -name '*.status' -exec cat {} \; 2>/dev/null \
+    | awk -v status="$_status" '$0 == status { count++ } END { print count + 0 }'
+}
+
+_print_progress() {
+  local table="$1"
+  local status_file="$2"
+  local _lock_dir="$STATUS_DIR/progress.lock"
+  local _status _status_label _done _ok_count _skip_count _fail_count
+
+  while ! mkdir "$_lock_dir" 2>/dev/null; do
+    sleep 0.1
+  done
+  trap 'rmdir "$_lock_dir" 2>/dev/null || true' RETURN
+
+  _status="$(cat "$status_file" 2>/dev/null || echo 1)"
+  case "$_status" in
+    0) _status_label="ok" ;;
+    2) _status_label="skipped" ;;
+    *) _status_label="failed" ;;
+  esac
+  _done="$(find "$STATUS_DIR" -maxdepth 1 -type f -name '*.status' 2>/dev/null | wc -l | tr -d ' ')"
+  _ok_count="$(_progress_status_count 0)"
+  _skip_count="$(_progress_status_count 2)"
+  _fail_count="$(_progress_status_count 1)"
+  echo "[PROGRESS] field lineage export ${_done}/${#TABLE_LIST[@]} done, ok=${_ok_count}, skipped=${_skip_count}, failed=${_fail_count}, latest=${table}, status=${_status_label}"
+}
+
 _export_one_table() {
   local TABLE_NAME="$1"
   local OUTPUT_FILE="$2"
@@ -294,7 +352,7 @@ _export_one_table() {
       mkdir -p "$DEBUG_DIR"
       _export_args+=(--debug-dir "$DEBUG_DIR")
     fi
-    _run_cli "${_export_args[@]}" >"$_cli_out" 2>&1
+    _run_cli "${_export_args[@]}" >"$_cli_out" 2>&1 7>&-
     _cli_rc=$?
     set -e
     cat "$_cli_out"
@@ -328,10 +386,10 @@ _export_one_table() {
 _SEM_FIFO="$STATUS_DIR/sem.fifo"
 mkfifo "$_SEM_FIFO"
 exec 7<>"$_SEM_FIFO"
+_FD7_OPEN=1
 rm -f "$_SEM_FIFO"
 for ((_i = 0; _i < CONCURRENCY; _i++)); do echo >&7; done
 
-_pids=()
 for TABLE_NAME in "${TABLE_LIST[@]}"; do
   OUTPUT_FILE="$BATCH_OUTPUT_DIR/${BATCH_ID}_${TABLE_NAME}.xlsx"
   STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.status"
@@ -339,6 +397,7 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
   read -r -u 7
   (
     _export_one_table "$TABLE_NAME" "$OUTPUT_FILE" "$STATUS_FILE" || true
+    _print_progress "$TABLE_NAME" "$STATUS_FILE"
     echo >&7
   ) &
   _pids+=("$!")
@@ -349,7 +408,10 @@ for _pid in "${_pids[@]}"; do
     : # 单表失败已在 STATUS_FILE 记录
   fi
 done
+_WAIT_COMPLETED=1
+exec 7<&-
 exec 7>&-
+_FD7_OPEN=0
 
 _ok=0
 _skip=0
@@ -382,11 +444,11 @@ echo "[INFO] succeeded: ${_ok}/${#TABLE_LIST[@]}, skipped: ${_skip}, failed: ${_
 _write_batch_summary_once || true
 
 if [[ "$_skip" -gt 0 ]]; then
-  echo "[WARN] ========== 以下表已跳过字段血缘解析（structured property 无内容）=========="
+  echo "[WARN] ========== 以下表已跳过字段血缘导出 =========="
   for _entry in "${_skipped_tables[@]}"; do
     echo "[WARN]   ${_entry}"
   done
-  echo "[WARN] 请先在 DataHub 补全 Etl Script (blf.data.warehouse.etl_script) 后重新导出。"
+  echo "[WARN] 若因 structured property 无内容跳过，请先在 DataHub 补全 Etl Script (blf.data.warehouse.etl_script) 后重新导出。"
 fi
 
 if [[ "$_fail" -gt 0 ]]; then

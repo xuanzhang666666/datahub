@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PARTITION_FIELDS = {"dt"}
+PARTITION_FIELDS = {"dt", "hr"}
 
 
 def is_partition_field(field_name: str) -> bool:

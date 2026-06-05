@@ -152,14 +152,35 @@ def fetch_schema_fields(
         raise RuntimeError(f"GET schemaMetadata HTTP {exc.code}: {detail}") from exc
 
 
+def fetch_schema_fields_with_partitions(
+    gms_url: str,
+    dataset_urn: str,
+    token: Optional[str] = None,
+    timeout_sec: int = 60,
+) -> Tuple[List[str], List[str]]:
+    """Fetch dataset schema fields and partition fields from DataHub."""
+    req = urllib.request.Request(
+        schema_metadata_url(gms_url, dataset_urn),
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            return (
+                extract_schema_field_names(payload),
+                extract_schema_partition_field_names(payload),
+            )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GET schemaMetadata HTTP {exc.code}: {detail}") from exc
+
+
 def extract_schema_field_names(payload: Dict[str, Any]) -> List[str]:
     """Extract field names from an OpenAPI schemaMetadata payload."""
-    current: Any = payload
-    if isinstance(current, dict) and "schemaMetadata" in current:
-        current = current["schemaMetadata"]
-    if isinstance(current, dict) and "value" in current:
-        current = current["value"]
-    fields = current.get("fields") if isinstance(current, dict) else None
+    fields = _schema_fields_from_payload(payload)
     if not isinstance(fields, list):
         return []
 
@@ -176,6 +197,36 @@ def extract_schema_field_names(payload: Dict[str, Any]) -> List[str]:
     return names
 
 
+def extract_schema_partition_field_names(payload: Dict[str, Any]) -> List[str]:
+    """Extract fields whose DataHub schema type marks them as Partition Key."""
+    fields = _schema_fields_from_payload(payload)
+    if not isinstance(fields, list):
+        return []
+
+    names: List[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        name = _schema_field_name(field)
+        key = name.lower()
+        if not name or key in seen:
+            continue
+        if _schema_field_is_partition_key(field):
+            names.append(name.lower())
+            seen.add(key)
+    return names
+
+
+def _schema_fields_from_payload(payload: Dict[str, Any]) -> Any:
+    current: Any = payload
+    if isinstance(current, dict) and "schemaMetadata" in current:
+        current = current["schemaMetadata"]
+    if isinstance(current, dict) and "value" in current:
+        current = current["value"]
+    return current.get("fields") if isinstance(current, dict) else None
+
+
 def _schema_field_name(field: Dict[str, Any]) -> str:
     raw_path = field.get("fieldPath")
     if isinstance(raw_path, str) and raw_path.strip():
@@ -186,6 +237,20 @@ def _schema_field_name(field: Dict[str, Any]) -> str:
     if isinstance(raw_name, str):
         return raw_name.strip().lower()
     return ""
+
+
+def _schema_field_is_partition_key(field: Dict[str, Any]) -> bool:
+    candidates: List[str] = []
+    for key in ("nativeDataType", "type", "fieldType"):
+        value = field.get(key)
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, dict):
+            for nested_key in ("type", "nativeDataType", "name"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, str):
+                    candidates.append(nested_value)
+    return any(value.strip().lower() == "partition key" for value in candidates)
 
 
 def _iter_property_assignments(payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
@@ -454,6 +519,18 @@ def trim_shell_job_to_entry_functions_with_debug(
     return trim_shell_job_to_entry_functions(etl_script, table_name), entry, reachable, removed
 
 
+def strip_commented_sql_for_llm(etl_script: str) -> str:
+    """Remove commented SQL fragments before sending ETL text to the LLM."""
+    without_block_comments = re.sub(r"/\*[\s\S]*?\*/", "", etl_script or "")
+    cleaned_lines: List[str] = []
+    for raw_line in without_block_comments.splitlines():
+        stripped = raw_line.lstrip()
+        if stripped.startswith("--") or stripped.startswith("#"):
+            continue
+        cleaned_lines.append(re.sub(r"\s+--.*$", "", raw_line.rstrip()))
+    return "\n".join(cleaned_lines).strip()
+
+
 def _extract_shell_functions(etl_script: str) -> Dict[str, tuple[int, int]]:
     lines = etl_script.splitlines()
     functions: Dict[str, tuple[int, int]] = {}
@@ -501,8 +578,10 @@ def prepare_etl_script_for_llm(
     """Resolve runtime variables and remove unreachable shell-job functions before LLM."""
     resolved = resolve_etl_script_with_execute_shell(etl_script, execute_shell)
     if _looks_like_python_script(resolved, execute_shell):
-        return resolved
-    return trim_shell_job_to_entry_functions(resolved, table_name)
+        return strip_commented_sql_for_llm(resolved)
+    return strip_commented_sql_for_llm(
+        trim_shell_job_to_entry_functions(resolved, table_name)
+    )
 
 
 def prepare_etl_script_for_llm_with_debug(
@@ -516,7 +595,7 @@ def prepare_etl_script_for_llm_with_debug(
     )
     is_python = _looks_like_python_script(resolved, execute_shell)
     if is_python:
-        llm_input = resolved
+        llm_input = strip_commented_sql_for_llm(resolved)
         entry_function = ""
         reachable_functions: List[str] = []
         removed_functions: List[str] = []
@@ -524,6 +603,7 @@ def prepare_etl_script_for_llm_with_debug(
         llm_input, entry_function, reachable_functions, removed_functions = (
             trim_shell_job_to_entry_functions_with_debug(resolved, table_name)
         )
+        llm_input = strip_commented_sql_for_llm(llm_input)
     return FieldLineagePreparationDebug(
         original_etl_script=etl_script or "",
         execute_shell=execute_shell or "",

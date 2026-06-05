@@ -18,7 +18,7 @@ if __name__ == "__main__" and __package__ is None:
 
 from .field_lineage_datahub_reader import (
     extract_field_lineage_input_with_debug,
-    fetch_schema_fields,
+    fetch_schema_fields_with_partitions,
     fetch_structured_properties,
     has_confirmed_field_lineage,
     make_hive_dataset_urn,
@@ -46,6 +46,44 @@ def _log(message: str) -> None:
     print(f"[FIELD_LINEAGE][{now}] {message}", flush=True)
 
 
+def _log_import_summary(summary: dict[str, object], output: Optional[Path]) -> None:
+    _log(
+        "import-reviewed summary: "
+        f"approved_rows={summary['approved_rows']} "
+        f"dry_run={summary['dry_run']} "
+        f"auto_approved_percent={float(summary['auto_approved_percent']):.2%} "
+        f"unresolved_field_count={summary['unresolved_field_count']}"
+    )
+    if output:
+        _log(f"import_plan={output}")
+    write_result = summary.get("write_result")
+    if not isinstance(write_result, dict):
+        return
+    tables = write_result.get("tables")
+    if not isinstance(tables, dict):
+        return
+    for table_name, raw_table_result in sorted(tables.items()):
+        if not isinstance(raw_table_result, dict):
+            continue
+        message = (
+            f"table={table_name} "
+            f"field_count={raw_table_result.get('field_count', 0)} "
+            f"written={raw_table_result.get('written', False)}"
+        )
+        completeness = raw_table_result.get("field_lineage_completeness")
+        if isinstance(completeness, dict):
+            missing_fields = completeness.get("missing_fields")
+            missing_count = len(missing_fields) if isinstance(missing_fields, list) else 0
+            message += (
+                f" completeness={completeness.get('is_complete', False)} "
+                f"covered={completeness.get('covered_field_count', 0)}/"
+                f"{completeness.get('schema_field_count', 0)} "
+                f"missing={missing_count} "
+                f"marked_flag={completeness.get('marked_data_availability_flag', False)}"
+            )
+        _log(message)
+
+
 def _cmd_export(args: argparse.Namespace) -> int:
     if args.llm_provider:
         os.environ["LLM_PROVIDER"] = args.llm_provider
@@ -65,6 +103,11 @@ def _cmd_export(args: argparse.Namespace) -> int:
         dataset_urn,
         token=args.gms_token,
     )
+    if has_confirmed_field_lineage(payload):
+        skip_reason = "Data Availability Flag 已包含「字段血缘」，字段血缘已确认，跳过导出"
+        _log(f"SKIP: {skip_reason}")
+        print(f"FIELD_LINEAGE_SKIP_REASON={skip_reason}", flush=True)
+        return EXIT_SKIP_NO_SOURCE
     skip_reason = missing_field_lineage_source_reason(payload)
     if skip_reason:
         _log(f"SKIP: {skip_reason}")
@@ -77,15 +120,20 @@ def _cmd_export(args: argparse.Namespace) -> int:
     )
     _log("reading DataHub schemaMetadata ...")
     try:
-        target_schema_fields = fetch_schema_fields(
+        target_schema_fields, target_partition_fields = fetch_schema_fields_with_partitions(
             args.gms_url,
             dataset_urn,
             token=args.gms_token,
         )
     except RuntimeError as exc:
         target_schema_fields = []
+        target_partition_fields = []
         _log(f"warning: schemaMetadata read failed, continue without DDL order: {exc}")
-    source_input = replace(source_input, target_schema_fields=target_schema_fields)
+    source_input = replace(
+        source_input,
+        target_schema_fields=target_schema_fields,
+        target_partition_fields=target_partition_fields,
+    )
     debug_dir = args.debug_dir or args.output.with_suffix("").with_name(
         f"{args.output.stem}_debug"
     )
@@ -96,6 +144,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
     )
     _log("structuredProperties loaded")
     _log(f"target_schema_field_count={len(source_input.target_schema_fields)}")
+    _log(f"target_partition_fields={','.join(source_input.target_partition_fields)}")
     _log(f"etl_script_chars={len(source_input.etl_script)}")
     _log(f"execute_shell_chars={len(source_input.execute_shell)}")
     _log(f"debug artifacts dir={debug_dir}")
@@ -239,7 +288,7 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    _log_import_summary(summary, args.output)
     if args.write:
         _log("import-reviewed write finished")
     else:

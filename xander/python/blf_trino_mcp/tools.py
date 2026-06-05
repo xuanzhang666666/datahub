@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Any
 
 from .ddl_unicode import maybe_decode_show_create_ddl
@@ -41,11 +43,29 @@ def _rows_as_dicts(columns: list[str], rows: list[Any]) -> list[dict[str, Any]]:
     items = []
     for row in rows:
         values = list(row) if isinstance(row, (tuple, list)) else [row]
+        safe_values = [_json_safe_value(value) for value in values]
         if columns and len(columns) == len(values):
-            items.append(dict(zip(columns, values)))
+            items.append(dict(zip(columns, safe_values)))
         else:
-            items.append({"row": values})
+            items.append({"row": safe_values})
     return items
+
+
+def _json_safe_value(value: Any) -> Any:
+    """Convert Trino DB-API values to JSON-serializable values."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _query_with_limit(

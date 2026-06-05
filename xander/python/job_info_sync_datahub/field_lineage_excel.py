@@ -18,6 +18,10 @@ from .field_lineage_models import (
     UnresolvedField,
     review_status_from_confidence,
 )
+from .field_lineage_constants import (
+    constant_expression_from_reason,
+    is_constant_transform_expression,
+)
 from .field_lineage_policy import is_partition_field, is_self_dependency
 
 CANDIDATE_HEADERS = [
@@ -80,14 +84,16 @@ def _effective_review_status(candidate: FieldLineageCandidate) -> FieldLineageRe
 
 
 def _is_safe_for_auto_approval(candidate: FieldLineageCandidate) -> bool:
-    values = [
+    required_values = [
         candidate.target_table,
         candidate.target_field,
-        candidate.source_table,
-        candidate.source_field,
         candidate.transform_expression,
     ]
-    if any(not value.strip() for value in values):
+    if any(not value.strip() for value in required_values):
+        return False
+    has_source = bool(candidate.source_table.strip() and candidate.source_field.strip())
+    is_constant = is_constant_transform_expression(candidate.transform_expression)
+    if not has_source and not is_constant:
         return False
     if "," in candidate.source_field:
         return False
@@ -165,11 +171,48 @@ def _unresolved_to_candidate_row(
     ]
 
 
+def _unresolved_constant_candidate(
+    source_input: FieldLineageInput,
+    unresolved: UnresolvedField,
+) -> Optional[FieldLineageCandidate]:
+    expression, evidence_sql = constant_expression_from_reason(
+        unresolved.reason,
+        unresolved.target_field,
+    )
+    if not expression:
+        return None
+    return FieldLineageCandidate(
+        target_table=source_input.table_name,
+        target_field=unresolved.target_field,
+        source_table="",
+        source_field="",
+        transform_expression=expression,
+        transform_explanation=(
+            f"目标字段 {unresolved.target_field} 由常量 {expression} 写入，"
+            "无上游来源字段。"
+        ),
+        evidence_sql=evidence_sql,
+        confidence="HIGH",
+        llm_notes=f"UNRESOLVED converted to constant field: {unresolved.reason}",
+        review_status=FieldLineageReviewStatus.AUTO_APPROVED,
+    )
+
+
+def _is_target_partition_field(source_input: FieldLineageInput, field_name: str) -> bool:
+    normalized = field_name.strip().lower()
+    dynamic_partitions = {
+        field.strip().lower()
+        for field in source_input.target_partition_fields
+        if field.strip()
+    }
+    return is_partition_field(normalized) or normalized in dynamic_partitions
+
+
 def _target_schema_field_set(source_input: FieldLineageInput) -> Set[str]:
     return {
         field.strip().lower()
         for field in source_input.target_schema_fields
-        if field.strip() and not is_partition_field(field)
+        if field.strip() and not _is_target_partition_field(source_input, field)
     }
 
 
@@ -258,7 +301,7 @@ def write_candidate_workbook(
     create_like_source_table = _create_like_source_table(source_input)
     for candidate in candidates:
         candidate = _canonical_candidate(source_input, candidate)
-        if is_partition_field(candidate.target_field):
+        if _is_target_partition_field(source_input, candidate.target_field):
             continue
         if is_self_dependency(candidate.target_table, candidate.source_table):
             continue
@@ -266,18 +309,25 @@ def write_candidate_workbook(
             continue
         emitted_target_fields.add(candidate.target_field.strip().lower())
         ws.append(_candidate_to_row(candidate))
+    remaining_unresolved_fields: List[UnresolvedField] = []
     for unresolved in unresolved_fields:
-        if is_partition_field(unresolved.target_field):
+        if _is_target_partition_field(source_input, unresolved.target_field):
             continue
         if not _is_known_target_field(unresolved.target_field, schema_fields):
             continue
+        constant_candidate = _unresolved_constant_candidate(source_input, unresolved)
+        if constant_candidate is not None:
+            emitted_target_fields.add(unresolved.target_field.strip().lower())
+            ws.append(_candidate_to_row(constant_candidate))
+            continue
+        remaining_unresolved_fields.append(unresolved)
         emitted_target_fields.add(unresolved.target_field.strip().lower())
         ws.append(_unresolved_to_candidate_row(source_input, unresolved))
     for target_field in source_input.target_schema_fields:
         normalized = target_field.strip().lower()
         if (
             not normalized
-            or is_partition_field(normalized)
+            or _is_target_partition_field(source_input, normalized)
             or normalized in emitted_target_fields
         ):
             continue
@@ -298,8 +348,8 @@ def write_candidate_workbook(
 
     unresolved_ws = wb.create_sheet("unresolved_fields")
     unresolved_ws.append(UNRESOLVED_HEADERS)
-    for unresolved in unresolved_fields:
-        if is_partition_field(unresolved.target_field):
+    for unresolved in remaining_unresolved_fields:
+        if _is_target_partition_field(source_input, unresolved.target_field):
             continue
         if not _is_known_target_field(unresolved.target_field, schema_fields):
             continue
@@ -314,6 +364,7 @@ def write_candidate_workbook(
     context_ws.append(["execute_shell_chars", str(len(source_input.execute_shell))])
     context_ws.append(["target_schema_field_count", str(len(source_input.target_schema_fields))])
     context_ws.append(["target_schema_fields", ",".join(source_input.target_schema_fields)])
+    context_ws.append(["target_partition_fields", ",".join(source_input.target_partition_fields)])
     context_ws.append(["target_table_aliases", ",".join(source_input.target_table_aliases)])
     context_ws.append(["create_like_source_table", create_like_source_table])
     context_ws.append(["execute_shell", source_input.execute_shell])

@@ -3,11 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Dict, List, Optional, Set, Tuple
 
-from .field_lineage_datahub_reader import make_hive_dataset_urn
+from .field_lineage_datahub_reader import (
+    extract_data_availability_flags,
+    fetch_schema_fields_with_partitions,
+    fetch_structured_properties,
+    make_hive_dataset_urn,
+)
+from .field_lineage_constants import is_constant_transform_expression
 from .field_lineage_models import FieldLineageCandidate
 from .field_lineage_policy import is_partition_field, is_self_dependency
+from .structured_properties import URN_DATA_AVAILABILITY_FLAG, sort_data_availability_flags
 from .models import TableRef
 
 try:
@@ -98,13 +111,20 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
         seen: Set[Tuple[str, str]] = set()
         for item in items:
             src = (item.source_table.strip().lower(), item.source_field.strip().lower())
+            if not src[0] and not src[1] and is_constant_transform_expression(
+                item.transform_expression
+            ):
+                continue
             if not src[0] or not src[1]:
                 continue
             if src in seen:
                 continue
             seen.add(src)
             sources.append(src)
-        if not sources:
+        has_constant_transform = any(
+            is_constant_transform_expression(item.transform_expression) for item in items
+        )
+        if not sources and not has_constant_transform:
             continue
         confidences = [i.confidence for i in items if i.confidence]
         grouped.append(
@@ -156,7 +176,146 @@ def _field_name_from_schema_field_urn(urn: str) -> Optional[str]:
     inner = urn[len("urn:li:schemaField:") :]
     if "," not in inner:
         return None
-    return inner.rsplit(",", 1)[-1].strip()
+    return inner.rsplit(",", 1)[-1].strip().rstrip(")").strip().lower()
+
+
+def _downstream_fields_from_fine_grained_lineages(
+    entries: List[FineGrainedLineageClass],
+) -> Set[str]:
+    fields: Set[str] = set()
+    for entry in entries:
+        for downstream in entry.downstreams or []:
+            field = _field_name_from_schema_field_urn(downstream)
+            if field:
+                fields.add(field)
+    return fields
+
+
+def _read_fine_grained_lineages_with_retry(
+    graph: object,
+    downstream_urn: str,
+    *,
+    expected_downstream_fields: Set[str],
+    max_attempts: int = 5,
+    sleep_seconds: int = 3,
+) -> List[FineGrainedLineageClass]:
+    """Read persisted fine-grained lineage, retrying while GMS has not exposed it."""
+    last_entries: List[FineGrainedLineageClass] = []
+    for attempt in range(1, max_attempts + 1):
+        existing = graph.get_aspect(
+            entity_urn=downstream_urn,
+            aspect_type=UpstreamLineageClass,
+        )
+        last_entries = (
+            list(existing.fineGrainedLineages)
+            if existing and existing.fineGrainedLineages
+            else []
+        )
+        covered = _downstream_fields_from_fine_grained_lineages(last_entries)
+        if expected_downstream_fields.issubset(covered):
+            return last_entries
+        if attempt < max_attempts:
+            time.sleep(sleep_seconds)
+    return last_entries
+
+
+def _patch_data_availability_flags(
+    gms_url: str,
+    dataset_urn: str,
+    flags: List[str],
+    token: Optional[str] = None,
+) -> None:
+    body = {
+        "patch": [
+            {
+                "op": "add",
+                "path": f"/properties/{URN_DATA_AVAILABILITY_FLAG}",
+                "value": {
+                    "propertyUrn": URN_DATA_AVAILABILITY_FLAG,
+                    "values": [{"string": flag} for flag in flags],
+                },
+            }
+        ],
+        "arrayPrimaryKeys": {"properties": ["propertyUrn"]},
+    }
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/"
+        f"{urllib.parse.quote(dataset_urn, safe='')}/structuredProperties",
+        data=data,
+        method="PATCH",
+        headers={
+            "Content-Type": "application/json-patch+json",
+            "Accept": "application/json",
+        },
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PATCH data_availability_flag HTTP {exc.code}: {detail}") from exc
+
+
+def verify_field_lineage_completeness(
+    gms_url: str,
+    target_table: str,
+    fine_grained_lineages: List[FineGrainedLineageClass],
+    token: Optional[str] = None,
+    platform_instance: str = "blf-prod-hive",
+    env: str = "PROD",
+    *,
+    mark_available: bool = True,
+) -> Dict[str, object]:
+    """Check whether every non-partition DDL field has field lineage, then mark it."""
+    dataset_urn = make_hive_dataset_urn(target_table, platform_instance, env)
+    all_schema_fields, partition_fields = fetch_schema_fields_with_partitions(
+        gms_url,
+        dataset_urn,
+        token=token,
+    )
+    partition_field_set = {field.strip().lower() for field in partition_fields if field.strip()}
+    schema_fields = [
+        field.lower()
+        for field in all_schema_fields
+        if not is_partition_field(field) and field.strip().lower() not in partition_field_set
+    ]
+    schema_field_set = set(schema_fields)
+    covered_fields = _downstream_fields_from_fine_grained_lineages(fine_grained_lineages)
+    missing_fields = [
+        field for field in schema_fields if field not in covered_fields
+    ]
+    extra_fields = sorted(covered_fields - schema_field_set)
+    is_complete = bool(schema_fields) and not missing_fields
+
+    result: Dict[str, object] = {
+        "dataset_urn": dataset_urn,
+        "schema_field_count": len(schema_fields),
+        "partition_fields": sorted(partition_field_set),
+        "covered_field_count": len(schema_field_set.intersection(covered_fields)),
+        "missing_fields": missing_fields,
+        "extra_downstream_fields": extra_fields,
+        "is_complete": is_complete,
+        "marked_data_availability_flag": False,
+    }
+    if not schema_fields:
+        result["reason"] = "schemaMetadata 无非分区字段，无法确认字段血缘完整"
+        return result
+    if not is_complete:
+        result["reason"] = "存在 DDL 非分区字段没有字段血缘"
+        return result
+
+    payload = fetch_structured_properties(gms_url, dataset_urn, token=token)
+    final_flags = sort_data_availability_flags(
+        [*extract_data_availability_flags(payload), "字段血缘"]
+    )
+    result["data_availability_flags_after"] = final_flags
+    if mark_available:
+        _patch_data_availability_flags(gms_url, dataset_urn, final_flags, token=token)
+        result["marked_data_availability_flag"] = True
+    return result
 
 
 def merge_fine_grained_lineages(
@@ -279,6 +438,36 @@ def write_approved_field_lineages(
         emitter.emit_mcp(mcp)
         table_result["written"] = True
         table_result["fine_grained_count_after_merge"] = len(merged_fg)
+        expected_downstream_fields = {g.target_field for g in groups}
+        verify_retry_attempts = int(os.getenv("FIELD_LINEAGE_VERIFY_RETRY_ATTEMPTS", "5"))
+        verify_retry_sleep_seconds = int(
+            os.getenv("FIELD_LINEAGE_VERIFY_RETRY_SLEEP_SECONDS", "3")
+        )
+        persisted_fg = _read_fine_grained_lineages_with_retry(
+            graph,
+            downstream_urn,
+            expected_downstream_fields=expected_downstream_fields,
+            max_attempts=verify_retry_attempts,
+            sleep_seconds=verify_retry_sleep_seconds,
+        )
+        persisted_downstream_fields = _downstream_fields_from_fine_grained_lineages(
+            persisted_fg
+        )
+        table_result["field_lineage_verify_retry"] = {
+            "max_attempts": verify_retry_attempts,
+            "sleep_seconds": verify_retry_sleep_seconds,
+            "expected_downstream_fields": sorted(expected_downstream_fields),
+            "persisted_downstream_fields": sorted(persisted_downstream_fields),
+            "persisted_fine_grained_count": len(persisted_fg),
+        }
+        table_result["field_lineage_completeness"] = verify_field_lineage_completeness(
+            gms_url,
+            target_table,
+            persisted_fg,
+            token=token,
+            platform_instance=platform_instance,
+            env=env,
+        )
         results["tables"][target_table] = table_result
 
     return results

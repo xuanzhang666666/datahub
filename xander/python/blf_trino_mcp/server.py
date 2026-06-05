@@ -5,12 +5,20 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import mimetypes
 import os
 import secrets
+import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable
 
+from .reports import (
+    export_nl_query_to_excel,
+    export_sql_to_excel,
+    generate_bi_report,
+)
 from .tools import (
     get_hive_table_ddl,
     get_hive_table_partitions,
@@ -142,6 +150,107 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["question"],
         },
     },
+    "blf_trino_export_sql_to_excel": {
+        "description": "执行只读 Trino SQL，并将查询结果导出为 Excel 文件，返回下载链接。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "只读 SQL，只允许 SELECT/WITH/SHOW/DESCRIBE/EXPLAIN 单语句。",
+                },
+                "row_limit": {
+                    "type": "integer",
+                    "default": 10000,
+                    "description": "最多导出多少行，MCP 最大 100000。",
+                },
+                "file_name": {
+                    "type": "string",
+                    "default": "",
+                    "description": "可选文件名前缀；为空时自动生成。",
+                },
+                "sheet_name": {
+                    "type": "string",
+                    "default": "data",
+                    "description": "Excel 数据 sheet 名称。",
+                },
+                "include_summary": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否生成 summary sheet，记录 SQL、行数、截断状态等信息。",
+                },
+            },
+            "required": ["sql"],
+        },
+    },
+    "blf_trino_export_nl_query_to_excel": {
+        "description": "将自然语言问题对应的 Agent 生成 SQL 执行后导出为 Excel 文件。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "用户自然语言问题。",
+                },
+                "generated_sql": {
+                    "type": "string",
+                    "description": "调用方 Agent 生成的只读 Trino SQL；MCP 负责校验、执行和导出。",
+                },
+                "row_limit": {
+                    "type": "integer",
+                    "default": 10000,
+                    "description": "最多导出多少行，MCP 最大 100000。",
+                },
+                "file_name": {
+                    "type": "string",
+                    "default": "",
+                    "description": "可选文件名前缀；为空时根据问题自动生成。",
+                },
+            },
+            "required": ["question", "generated_sql"],
+        },
+    },
+    "blf_trino_generate_bi_report": {
+        "description": "执行一个或多个只读 Trino SQL，生成 Excel 多 sheet 报表，并可同时生成 HTML BI 报表。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "report_title": {
+                    "type": "string",
+                    "description": "报表标题，也会用于生成文件名前缀。",
+                },
+                "queries": {
+                    "type": "array",
+                    "description": "报表数据集列表，每项包含 name 和 sql。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "数据集名称，会作为 Excel sheet 名称。",
+                            },
+                            "sql": {
+                                "type": "string",
+                                "description": "只读 Trino SQL。",
+                            },
+                        },
+                        "required": ["name", "sql"],
+                    },
+                },
+                "row_limit": {
+                    "type": "integer",
+                    "default": 10000,
+                    "description": "每个 SQL 最多导出多少行，MCP 最大 100000。",
+                },
+                "include_html": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否同时生成 HTML 报表，便于浏览器查看。",
+                },
+            },
+            "required": ["report_title", "queries"],
+        },
+    },
 }
 
 
@@ -163,15 +272,27 @@ def load_env_file(path: str) -> None:
 class BlfTrinoMcpApplication:
     """Stateful MCP JSON-RPC application."""
 
-    def __init__(self, *, trino_client: TrinoClient, mcp_token: str | None) -> None:
+    def __init__(
+        self,
+        *,
+        trino_client: TrinoClient,
+        mcp_token: str | None,
+        export_dir: str,
+        public_base_url: str,
+    ) -> None:
         self.trino_client = trino_client
         self.mcp_token = mcp_token
+        self.export_dir = export_dir
+        self.public_base_url = public_base_url.rstrip("/")
         self.handlers: dict[str, ToolHandler] = {
             "blf_trino_get_hive_table_ddl": get_hive_table_ddl,
             "blf_trino_get_hive_table_partitions": get_hive_table_partitions,
             "blf_trino_query_hive_sql": query_hive_sql,
             "blf_trino_query_hive_sql_fragment": query_hive_sql_fragment,
             "blf_trino_query_hive_by_natural_language": query_hive_by_natural_language,
+            "blf_trino_export_sql_to_excel": export_sql_to_excel,
+            "blf_trino_export_nl_query_to_excel": export_nl_query_to_excel,
+            "blf_trino_generate_bi_report": generate_bi_report,
         }
 
     def authorized(self, header_value: str | None) -> bool:
@@ -214,7 +335,19 @@ class BlfTrinoMcpApplication:
             raise ValueError(f"Unknown tool: {name}")
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be an object")
-        result = self.handlers[name](self.trino_client, **arguments)
+        if name in {
+            "blf_trino_export_sql_to_excel",
+            "blf_trino_export_nl_query_to_excel",
+            "blf_trino_generate_bi_report",
+        }:
+            result = self.handlers[name](
+                self.trino_client,
+                export_dir=self.export_dir,
+                public_base_url=self.public_base_url,
+                **arguments,
+            )
+        else:
+            result = self.handlers[name](self.trino_client, **arguments)
         return {
             "content": [
                 {
@@ -251,6 +384,9 @@ def make_handler(app: BlfTrinoMcpApplication) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:
             if self.path.rstrip("/") == "/health":
                 self._write_json({"ok": True})
+                return
+            if self.path.startswith("/files/"):
+                self._serve_export_file()
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -302,6 +438,37 @@ def make_handler(app: BlfTrinoMcpApplication) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _serve_export_file(self) -> None:
+            raw_name = self.path[len("/files/") :]
+            file_name = Path(urllib.parse.unquote(raw_name)).name
+            path = Path(app.export_dir) / file_name
+            try:
+                resolved = path.resolve()
+                export_root = Path(app.export_dir).resolve()
+                if export_root not in resolved.parents and resolved != export_root:
+                    self.send_error(HTTPStatus.FORBIDDEN)
+                    return
+                if not resolved.is_file():
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                content_type = (
+                    mimetypes.guess_type(str(resolved))[0]
+                    or "application/octet-stream"
+                )
+                body = resolved.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{resolved.name}"',
+                )
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                logger.exception("Failed to serve export file %s", file_name)
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+
     return Handler
 
 
@@ -316,9 +483,19 @@ def build_app() -> BlfTrinoMcpApplication:
         schema=os.getenv("TRINO_SCHEMA", TrinoConfig.schema),
     )
     token = os.getenv("BLF_TRINO_MCP_TOKEN") or os.getenv("BLF_DATAHUB_MCP_TOKEN")
+    export_dir = os.getenv(
+        "BLF_TRINO_EXPORT_DIR",
+        "/data/datahub/scripts/blf_trino_exports",
+    )
+    public_base_url = os.getenv(
+        "BLF_TRINO_PUBLIC_BASE_URL",
+        f"http://neo4j2.dp.data.bj1.wormpex.com:{os.getenv('BLF_TRINO_MCP_PORT', '9011')}",
+    )
     return BlfTrinoMcpApplication(
         trino_client=TrinoClient(config),
         mcp_token=token,
+        export_dir=export_dir,
+        public_base_url=public_base_url,
     )
 
 

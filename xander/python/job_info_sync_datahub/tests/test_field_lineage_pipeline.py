@@ -13,9 +13,11 @@ from job_info_sync_datahub.field_lineage_datahub_reader import (
     extract_field_lineage_input,
     extract_field_lineage_input_with_debug,
     extract_schema_field_names,
+    extract_schema_partition_field_names,
     has_confirmed_field_lineage,
     make_hive_dataset_urn,
     missing_field_lineage_source_reason,
+    strip_commented_sql_for_llm,
     strip_markdown_code_fence,
     write_field_lineage_debug_artifacts,
 )
@@ -37,10 +39,13 @@ from job_info_sync_datahub.field_lineage_models import (
     UnresolvedField,
 )
 from job_info_sync_datahub.field_lineage_writer import (
+    _field_name_from_schema_field_urn,
+    _read_fine_grained_lineages_with_retry,
     build_fine_grained_lineage_class,
     build_transform_operation_for_ui,
     group_approved_rows,
     merge_fine_grained_lineages,
+    verify_field_lineage_completeness,
 )
 from job_info_sync_datahub.structured_properties import URN_ETL_SCRIPT, URN_EXECUTE_SHELL
 from job_info_sync_datahub.structured_properties import URN_DATA_AVAILABILITY_FLAG
@@ -184,6 +189,52 @@ def test_extract_data_availability_flags_detects_confirmed_field_lineage() -> No
     assert has_confirmed_field_lineage(payload) is True
 
 
+def test_extract_schema_partition_field_names_from_partition_key_type() -> None:
+    payload = {
+        "schemaMetadata": {
+            "value": {
+                "fields": [
+                    {"fieldPath": "sku_code", "nativeDataType": "string"},
+                    {"fieldPath": "kpt", "nativeDataType": "Partition Key"},
+                    {"fieldPath": "biz_hour", "type": "Partition Key"},
+                ]
+            }
+        }
+    }
+
+    assert extract_schema_field_names(payload) == ["sku_code", "kpt", "biz_hour"]
+    assert extract_schema_partition_field_names(payload) == ["kpt", "biz_hour"]
+
+
+def test_strip_commented_sql_for_llm_removes_commented_sources() -> None:
+    script = """
+with active_data as (
+    select store_code, sku_code -- active inline comment
+    from data_smartorder.active_source_di
+),
+--store_contract_hurdle_data as--项目维度，合同
+--(select
+    --project_id,
+    --business_estimate_value_hurdle-0 as hurdle--有数据只有600多条
+--from dw_store_construction_contract_detail_v1--上游209单
+--where dt ='20260603'
+--),
+/* commented_block as (
+   select * from data_smartorder.block_commented_source_di
+) */
+final_data as (
+    select * from active_data
+)
+"""
+
+    cleaned = strip_commented_sql_for_llm(script)
+
+    assert "data_smartorder.active_source_di" in cleaned
+    assert "active inline comment" not in cleaned
+    assert "dw_store_construction_contract_detail_v1" not in cleaned
+    assert "data_smartorder.block_commented_source_di" not in cleaned
+
+
 def test_extract_field_lineage_input_keeps_only_job_entry_reachable_functions() -> None:
     payload = _structured_properties_payload(
         etl_script=(
@@ -198,6 +249,7 @@ def test_extract_field_lineage_input_keeps_only_job_entry_reachable_functions() 
             "function calculate {\n"
             "  $HIVE << EOF\n"
             "insert overwrite table default.$TABLE_NAME select company_id from ods.company;\n"
+            "--select bad_id from ods.commented_source;\n"
             "EOF\n"
             "}\n"
             "\n"
@@ -225,6 +277,7 @@ def test_extract_field_lineage_input_keeps_only_job_entry_reachable_functions() 
     assert "HDFS_DIR=/user/wstats/ods_bach_baseinfo_shop_company" in result.etl_script
     assert "unused_debug_sql" not in result.etl_script
     assert "should_not_send" not in result.etl_script
+    assert "ods.commented_source" not in result.etl_script
 
 
 def test_write_field_lineage_debug_artifacts_saves_intermediate_results(tmp_path: Path) -> None:
@@ -638,9 +691,18 @@ def test_write_candidate_workbook_excludes_partition_fields(tmp_path: Path) -> N
                 transform_expression="'20260604'",
                 confidence="HIGH",
             ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="hr",
+                source_table="ods.store_info",
+                source_field="hr",
+                transform_expression="'11'",
+                confidence="HIGH",
+            ),
         ],
         unresolved_fields=[
             UnresolvedField(target_field="dt", reason="partition field"),
+            UnresolvedField(target_field="hr", reason="partition field"),
             UnresolvedField(target_field="unknown_field", reason="dynamic SQL"),
         ],
         llm_model="deepseek-test",
@@ -677,6 +739,226 @@ def test_write_candidate_workbook_excludes_partition_fields(tmp_path: Path) -> N
         )
     ]
     assert unresolved_fields == ["unknown_field"]
+
+
+def test_write_candidate_workbook_excludes_hr_partition_from_schema_fill(
+    tmp_path: Path,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.product_shop_sku_hi"),
+        table_name="default.product_shop_sku_hi",
+        etl_script="select sku_code from ods.product_shop_sku",
+        execute_shell="sh run.sh",
+        target_schema_fields=["sku_code", "dt", "hr"],
+    )
+
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.product_shop_sku_hi",
+                target_field="sku_code",
+                source_table="ods.product_shop_sku",
+                source_field="sku_code",
+                transform_expression="sku_code",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(workbook)
+    target_fields = [
+        row[0]
+        for row in wb["candidate_lineage"].iter_rows(
+            min_row=2,
+            min_col=3,
+            max_col=3,
+            values_only=True,
+        )
+    ]
+    assert target_fields == ["sku_code"]
+
+
+def test_write_candidate_workbook_excludes_schema_partition_key_fields(
+    tmp_path: Path,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.product_shop_sku_hi"),
+        table_name="default.product_shop_sku_hi",
+        etl_script="select sku_code from ods.product_shop_sku",
+        execute_shell="sh run.sh",
+        target_schema_fields=["sku_code", "kpt"],
+        target_partition_fields=["kpt"],
+    )
+
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.product_shop_sku_hi",
+                target_field="sku_code",
+                source_table="ods.product_shop_sku",
+                source_field="sku_code",
+                transform_expression="sku_code",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.product_shop_sku_hi",
+                target_field="kpt",
+                source_table="ods.product_shop_sku",
+                source_field="kpt",
+                transform_expression="kpt",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[UnresolvedField(target_field="kpt", reason="partition key")],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(workbook)
+    target_fields = [
+        row[0]
+        for row in wb["candidate_lineage"].iter_rows(
+            min_row=2,
+            min_col=3,
+            max_col=3,
+            values_only=True,
+        )
+    ]
+    assert target_fields == ["sku_code"]
+    assert list(wb["unresolved_fields"].iter_rows(min_row=2, values_only=True)) == []
+
+
+def test_write_candidate_workbook_auto_approves_null_constant_field(tmp_path: Path) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.plan_price"),
+        table_name="default.plan_price",
+        etl_script="insert overwrite table default.plan_price select null as vendor_code from tmp1",
+        execute_shell="sh run.sh",
+        target_schema_fields=["plan_code", "vendor_code", "dt"],
+    )
+
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.plan_price",
+                target_field="vendor_code",
+                source_table="",
+                source_field="",
+                transform_expression="NULL",
+                transform_explanation="目标字段 vendor_code 由常量 NULL 写入，表示业务系统废弃字段，无上游来源字段。",
+                evidence_sql="null as vendor_code",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(workbook)
+    headers = [cell.value for cell in wb["candidate_lineage"][1]]
+    rows = [
+        dict(zip(headers, row))
+        for row in wb["candidate_lineage"].iter_rows(min_row=2, values_only=True)
+    ]
+    vendor_row = next(row for row in rows if row["target_field"] == "vendor_code")
+    assert vendor_row["review_status"] == "AUTO_APPROVED"
+    assert vendor_row["source_table"] is None
+    assert vendor_row["source_field"] is None
+    assert vendor_row["transform_expression"] == "NULL"
+
+
+def test_write_candidate_workbook_auto_approves_unresolved_null_constant_field(
+    tmp_path: Path,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.pdw_bach_baseinfo_price_price_plan_detail"),
+        table_name="default.pdw_bach_baseinfo_price_price_plan_detail",
+        etl_script="insert overwrite table default.pdw_bach_baseinfo_price_price_plan_detail select null as vendor_code from tmp1",
+        execute_shell="sh run.sh",
+        target_schema_fields=["plan_code", "vendor_code", "dt"],
+    )
+
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[],
+        unresolved_fields=[
+            UnresolvedField(
+                target_field="vendor_code",
+                reason=(
+                    "SQL 第3列表达式为 `null as vendor_code`，写入 NULL 常量，"
+                    "没有可确认的来源表字段。"
+                ),
+            )
+        ],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(workbook)
+    headers = [cell.value for cell in wb["candidate_lineage"][1]]
+    rows = [
+        dict(zip(headers, row))
+        for row in wb["candidate_lineage"].iter_rows(min_row=2, values_only=True)
+    ]
+    vendor_row = next(row for row in rows if row["target_field"] == "vendor_code")
+    assert vendor_row["review_status"] == "AUTO_APPROVED"
+    assert vendor_row["source_table"] is None
+    assert vendor_row["source_field"] is None
+    assert vendor_row["transform_expression"] == "NULL"
+    assert vendor_row["evidence_sql"] == "null as vendor_code"
+    assert list(wb["unresolved_fields"].iter_rows(min_row=2, values_only=True)) == []
+
+
+def test_write_candidate_workbook_auto_approves_runtime_constant_field(
+    tmp_path: Path,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.price_plan"),
+        table_name="default.price_plan",
+        etl_script="select cast(date_format(current_date(),'yyyy-MM-dd') as string) as update_time",
+        execute_shell="sh run.sh",
+        target_schema_fields=["update_time"],
+    )
+
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[],
+        unresolved_fields=[
+            UnresolvedField(
+                target_field="update_time",
+                reason=(
+                    "新增数据分支第 11 个表达式为 "
+                    "`cast(date_format(current_date(),'yyyy-MM-dd') as string) as update_time`，"
+                    "是运行时当前日期生成值，不来自任何源表字段；因此无法给出源表字段级血缘。"
+                ),
+            )
+        ],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(workbook)
+    headers = [cell.value for cell in wb["candidate_lineage"][1]]
+    row = dict(zip(headers, next(wb["candidate_lineage"].iter_rows(min_row=2, values_only=True))))
+    assert row["review_status"] == "AUTO_APPROVED"
+    assert row["source_table"] is None
+    assert row["source_field"] is None
+    assert row["target_field"] == "update_time"
+    assert row["transform_expression"] == "cast(date_format(current_date(),'yyyy-MM-dd') as string)"
+    assert row["evidence_sql"] == "cast(date_format(current_date(),'yyyy-MM-dd') as string) as update_time"
+    assert list(wb["unresolved_fields"].iter_rows(min_row=2, values_only=True)) == []
 
 
 def test_write_candidate_workbook_filters_to_schema_and_fills_missing_fields(
@@ -1056,6 +1338,13 @@ def test_group_approved_rows_skips_partition_fields() -> None:
                 source_field="dt",
                 transform_expression="'20260604'",
             ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="hr",
+                source_table="ods.store_info",
+                source_field="hr",
+                transform_expression="'11'",
+            ),
         ]
     )
 
@@ -1130,6 +1419,27 @@ def test_group_approved_rows_skips_self_dependency_rows() -> None:
     )
 
 
+def test_group_approved_rows_keeps_null_constant_fields() -> None:
+    grouped = group_approved_rows(
+        [
+            FieldLineageCandidate(
+                target_table="default.plan_price",
+                target_field="vendor_code",
+                source_table="",
+                source_field="",
+                transform_expression="NULL",
+                transform_explanation="目标字段 vendor_code 由常量 NULL 写入，无上游来源字段。",
+                confidence="HIGH",
+            )
+        ]
+    )
+
+    assert len(grouped) == 1
+    assert grouped[0].target_field == "vendor_code"
+    assert grouped[0].sources == ()
+    assert "NULL" in grouped[0].transform_operation
+
+
 class _FakeFineGrainedLineage:
     def __init__(
         self,
@@ -1167,6 +1477,146 @@ def test_merge_fine_grained_lineages_updates_same_downstream_field() -> None:
     assert merged == [existing_keep, new_store_id]
 
 
+def test_field_name_from_schema_field_urn_strips_dataset_wrapper() -> None:
+    assert (
+        _field_name_from_schema_field_urn(
+            "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,"
+            "blf-prod-hive.default.dim_store_info,PROD),store_id)"
+        )
+        == "store_id"
+    )
+
+
+def test_verify_field_lineage_completeness_marks_data_availability_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patched: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer.fetch_schema_fields_with_partitions",
+        lambda *args, **kwargs: (["store_id", "store_name", "dt", "kpt"], ["kpt"]),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer.fetch_structured_properties",
+        lambda *args, **kwargs: _structured_properties_payload(
+            etl_script="select 1",
+            execute_shell="sh run.sh",
+            availability_flags=["表血缘", "DDL"],
+        ),
+    )
+
+    def fake_patch(gms_url: str, dataset_urn: str, flags: list[str], token: str | None = None) -> None:
+        patched["dataset_urn"] = dataset_urn
+        patched["flags"] = flags
+
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer._patch_data_availability_flags",
+        fake_patch,
+    )
+
+    dataset_urn = make_hive_dataset_urn("default.dim_store_info")
+    result = verify_field_lineage_completeness(
+        "http://localhost:8080",
+        "default.dim_store_info",
+        [
+            _FakeFineGrainedLineage(
+                upstreams=["urn:li:schemaField:(source,id)"],
+                downstreams=[f"urn:li:schemaField:({dataset_urn},store_id)"],
+            ),
+            _FakeFineGrainedLineage(
+                upstreams=["urn:li:schemaField:(source,name)"],
+                downstreams=[f"urn:li:schemaField:({dataset_urn},store_name)"],
+            ),
+        ],
+        token="token",
+    )
+
+    assert result["is_complete"] is True
+    assert result["schema_field_count"] == 2
+    assert result["partition_fields"] == ["kpt"]
+    assert result["covered_field_count"] == 2
+    assert result["missing_fields"] == []
+    assert result["marked_data_availability_flag"] is True
+    assert patched["dataset_urn"] == dataset_urn
+    assert patched["flags"] == ["DDL", "表血缘", "字段血缘"]
+
+
+def test_verify_field_lineage_completeness_does_not_mark_when_missing_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer.fetch_schema_fields_with_partitions",
+        lambda *args, **kwargs: (["store_id", "store_name", "dt"], []),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer.fetch_structured_properties",
+        lambda *args, **kwargs: pytest.fail("incomplete lineage should not read flags"),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer._patch_data_availability_flags",
+        lambda *args, **kwargs: pytest.fail("incomplete lineage should not patch flags"),
+    )
+
+    dataset_urn = make_hive_dataset_urn("default.dim_store_info")
+    result = verify_field_lineage_completeness(
+        "http://localhost:8080",
+        "default.dim_store_info",
+        [
+            _FakeFineGrainedLineage(
+                upstreams=["urn:li:schemaField:(source,id)"],
+                downstreams=[f"urn:li:schemaField:({dataset_urn},store_id)"],
+            )
+        ],
+    )
+
+    assert result["is_complete"] is False
+    assert result["schema_field_count"] == 2
+    assert result["covered_field_count"] == 1
+    assert result["missing_fields"] == ["store_name"]
+    assert result["marked_data_availability_flag"] is False
+
+
+def test_read_fine_grained_lineages_with_retry_waits_for_persisted_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class FakeAspect:
+        def __init__(self, fine_grained_lineages: list[_FakeFineGrainedLineage]) -> None:
+            self.fineGrainedLineages = fine_grained_lineages
+
+    class FakeGraph:
+        def get_aspect(self, *args, **kwargs) -> FakeAspect:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return FakeAspect([])
+            return FakeAspect(
+                [
+                    _FakeFineGrainedLineage(
+                        upstreams=["urn:li:schemaField:(source,id)"],
+                        downstreams=["urn:li:schemaField:(target,store_id)"],
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer.time.sleep",
+        lambda seconds: None,
+    )
+
+    result = _read_fine_grained_lineages_with_retry(
+        FakeGraph(),
+        "urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.default.dim_store_info,PROD)",
+        expected_downstream_fields={"store_id"},
+        max_attempts=3,
+        sleep_seconds=1,
+    )
+
+    assert attempts == 2
+    assert len(result) == 1
+
+
 def test_build_transform_operation_for_ui() -> None:
     assert (
         build_transform_operation_for_ui(
@@ -1176,6 +1626,66 @@ def test_build_transform_operation_for_ui() -> None:
         == "/* 中文解释：优先取 ods.a 表中的 x 字段，为空时取 ods.b 表中的 y 字段，表示按优先级兜底。 */\n"
         "coalesce(a, b)"
     )
+
+
+def test_export_cli_skips_when_field_lineage_already_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "confirmed.xlsx"
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.fetch_structured_properties",
+        lambda *args, **kwargs: _structured_properties_payload(
+            etl_script="select 1",
+            execute_shell="sh run.sh",
+            availability_flags=["DDL", "表血缘", "字段血缘"],
+        ),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.call_llm_extract_field_lineage",
+        lambda *args, **kwargs: pytest.fail("confirmed field lineage should skip LLM"),
+    )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "export",
+            "--table",
+            "default.dim_store_info",
+            "--output",
+            str(output),
+            "--gms-url",
+            "http://localhost:8080",
+        ]
+    )
+
+    assert exit_code == 3
+    assert not output.exists()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("datahub") is None,
+    reason="acryl-datahub not installed",
+)
+def test_build_fine_grained_allows_constant_target_field_without_upstreams() -> None:
+    group = group_approved_rows(
+        [
+            FieldLineageCandidate(
+                target_table="default.plan_price",
+                target_field="vendor_code",
+                source_table="",
+                source_field="",
+                transform_expression="NULL",
+                transform_explanation="目标字段 vendor_code 由常量 NULL 写入，无上游来源字段。",
+                confidence="HIGH",
+            )
+        ]
+    )[0]
+
+    fg = build_fine_grained_lineage_class(group)
+
+    assert fg.upstreams == []
+    assert len(fg.downstreams) == 1
+    assert "NULL" in fg.transformOperation
 
 
 @pytest.mark.skipif(
@@ -1204,7 +1714,10 @@ def test_build_fine_grained_sets_transform_operation() -> None:
     assert len(fg.upstreams) == 1
 
 
-def test_import_reviewed_cli_writes_approved_plan(tmp_path: Path) -> None:
+def test_import_reviewed_cli_writes_approved_plan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     workbook = tmp_path / "review.xlsx"
     output = tmp_path / "import_plan.json"
     source = FieldLineageInput(
@@ -1248,6 +1761,9 @@ def test_import_reviewed_cli_writes_approved_plan(tmp_path: Path) -> None:
         table_result["replacement_mode"]
         == "clear_import_replace_all_fine_grained_lineages_for_table"
     )
+    stdout = capsys.readouterr().out
+    assert '"rows"' not in stdout
+    assert "import_plan=" in stdout
 
 
 def test_import_reviewed_cli_can_limit_import_statuses(tmp_path: Path) -> None:

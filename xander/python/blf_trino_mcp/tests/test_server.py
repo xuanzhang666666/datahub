@@ -8,6 +8,8 @@ def test_authorized_requires_bearer_token() -> None:
     app = BlfTrinoMcpApplication(
         trino_client=TrinoClient(TrinoConfig()),
         mcp_token="secret",
+        export_dir="/tmp/blf_trino_mcp_tests",
+        public_base_url="http://localhost:9011",
     )
 
     assert app.authorized("Bearer secret")
@@ -19,6 +21,8 @@ def test_tools_list_contains_trino_tools_with_chinese_descriptions() -> None:
     app = BlfTrinoMcpApplication(
         trino_client=TrinoClient(TrinoConfig()),
         mcp_token=None,
+        export_dir="/tmp/blf_trino_mcp_tests",
+        public_base_url="http://localhost:9011",
     )
 
     response = app.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -30,6 +34,9 @@ def test_tools_list_contains_trino_tools_with_chinese_descriptions() -> None:
     assert "blf_trino_query_hive_sql" in names
     assert "blf_trino_query_hive_sql_fragment" in names
     assert "blf_trino_query_hive_by_natural_language" in names
+    assert "blf_trino_export_sql_to_excel" in names
+    assert "blf_trino_export_nl_query_to_excel" in names
+    assert "blf_trino_generate_bi_report" in names
     ddl_tool = next(tool for tool in tools if tool["name"] == "blf_trino_get_hive_table_ddl")
     assert "通过 Trino 查询 Hive 表 DDL" in ddl_tool["description"]
     assert "Hive 表名" in ddl_tool["inputSchema"]["properties"]["table"]["description"]
