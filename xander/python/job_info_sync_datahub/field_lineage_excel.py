@@ -18,7 +18,7 @@ from .field_lineage_models import (
     UnresolvedField,
     review_status_from_confidence,
 )
-from .field_lineage_policy import is_partition_field
+from .field_lineage_policy import is_partition_field, is_self_dependency
 
 CANDIDATE_HEADERS = [
     "review_status",
@@ -43,6 +43,11 @@ DEFAULT_IMPORT_STATUSES = {
 }
 _UNRESOLVED_VARIABLE_RE = re.compile(
     r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{\s*[^}]+\s*\}\}"
+)
+_CREATE_TABLE_LIKE_RE = re.compile(
+    r"\bcreate\s+(?:external\s+)?table\s+(?:if\s+not\s+exists\s+)?"
+    r"(?P<target>`?[\w.]+`?)\s+like\s+(?P<source>`?[\w.]+`?)",
+    re.I,
 )
 
 
@@ -116,6 +121,30 @@ def _candidate_to_row(candidate: FieldLineageCandidate) -> List[str]:
     ]
 
 
+def _canonical_candidate(
+    source_input: FieldLineageInput,
+    candidate: FieldLineageCandidate,
+) -> FieldLineageCandidate:
+    target_table = candidate.target_table.strip().lower()
+    aliases = {alias.strip().lower() for alias in source_input.target_table_aliases}
+    if target_table not in aliases:
+        return candidate
+    return FieldLineageCandidate(
+        target_table=source_input.table_name,
+        target_field=candidate.target_field,
+        source_table=candidate.source_table,
+        source_field=candidate.source_field,
+        transform_expression=candidate.transform_expression,
+        transform_explanation=candidate.transform_explanation,
+        evidence_sql=candidate.evidence_sql,
+        confidence=candidate.confidence,
+        llm_notes=candidate.llm_notes,
+        reviewer_notes=candidate.reviewer_notes,
+        import_error=candidate.import_error,
+        review_status=candidate.review_status,
+    )
+
+
 def _unresolved_to_candidate_row(
     source_input: FieldLineageInput,
     unresolved: UnresolvedField,
@@ -136,6 +165,80 @@ def _unresolved_to_candidate_row(
     ]
 
 
+def _target_schema_field_set(source_input: FieldLineageInput) -> Set[str]:
+    return {
+        field.strip().lower()
+        for field in source_input.target_schema_fields
+        if field.strip() and not is_partition_field(field)
+    }
+
+
+def _is_known_target_field(target_field: str, schema_fields: Set[str]) -> bool:
+    if not schema_fields:
+        return True
+    return target_field.strip().lower() in schema_fields
+
+
+def _missing_schema_field_row(source_input: FieldLineageInput, target_field: str) -> List[str]:
+    return [
+        FieldLineageReviewStatus.NEEDS_REVIEW.value,
+        source_input.table_name,
+        target_field,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "UNRESOLVED: DataHub DDL 字段未在 LLM 输出中找到，请按 Hive insert select 顺序确认来源",
+        "",
+        "",
+    ]
+
+
+def _normalize_table_ref(table_name: str, default_db: str) -> str:
+    cleaned = table_name.strip().strip("`").lower()
+    if "." in cleaned:
+        return cleaned
+    return f"{default_db}.{cleaned}"
+
+
+def _create_like_source_table(source_input: FieldLineageInput) -> str:
+    target_db = (
+        source_input.table_name.rsplit(".", 1)[0]
+        if "." in source_input.table_name
+        else "default"
+    )
+    targets = {source_input.table_name.strip().lower()}
+    targets.update(alias.strip().lower() for alias in source_input.target_table_aliases)
+    for match in _CREATE_TABLE_LIKE_RE.finditer(source_input.etl_script or ""):
+        target = _normalize_table_ref(match.group("target"), target_db)
+        if target in targets:
+            return _normalize_table_ref(match.group("source"), target_db)
+    return ""
+
+
+def _create_like_candidate(
+    source_input: FieldLineageInput,
+    source_table: str,
+    target_field: str,
+) -> FieldLineageCandidate:
+    return FieldLineageCandidate(
+        target_table=source_input.table_name,
+        target_field=target_field,
+        source_table=source_table,
+        source_field=target_field,
+        transform_expression=target_field,
+        transform_explanation=(
+            f"目标表通过 CREATE TABLE LIKE 复制 {source_table} 的表结构，"
+            f"字段 {target_field} 与来源表同名字段一一对应。"
+        ),
+        evidence_sql=f"create table {source_input.table_name} like {source_table}",
+        confidence="HIGH",
+        review_status=FieldLineageReviewStatus.AUTO_APPROVED,
+    )
+
+
 def write_candidate_workbook(
     path: Path,
     *,
@@ -150,20 +253,55 @@ def write_candidate_workbook(
     ws = wb.active
     ws.title = "candidate_lineage"
     ws.append(CANDIDATE_HEADERS)
+    schema_fields = _target_schema_field_set(source_input)
+    emitted_target_fields: Set[str] = set()
+    create_like_source_table = _create_like_source_table(source_input)
     for candidate in candidates:
+        candidate = _canonical_candidate(source_input, candidate)
         if is_partition_field(candidate.target_field):
             continue
+        if is_self_dependency(candidate.target_table, candidate.source_table):
+            continue
+        if not _is_known_target_field(candidate.target_field, schema_fields):
+            continue
+        emitted_target_fields.add(candidate.target_field.strip().lower())
         ws.append(_candidate_to_row(candidate))
     for unresolved in unresolved_fields:
         if is_partition_field(unresolved.target_field):
             continue
+        if not _is_known_target_field(unresolved.target_field, schema_fields):
+            continue
+        emitted_target_fields.add(unresolved.target_field.strip().lower())
         ws.append(_unresolved_to_candidate_row(source_input, unresolved))
+    for target_field in source_input.target_schema_fields:
+        normalized = target_field.strip().lower()
+        if (
+            not normalized
+            or is_partition_field(normalized)
+            or normalized in emitted_target_fields
+        ):
+            continue
+        if create_like_source_table:
+            ws.append(
+                _candidate_to_row(
+                    _create_like_candidate(
+                        source_input,
+                        create_like_source_table,
+                        normalized,
+                    )
+                )
+            )
+        else:
+            ws.append(_missing_schema_field_row(source_input, normalized))
+        emitted_target_fields.add(normalized)
     _style_sheet(ws)
 
     unresolved_ws = wb.create_sheet("unresolved_fields")
     unresolved_ws.append(UNRESOLVED_HEADERS)
     for unresolved in unresolved_fields:
         if is_partition_field(unresolved.target_field):
+            continue
+        if not _is_known_target_field(unresolved.target_field, schema_fields):
             continue
         unresolved_ws.append([unresolved.target_field, unresolved.reason])
     _style_sheet(unresolved_ws)
@@ -174,6 +312,10 @@ def write_candidate_workbook(
     context_ws.append(["dataset_urn", source_input.dataset_urn])
     context_ws.append(["etl_script_chars", str(len(source_input.etl_script))])
     context_ws.append(["execute_shell_chars", str(len(source_input.execute_shell))])
+    context_ws.append(["target_schema_field_count", str(len(source_input.target_schema_fields))])
+    context_ws.append(["target_schema_fields", ",".join(source_input.target_schema_fields)])
+    context_ws.append(["target_table_aliases", ",".join(source_input.target_table_aliases)])
+    context_ws.append(["create_like_source_table", create_like_source_table])
     context_ws.append(["execute_shell", source_input.execute_shell])
     context_ws.append(["llm_model", llm_model])
     if debug_dir is not None:
@@ -238,6 +380,11 @@ def load_approved_review_rows(
         if is_partition_field(rec.get("target_field", "")):
             continue
         for expanded_rec in _expand_multi_source_tables(rec):
+            if is_self_dependency(
+                expanded_rec.get("target_table", ""),
+                expanded_rec.get("source_table", ""),
+            ):
+                continue
             approved.append(
                 FieldLineageCandidate(
                     target_table=expanded_rec.get("target_table", "").lower(),

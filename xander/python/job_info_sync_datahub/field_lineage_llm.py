@@ -60,6 +60,10 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
   `优先取 ods.bach_store 表中的 store_address 字段，为空时取 ods.hd_store 表中的 store_address 字段，表示门店地址按优先级兜底合并。`
 - 禁止只写“直映”“同名字段”等过短描述；必须出现具体的来源表名与来源字段名。
 - 同一目标字段若有多来源（如 coalesce），可为每个来源各写一条 mapping，transform_expression 和 transform_explanation 填同一完整内容（含全部来源表字段）。
+- Hive `INSERT INTO/OVERWRITE target SELECT ...` 未显式指定目标字段列表时，目标字段必须按 DataHub DDL 字段顺序与 SELECT 表达式位置对齐，不按 SELECT 输出别名或表达式名匹配。分区字段不做字段血缘。
+- 例：目标表 DDL 字段为 `col1,col2,col3`，SQL 为 `insert overwrite table ods_table1 partition(dt='20250606') select user_name as col1, col2, user_age from ods_table3`，则 `user_name` 写入 `col1`，`col2` 写入 `col2`，`user_age` 写入 `col3`。
+- 如果脚本写入 `not_verified_<目标表名>`，它是数据校验中间表，字段血缘必须折叠到真实目标表；不要因为 ETL 只直接写入 not_verified 表就输出“未直接向目标表写入数据”。
+- 如果脚本使用 `CREATE TABLE target LIKE source` 创建目标表，表示目标表结构与 source 一致；字段血缘按同名字段一一对应，例如 `target.col1 <- source.col1`。
 - review_status 不需要输出；导出 Excel 时 confidence=HIGH 的行会默认 APPROVED，其余为 PENDING。
 - target_table 必须是本次输入表。
 """
@@ -139,8 +143,32 @@ def parse_field_lineage_payload(text: str) -> FieldLineageParseResult:
 
 
 def build_field_lineage_user_message(source_input: FieldLineageInput) -> str:
+    schema_section = ""
+    if source_input.target_schema_fields:
+        numbered_fields = "\n".join(
+            f"{idx}. {field}"
+            for idx, field in enumerate(source_input.target_schema_fields, start=1)
+        )
+        schema_section = (
+            "目标表 DataHub DDL 字段顺序:\n"
+            f"{numbered_fields}\n\n"
+            "重要：Hive insert select 未写目标列清单时，必须按上面字段顺序与 SELECT 表达式位置对齐。\n\n"
+        )
+    alias_section = ""
+    if source_input.target_table_aliases:
+        alias_lines = "\n".join(
+            f"- {alias} 等同于 {source_input.table_name}"
+            for alias in source_input.target_table_aliases
+        )
+        alias_section = (
+            "目标表运行时别名/中间校验表:\n"
+            f"{alias_lines}\n\n"
+            "重要：这些别名表的写入要折叠成目标表字段血缘，不要判定为未写入目标表。\n\n"
+        )
     return (
         f"目标表: {source_input.table_name}\n\n"
+        f"{schema_section}"
+        f"{alias_section}"
         f"执行命令:\n{source_input.execute_shell}\n\n"
         f"ETL 脚本:\n{source_input.etl_script}"
     )
@@ -162,6 +190,8 @@ def build_field_lineage_request_debug_info(
         "user_message_chars": len(user_message),
         "etl_script_chars": len(source_input.etl_script),
         "execute_shell_chars": len(source_input.execute_shell),
+        "target_schema_field_count": len(source_input.target_schema_fields),
+        "target_table_alias_count": len(source_input.target_table_aliases),
     }
 
 
@@ -197,6 +227,8 @@ def call_llm_extract_field_lineage(
         f"user_message_chars={debug_info['user_message_chars']} "
         f"etl_script_chars={debug_info['etl_script_chars']} "
         f"execute_shell_chars={debug_info['execute_shell_chars']} "
+        f"target_schema_field_count={debug_info['target_schema_field_count']} "
+        f"target_table_alias_count={debug_info['target_table_alias_count']} "
         f"request_bytes={len(data)}"
     )
     start = time.perf_counter()

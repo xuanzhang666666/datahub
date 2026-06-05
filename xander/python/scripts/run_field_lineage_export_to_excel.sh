@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
+
 # run_field_lineage_export_to_excel.sh — Jenkins / neo4j2：按表列表批量导出字段级血缘 Excel
 #
 # 部署路径：/data/datahub/scripts/run_field_lineage_export_to_excel.sh
@@ -167,12 +171,9 @@ STATUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/field_lineage_export.XXXXXX")"
 _BATCH_SUMMARY_DONE=0
 
 _has_batch_export_workbooks() {
-  local _path
-  while IFS= read -r _path; do
-    [[ "$_path" == *"_summary.xlsx" ]] && continue
-    return 0
-  done < <(find "$BATCH_OUTPUT_DIR" -maxdepth 1 -type f -name '*.xlsx' 2>/dev/null || true)
-  return 1
+  find "$BATCH_OUTPUT_DIR" -maxdepth 1 -type f -name '*.xlsx' 2>/dev/null \
+    | grep -v '_summary\.xlsx$' \
+    | grep -q .
 }
 
 _write_batch_summary_once() {

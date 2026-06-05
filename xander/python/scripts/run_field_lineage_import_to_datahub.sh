@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
+
 # run_field_lineage_import_to_datahub.sh — Jenkins / neo4j2：从审核 Excel 导入字段级血缘到 DataHub
 #
 # 部署路径：/data/datahub/scripts/run_field_lineage_import_to_datahub.sh

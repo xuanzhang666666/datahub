@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,7 @@ if __name__ == "__main__" and __package__ is None:
 
 from .field_lineage_datahub_reader import (
     extract_field_lineage_input_with_debug,
+    fetch_schema_fields,
     fetch_structured_properties,
     has_confirmed_field_lineage,
     make_hive_dataset_urn,
@@ -73,6 +75,17 @@ def _cmd_export(args: argparse.Namespace) -> int:
         args.table,
         payload,
     )
+    _log("reading DataHub schemaMetadata ...")
+    try:
+        target_schema_fields = fetch_schema_fields(
+            args.gms_url,
+            dataset_urn,
+            token=args.gms_token,
+        )
+    except RuntimeError as exc:
+        target_schema_fields = []
+        _log(f"warning: schemaMetadata read failed, continue without DDL order: {exc}")
+    source_input = replace(source_input, target_schema_fields=target_schema_fields)
     debug_dir = args.debug_dir or args.output.with_suffix("").with_name(
         f"{args.output.stem}_debug"
     )
@@ -82,6 +95,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         preparation_debug,
     )
     _log("structuredProperties loaded")
+    _log(f"target_schema_field_count={len(source_input.target_schema_fields)}")
     _log(f"etl_script_chars={len(source_input.etl_script)}")
     _log(f"execute_shell_chars={len(source_input.execute_shell)}")
     _log(f"debug artifacts dir={debug_dir}")

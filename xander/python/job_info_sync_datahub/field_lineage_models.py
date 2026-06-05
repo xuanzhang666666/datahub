@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List
 
@@ -37,6 +37,8 @@ class FieldLineageInput:
     table_name: str
     etl_script: str
     execute_shell: str
+    target_schema_fields: List[str] = field(default_factory=list)
+    target_table_aliases: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

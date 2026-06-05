@@ -8,9 +8,11 @@ import pytest
 from openpyxl import load_workbook
 
 from job_info_sync_datahub.field_lineage_datahub_reader import (
+    build_target_table_aliases,
     extract_data_availability_flags,
     extract_field_lineage_input,
     extract_field_lineage_input_with_debug,
+    extract_schema_field_names,
     has_confirmed_field_lineage,
     make_hive_dataset_urn,
     missing_field_lineage_source_reason,
@@ -24,6 +26,7 @@ from job_info_sync_datahub.field_lineage_excel import (
     write_candidate_workbook,
 )
 from job_info_sync_datahub.field_lineage_llm import (
+    build_field_lineage_user_message,
     build_field_lineage_request_debug_info,
     parse_field_lineage_payload,
 )
@@ -103,6 +106,7 @@ def test_extract_field_lineage_input_from_structured_properties() -> None:
         table_name="default.dim_store_info",
         etl_script="insert overwrite table default.dim_store_info select 1;",
         execute_shell="sh run_dim_store_info.sh",
+        target_table_aliases=["default.not_verified_dim_store_info"],
     )
 
 
@@ -134,6 +138,39 @@ def test_extract_field_lineage_input_resolves_execute_shell_variables() -> None:
     assert "dt='20260508'" in result.etl_script
     assert "dt='20260507'" in result.etl_script
     assert "${" not in result.etl_script
+
+
+def test_extract_field_lineage_input_resolves_nested_not_verified_table_name() -> None:
+    payload = _structured_properties_payload(
+        etl_script=(
+            "```shell\n"
+            "source ${ETC}/format_date.cnf\n"
+            "NOT_VERIFIED_TABLE_NAME=\"${TABLE_NAME}\"\n"
+            "TABLE_NAME=\"dw_store_order_plan_sku\"\n"
+            "function dw_store_order_plan_sku_run {\n"
+            "  calculate\n"
+            "}\n"
+            "function calculate {\n"
+            "  ${HIVE} -e << EOF \"\n"
+            "    insert overwrite table ${NOT_VERIFIED_TABLE_NAME} partition(dt=${DATE})\n"
+            "    select store_code, sku_code from dw_store_order_plan_sku_di where dt='${DATE}';\n"
+            "  \"\n"
+            "EOF\n"
+            "}\n"
+            "```"
+        ),
+        execute_shell="```shell\nDATE=20260603 sh run.sh\n```",
+    )
+
+    result = extract_field_lineage_input(
+        dataset_urn=make_hive_dataset_urn("default.dw_store_order_plan_sku"),
+        table_name="default.dw_store_order_plan_sku",
+        payload=payload,
+    )
+
+    assert "insert overwrite table dw_store_order_plan_sku" in result.etl_script
+    assert "partition(dt=20260603)" in result.etl_script
+    assert "${NOT_VERIFIED_TABLE_NAME}" not in result.etl_script
 
 
 def test_extract_data_availability_flags_detects_confirmed_field_lineage() -> None:
@@ -642,6 +679,218 @@ def test_write_candidate_workbook_excludes_partition_fields(tmp_path: Path) -> N
     assert unresolved_fields == ["unknown_field"]
 
 
+def test_write_candidate_workbook_filters_to_schema_and_fills_missing_fields(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn(
+            "default.pdw_order_store_90_order_detail_booking_main_di"
+        ),
+        table_name="default.pdw_order_store_90_order_detail_booking_main_di",
+        etl_script=(
+            "insert overwrite table target select col1, "
+            "get_json_object(data, '$.bookingExtendInfo.bookingJsonInfo') from ods.source"
+        ),
+        execute_shell="sh run.sh",
+        target_schema_fields=["order_id", "booking_json_info", "dt"],
+    )
+
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table=source.table_name,
+                target_field="order_id",
+                source_table="ods.order_detail",
+                source_field="order_id",
+                transform_expression="order_id",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[
+            UnresolvedField(
+                target_field="bookingextendinfo_bookingjsoninfo",
+                reason="LLM used JSON path as target field name",
+            )
+        ],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    headers = [cell.value for cell in wb["candidate_lineage"][1]]
+    rows = [
+        dict(zip(headers, row))
+        for row in wb["candidate_lineage"].iter_rows(min_row=2, values_only=True)
+    ]
+
+    assert [row["target_field"] for row in rows] == [
+        "order_id",
+        "booking_json_info",
+    ]
+    assert rows[0]["review_status"] == "AUTO_APPROVED"
+    assert rows[1]["review_status"] == "NEEDS_REVIEW"
+    assert rows[1]["source_table"] is None
+    assert "DataHub DDL 字段" in rows[1]["llm_notes"]
+    assert list(wb["unresolved_fields"].iter_rows(min_row=2, values_only=True)) == []
+
+
+def test_build_field_lineage_user_message_includes_schema_order_rule() -> None:
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.ods_table1"),
+        table_name="default.ods_table1",
+        etl_script=(
+            "insert overwrite table ods_table1 "
+            "select user_name as col1, col2, user_age from ods_table3"
+        ),
+        execute_shell="sh run.sh",
+        target_schema_fields=["col1", "col2", "col3", "dt"],
+    )
+
+    message = build_field_lineage_user_message(source)
+
+    assert "目标表 DataHub DDL 字段顺序" in message
+    assert "1. col1" in message
+    assert "3. col3" in message
+    assert "按上面字段顺序与 SELECT 表达式位置对齐" in message
+
+
+def test_build_field_lineage_user_message_includes_not_verified_alias() -> None:
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn(
+            "data_smartorder.dw_ordering_opportunity_loss_actual_sold_out_time_store_sku_main_sku"
+        ),
+        table_name=(
+            "data_smartorder."
+            "dw_ordering_opportunity_loss_actual_sold_out_time_store_sku_main_sku"
+        ),
+        etl_script=(
+            "insert overwrite table data_smartorder."
+            "not_verified_dw_ordering_opportunity_loss_actual_sold_out_time_store_sku_main_sku "
+            "select store_code, sku_main_code from ods.source"
+        ),
+        execute_shell="sh run.sh",
+        target_table_aliases=build_target_table_aliases(
+            "data_smartorder."
+            "dw_ordering_opportunity_loss_actual_sold_out_time_store_sku_main_sku"
+        ),
+    )
+
+    message = build_field_lineage_user_message(source)
+
+    assert (
+        "data_smartorder."
+        "not_verified_dw_ordering_opportunity_loss_actual_sold_out_time_store_sku_main_sku"
+        in message
+    )
+    assert "等同于" in message
+    assert "不要判定为未写入目标表" in message
+
+
+def test_write_candidate_workbook_canonicalizes_not_verified_target_table(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    target = (
+        "data_smartorder."
+        "dw_ordering_opportunity_loss_actual_sold_out_time_store_sku_main_sku"
+    )
+    alias = (
+        "data_smartorder."
+        "not_verified_dw_ordering_opportunity_loss_actual_sold_out_time_store_sku_main_sku"
+    )
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn(target),
+        table_name=target,
+        etl_script="insert overwrite table alias select store_code from ods.source",
+        execute_shell="sh run.sh",
+        target_schema_fields=["store_code"],
+        target_table_aliases=[alias],
+    )
+
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table=alias,
+                target_field="store_code",
+                source_table="ods.source",
+                source_field="store_code",
+                transform_expression="store_code",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    headers = [cell.value for cell in wb["candidate_lineage"][1]]
+    row = dict(zip(headers, next(wb["candidate_lineage"].iter_rows(min_row=2, values_only=True))))
+    assert row["target_table"] == target
+    assert row["target_field"] == "store_code"
+
+
+def test_write_candidate_workbook_maps_create_table_like_fields(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dw_order_sku_v1"),
+        table_name="default.dw_order_sku_v1",
+        etl_script=(
+            "create table if not exists default.dw_order_sku_v1\n"
+            "like default.dw_order_sku_v1_archive;"
+        ),
+        execute_shell="sh run.sh",
+        target_schema_fields=["order_id", "sku_code", "dt"],
+    )
+
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    headers = [cell.value for cell in wb["candidate_lineage"][1]]
+    rows = [
+        dict(zip(headers, row))
+        for row in wb["candidate_lineage"].iter_rows(min_row=2, values_only=True)
+    ]
+
+    assert [row["target_field"] for row in rows] == ["order_id", "sku_code"]
+    assert [row["source_table"] for row in rows] == [
+        "default.dw_order_sku_v1_archive",
+        "default.dw_order_sku_v1_archive",
+    ]
+    assert [row["source_field"] for row in rows] == ["order_id", "sku_code"]
+    assert [row["review_status"] for row in rows] == ["AUTO_APPROVED", "AUTO_APPROVED"]
+    assert "CREATE TABLE LIKE" in rows[0]["transform_explanation"]
+
+
+def test_extract_schema_field_names_from_openapi_payload() -> None:
+    payload = {
+        "value": {
+            "fields": [
+                {"fieldPath": "[version=2.0].[type=string].order_id"},
+                {"fieldPath": "[version=2.0].[type=string].booking_json_info"},
+                {"fieldPath": "[version=2.0].[type=string].dt"},
+            ]
+        }
+    }
+
+    assert extract_schema_field_names(payload) == [
+        "order_id",
+        "booking_json_info",
+        "dt",
+    ]
+
+
 def test_write_batch_summary_workbook_counts_review_statuses(tmp_path: Path) -> None:
     batch_dir = tmp_path / "batch"
     batch_dir.mkdir()
@@ -811,6 +1060,74 @@ def test_group_approved_rows_skips_partition_fields() -> None:
     )
 
     assert [item.target_field for item in grouped] == ["store_id"]
+
+
+def test_write_candidate_workbook_excludes_self_dependency_rows(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.pdw_cvs_usercenter_weixin_id_mapping"),
+        table_name="default.pdw_cvs_usercenter_weixin_id_mapping",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.pdw_cvs_usercenter_weixin_id_mapping",
+                target_field="user_id",
+                source_table="default.pdw_cvs_usercenter_weixin_id_mapping",
+                source_field="user_id",
+                transform_expression="user_id",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.pdw_cvs_usercenter_weixin_id_mapping",
+                target_field="user_id",
+                source_table="default.ods_cvs_usercenter_weixin_id_mapping_di",
+                source_field="user_id",
+                transform_expression="user_id",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    rows = list(wb["candidate_lineage"].iter_rows(min_row=2, values_only=True))
+
+    assert len(rows) == 1
+    headers = [cell.value for cell in wb["candidate_lineage"][1]]
+    rec = dict(zip(headers, rows[0]))
+    assert rec["source_table"] == "default.ods_cvs_usercenter_weixin_id_mapping_di"
+
+
+def test_group_approved_rows_skips_self_dependency_rows() -> None:
+    grouped = group_approved_rows(
+        [
+            FieldLineageCandidate(
+                target_table="default.pdw_cvs_usercenter_weixin_id_mapping",
+                target_field="user_id",
+                source_table="default.pdw_cvs_usercenter_weixin_id_mapping",
+                source_field="user_id",
+                transform_expression="user_id",
+            ),
+            FieldLineageCandidate(
+                target_table="default.pdw_cvs_usercenter_weixin_id_mapping",
+                target_field="user_id",
+                source_table="default.ods_cvs_usercenter_weixin_id_mapping_di",
+                source_field="user_id",
+                transform_expression="user_id",
+            ),
+        ]
+    )
+
+    assert len(grouped) == 1
+    assert grouped[0].sources == (
+        ("default.ods_cvs_usercenter_weixin_id_mapping_di", "user_id"),
+    )
 
 
 class _FakeFineGrainedLineage:

@@ -75,6 +75,20 @@ def make_hive_dataset_urn(
     )
 
 
+def build_target_table_aliases(table_name: str) -> List[str]:
+    """Return runtime table names that should be treated as the requested target."""
+    normalized = table_name.strip().lower()
+    if "." not in normalized:
+        normalized = f"default.{normalized}"
+    db, table = normalized.rsplit(".", 1)
+    aliases: List[str] = []
+    if table.startswith("not_verified_"):
+        aliases.append(f"{db}.{table.removeprefix('not_verified_')}")
+    else:
+        aliases.append(f"{db}.not_verified_{table}")
+    return [alias for alias in aliases if alias != normalized]
+
+
 def strip_markdown_code_fence(value: str) -> str:
     """Remove a single Markdown code fence wrapper if present."""
     match = _CODE_FENCE_RE.match(value or "")
@@ -86,6 +100,11 @@ def strip_markdown_code_fence(value: str) -> str:
 def structured_properties_url(gms_url: str, dataset_urn: str) -> str:
     encoded = urllib.parse.quote(dataset_urn, safe="")
     return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/structuredProperties"
+
+
+def schema_metadata_url(gms_url: str, dataset_urn: str) -> str:
+    encoded = urllib.parse.quote(dataset_urn, safe="")
+    return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/schemaMetadata"
 
 
 def fetch_structured_properties(
@@ -108,6 +127,65 @@ def fetch_structured_properties(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"GET structuredProperties HTTP {exc.code}: {detail}") from exc
+
+
+def fetch_schema_fields(
+    gms_url: str,
+    dataset_urn: str,
+    token: Optional[str] = None,
+    timeout_sec: int = 60,
+) -> List[str]:
+    """Fetch dataset schema fields from DataHub in DDL order."""
+    req = urllib.request.Request(
+        schema_metadata_url(gms_url, dataset_urn),
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            return extract_schema_field_names(payload)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GET schemaMetadata HTTP {exc.code}: {detail}") from exc
+
+
+def extract_schema_field_names(payload: Dict[str, Any]) -> List[str]:
+    """Extract field names from an OpenAPI schemaMetadata payload."""
+    current: Any = payload
+    if isinstance(current, dict) and "schemaMetadata" in current:
+        current = current["schemaMetadata"]
+    if isinstance(current, dict) and "value" in current:
+        current = current["value"]
+    fields = current.get("fields") if isinstance(current, dict) else None
+    if not isinstance(fields, list):
+        return []
+
+    names: List[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        name = _schema_field_name(field)
+        key = name.lower()
+        if name and key not in seen:
+            names.append(name.lower())
+            seen.add(key)
+    return names
+
+
+def _schema_field_name(field: Dict[str, Any]) -> str:
+    raw_path = field.get("fieldPath")
+    if isinstance(raw_path, str) and raw_path.strip():
+        tail = raw_path.rsplit(".", 1)[-1].strip()
+        if tail:
+            return tail.lower()
+    raw_name = field.get("fieldName")
+    if isinstance(raw_name, str):
+        return raw_name.strip().lower()
+    return ""
 
 
 def _iter_property_assignments(payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
@@ -254,18 +332,7 @@ def resolve_etl_script_with_execute_shell(etl_script: str, execute_shell: str) -
     """Replace ETL placeholders with variables parsed from Execute Shell."""
     variables = parse_execute_shell_variables(execute_shell)
     variables.update(_parse_script_assignment_variables(etl_script or "", variables))
-
-    def replace_var(match: re.Match[str]) -> str:
-        name = match.group(1)
-        if name in variables:
-            return variables[name]
-        if name in _IGNORED_UNRESOLVED_VARS:
-            return match.group(0)
-        return match.group(0)
-
-    resolved = _BRACED_VAR_RE.sub(replace_var, etl_script or "")
-    resolved = _DOLLAR_VAR_RE.sub(replace_var, resolved)
-    return _JINJA_VAR_RE.sub(replace_var, resolved)
+    return _replace_variables_in_text(etl_script or "", variables)
 
 
 def resolve_etl_script_with_debug(
@@ -313,9 +380,15 @@ def _replace_variables_in_text(text: str, variables: Dict[str, str]) -> str:
         name = match.group(1)
         return variables.get(name, match.group(0))
 
-    resolved = _BRACED_VAR_RE.sub(replace_var, text or "")
-    resolved = _DOLLAR_VAR_RE.sub(replace_var, resolved)
-    return _JINJA_VAR_RE.sub(replace_var, resolved)
+    resolved = text or ""
+    for _ in range(10):
+        previous = resolved
+        resolved = _BRACED_VAR_RE.sub(replace_var, resolved)
+        resolved = _DOLLAR_VAR_RE.sub(replace_var, resolved)
+        resolved = _JINJA_VAR_RE.sub(replace_var, resolved)
+        if resolved == previous:
+            break
+    return resolved
 
 
 def _looks_like_python_script(etl_script: str, execute_shell: str) -> bool:
@@ -498,6 +571,7 @@ def extract_field_lineage_input(
         table_name=table_name.strip().lower(),
         etl_script=resolved_etl_script,
         execute_shell=execute_shell,
+        target_table_aliases=build_target_table_aliases(table_name),
     )
 
 
@@ -518,6 +592,7 @@ def extract_field_lineage_input_with_debug(
         table_name=table_name.strip().lower(),
         etl_script=debug.llm_input_etl_script,
         execute_shell=execute_shell,
+        target_table_aliases=build_target_table_aliases(table_name),
     )
     return source_input, debug
 
@@ -558,6 +633,9 @@ def write_field_lineage_debug_artifacts(
                 "reachable_functions": debug.reachable_functions,
                 "removed_functions": debug.removed_functions,
                 "unresolved_variables": debug.unresolved_variables,
+                "target_schema_fields": source_input.target_schema_fields,
+                "target_schema_field_count": len(source_input.target_schema_fields),
+                "target_table_aliases": source_input.target_table_aliases,
                 "original_etl_script_chars": len(debug.original_etl_script),
                 "resolved_etl_script_chars": len(debug.resolved_etl_script),
                 "llm_input_etl_script_chars": len(debug.llm_input_etl_script),
@@ -584,4 +662,16 @@ def read_field_lineage_input(
     """Fetch structured properties and return field-lineage LLM input."""
     dataset_urn = make_hive_dataset_urn(table_name, platform_instance, env)
     payload = fetch_structured_properties(gms_url, dataset_urn, token=token)
-    return extract_field_lineage_input(dataset_urn, table_name, payload)
+    source_input = extract_field_lineage_input(dataset_urn, table_name, payload)
+    try:
+        schema_fields = fetch_schema_fields(gms_url, dataset_urn, token=token)
+    except RuntimeError:
+        schema_fields = []
+    return FieldLineageInput(
+        dataset_urn=source_input.dataset_urn,
+        table_name=source_input.table_name,
+        etl_script=source_input.etl_script,
+        execute_shell=source_input.execute_shell,
+        target_schema_fields=schema_fields,
+        target_table_aliases=source_input.target_table_aliases,
+    )

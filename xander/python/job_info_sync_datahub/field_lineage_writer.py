@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .field_lineage_datahub_reader import make_hive_dataset_urn
 from .field_lineage_models import FieldLineageCandidate
-from .field_lineage_policy import is_partition_field
+from .field_lineage_policy import is_partition_field, is_self_dependency
 from .models import TableRef
 
 try:
@@ -86,6 +86,8 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
     buckets: Dict[Tuple[str, str], List[FieldLineageCandidate]] = {}
     for row in rows:
         if is_partition_field(row.target_field):
+            continue
+        if is_self_dependency(row.target_table, row.source_table):
             continue
         key = (row.target_table.strip().lower(), row.target_field.strip().lower())
         buckets.setdefault(key, []).append(row)
