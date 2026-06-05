@@ -230,9 +230,11 @@ def _schema_fields_from_payload(payload: Dict[str, Any]) -> Any:
 def _schema_field_name(field: Dict[str, Any]) -> str:
     raw_path = field.get("fieldPath")
     if isinstance(raw_path, str) and raw_path.strip():
-        tail = raw_path.rsplit(".", 1)[-1].strip()
-        if tail:
-            return tail.lower()
+        cleaned_path = re.sub(r"\[[^\]]+\]\.?", "", raw_path).strip(".")
+        if cleaned_path and "." not in cleaned_path:
+            return cleaned_path.strip().lower()
+        if cleaned_path and "." in cleaned_path:
+            return ""
     raw_name = field.get("fieldName")
     if isinstance(raw_name, str):
         return raw_name.strip().lower()

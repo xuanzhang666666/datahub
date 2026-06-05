@@ -105,7 +105,18 @@ def _unresolved_field_count(path: Path) -> int:
     if "unresolved_fields" not in wb.sheetnames:
         return 0
     ws = wb["unresolved_fields"]
-    return max(ws.max_row - 1, 0)
+    rows = ws.iter_rows(values_only=True)
+    headers = [str(value or "").strip() for value in next(rows, [])]
+    try:
+        target_field_idx = headers.index("target_field")
+    except ValueError:
+        target_field_idx = 0
+    count = 0
+    for row in rows:
+        value = row[target_field_idx] if target_field_idx < len(row) else ""
+        if value is not None and str(value).strip():
+            count += 1
+    return count
 
 
 def _table_name_from_records(path: Path, records: List[Dict[str, str]]) -> str:

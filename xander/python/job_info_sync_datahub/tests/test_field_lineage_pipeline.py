@@ -206,6 +206,47 @@ def test_extract_schema_partition_field_names_from_partition_key_type() -> None:
     assert extract_schema_partition_field_names(payload) == ["kpt", "biz_hour"]
 
 
+def test_extract_schema_field_names_ignores_nested_struct_subfields() -> None:
+    payload = {
+        "schemaMetadata": {
+            "value": {
+                "fields": [
+                    {
+                        "fieldPath": "[version=2.0].[type=string].document_id",
+                        "nativeDataType": "string",
+                    },
+                    {
+                        "fieldPath": "[version=2.0].[type=struct].sale_spec",
+                        "nativeDataType": "struct",
+                    },
+                    {
+                        "fieldPath": "[version=2.0].[type=struct].sale_spec.expression",
+                        "nativeDataType": "string",
+                    },
+                    {
+                        "fieldPath": "[version=2.0].[type=struct].sale_spec.unit",
+                        "nativeDataType": "string",
+                    },
+                    {
+                        "fieldPath": "[version=2.0].[type=struct].sale_spec.qty",
+                        "nativeDataType": "string",
+                    },
+                    {
+                        "fieldPath": "[version=2.0].[type=struct].ordering_spec",
+                        "nativeDataType": "struct",
+                    },
+                ]
+            }
+        }
+    }
+
+    assert extract_schema_field_names(payload) == [
+        "document_id",
+        "sale_spec",
+        "ordering_spec",
+    ]
+
+
 def test_strip_commented_sql_for_llm_removes_commented_sources() -> None:
     script = """
 with active_data as (
@@ -1221,6 +1262,47 @@ def test_write_batch_summary_workbook_counts_review_statuses(tmp_path: Path) -> 
     assert row["auto_approved_percent"] == 1 / 3
     assert row["needs_review_count"] == 2
     assert row["unresolved_field_count"] == 1
+
+
+def test_batch_summary_ignores_blank_unresolved_rows(tmp_path: Path) -> None:
+    batch_dir = tmp_path / "batch"
+    batch_dir.mkdir()
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    workbook = batch_dir / "202606041414_default.dim_store_info.xlsx"
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="safe_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+    wb = load_workbook(workbook)
+    wb["unresolved_fields"]["A2"] = None
+    wb["unresolved_fields"]["B2"] = None
+    wb.save(workbook)
+
+    summary = tmp_path / "summary.xlsx"
+    write_batch_summary_workbook(batch_dir, summary)
+
+    wb = load_workbook(summary)
+    ws = wb["table_summary"]
+    headers = [cell.value for cell in ws[1]]
+    row = {headers[idx]: value for idx, value in enumerate(next(ws.iter_rows(min_row=2, values_only=True)))}
+    assert row["unresolved_field_count"] == 0
 
 
 def test_batch_summary_counts_candidate_lineage_rows_for_percent(tmp_path: Path) -> None:
