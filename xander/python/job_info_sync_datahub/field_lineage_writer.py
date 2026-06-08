@@ -17,9 +17,17 @@ from .field_lineage_datahub_reader import (
     fetch_structured_properties,
     make_hive_dataset_urn,
 )
-from .field_lineage_constants import is_constant_transform_expression
+from .field_lineage_constants import (
+    has_explained_transform,
+    is_constant_transform_expression,
+    is_placeholder_transform_text,
+)
 from .field_lineage_models import FieldLineageCandidate
-from .field_lineage_policy import is_partition_field, is_self_dependency
+from .field_lineage_policy import (
+    is_partition_field,
+    is_self_dependency,
+    normalize_source_table_name,
+)
 from .structured_properties import URN_DATA_AVAILABILITY_FLAG, sort_data_availability_flags
 from .models import TableRef
 
@@ -64,7 +72,12 @@ def _confidence_score(confidence: str) -> float:
 
 
 def _pick_transform_expression(rows: List[FieldLineageCandidate]) -> str:
-    exprs = [r.transform_expression.strip() for r in rows if r.transform_expression.strip()]
+    exprs = [
+        r.transform_expression.strip()
+        for r in rows
+        if r.transform_expression.strip()
+        and not is_placeholder_transform_text(r.transform_expression)
+    ]
     if not exprs:
         return ""
     unique = list(dict.fromkeys(exprs))
@@ -74,7 +87,12 @@ def _pick_transform_expression(rows: List[FieldLineageCandidate]) -> str:
 
 
 def _pick_transform_explanation(rows: List[FieldLineageCandidate]) -> str:
-    explanations = [r.transform_explanation.strip() for r in rows if r.transform_explanation.strip()]
+    explanations = [
+        r.transform_explanation.strip()
+        for r in rows
+        if r.transform_explanation.strip()
+        and not is_placeholder_transform_text(r.transform_explanation)
+    ]
     if not explanations:
         return ""
     unique = list(dict.fromkeys(explanations))
@@ -110,7 +128,10 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
         sources: List[Tuple[str, str]] = []
         seen: Set[Tuple[str, str]] = set()
         for item in items:
-            src = (item.source_table.strip().lower(), item.source_field.strip().lower())
+            src = (
+                normalize_source_table_name(item.source_table),
+                item.source_field.strip().lower(),
+            )
             if not src[0] and not src[1] and is_constant_transform_expression(
                 item.transform_expression
             ):
@@ -124,7 +145,16 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
         has_constant_transform = any(
             is_constant_transform_expression(item.transform_expression) for item in items
         )
-        if not sources and not has_constant_transform:
+        has_explained_sourceless_transform = any(
+            not item.source_table.strip()
+            and not item.source_field.strip()
+            and has_explained_transform(
+                item.transform_expression,
+                item.transform_explanation,
+            )
+            for item in items
+        )
+        if not sources and not has_constant_transform and not has_explained_sourceless_transform:
             continue
         confidences = [i.confidence for i in items if i.confidence]
         grouped.append(

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -16,13 +17,18 @@ from .field_lineage_models import (
     FieldLineageInput,
     FieldLineageReviewStatus,
     UnresolvedField,
-    review_status_from_confidence,
 )
 from .field_lineage_constants import (
     constant_expression_from_reason,
+    has_explained_transform,
     is_constant_transform_expression,
+    is_placeholder_transform_text,
 )
-from .field_lineage_policy import is_partition_field, is_self_dependency
+from .field_lineage_policy import (
+    is_partition_field,
+    is_self_dependency,
+    normalize_source_table_name,
+)
 
 CANDIDATE_HEADERS = [
     "review_status",
@@ -45,9 +51,6 @@ DEFAULT_IMPORT_STATUSES = {
     FieldLineageReviewStatus.APPROVED,
     FieldLineageReviewStatus.AUTO_APPROVED,
 }
-_UNRESOLVED_VARIABLE_RE = re.compile(
-    r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{\s*[^}]+\s*\}\}"
-)
 _CREATE_TABLE_LIKE_RE = re.compile(
     r"\bcreate\s+(?:external\s+)?table\s+(?:if\s+not\s+exists\s+)?"
     r"(?P<target>`?[\w.]+`?)\s+like\s+(?P<source>`?[\w.]+`?)",
@@ -73,14 +76,21 @@ def _style_sheet(ws) -> None:
 
 
 def _effective_review_status(candidate: FieldLineageCandidate) -> FieldLineageReviewStatus:
-    if candidate.review_status != FieldLineageReviewStatus.PENDING:
+    if candidate.review_status in {
+        FieldLineageReviewStatus.APPROVED,
+        FieldLineageReviewStatus.REJECTED,
+        FieldLineageReviewStatus.NEEDS_REVIEW,
+        FieldLineageReviewStatus.NEEDS_FIX,
+    }:
         return candidate.review_status
-    status = review_status_from_confidence(candidate.confidence)
-    if status != FieldLineageReviewStatus.AUTO_APPROVED:
-        return status
-    if _is_safe_for_auto_approval(candidate):
-        return status
-    return FieldLineageReviewStatus.NEEDS_REVIEW
+    if candidate.review_status in {
+        FieldLineageReviewStatus.PENDING,
+        FieldLineageReviewStatus.AUTO_APPROVED,
+    }:
+        if _is_safe_for_auto_approval(candidate):
+            return FieldLineageReviewStatus.AUTO_APPROVED
+        return FieldLineageReviewStatus.NEEDS_REVIEW
+    return candidate.review_status
 
 
 def _is_safe_for_auto_approval(candidate: FieldLineageCandidate) -> bool:
@@ -91,23 +101,30 @@ def _is_safe_for_auto_approval(candidate: FieldLineageCandidate) -> bool:
     ]
     if any(not value.strip() for value in required_values):
         return False
-    has_source = bool(candidate.source_table.strip() and candidate.source_field.strip())
+    if any(
+        is_placeholder_transform_text(value)
+        for value in (
+            candidate.transform_expression,
+            candidate.transform_explanation,
+            candidate.evidence_sql,
+        )
+    ):
+        return False
+    has_source_table = bool(candidate.source_table.strip())
+    has_source_field = bool(candidate.source_field.strip())
+    has_source = has_source_table and has_source_field
+    has_partial_source = has_source_table != has_source_field
     is_constant = is_constant_transform_expression(candidate.transform_expression)
-    if not has_source and not is_constant:
+    if has_partial_source:
         return False
     if "," in candidate.source_field:
         return False
-    inspected_text = "\n".join(
-        [
-            candidate.target_table,
-            candidate.target_field,
-            candidate.source_table,
-            candidate.source_field,
-            candidate.transform_expression,
-            candidate.evidence_sql,
-        ]
+    if has_source or is_constant:
+        return True
+    return has_explained_transform(
+        candidate.transform_expression,
+        candidate.transform_explanation,
     )
-    return _UNRESOLVED_VARIABLE_RE.search(inspected_text) is None
 
 
 def _candidate_to_row(candidate: FieldLineageCandidate) -> List[str]:
@@ -133,12 +150,12 @@ def _canonical_candidate(
 ) -> FieldLineageCandidate:
     target_table = candidate.target_table.strip().lower()
     aliases = {alias.strip().lower() for alias in source_input.target_table_aliases}
-    if target_table not in aliases:
-        return candidate
+    if target_table in aliases:
+        target_table = source_input.table_name
     return FieldLineageCandidate(
-        target_table=source_input.table_name,
+        target_table=target_table,
         target_field=candidate.target_field,
-        source_table=candidate.source_table,
+        source_table=normalize_source_table_name(candidate.source_table),
         source_field=candidate.source_field,
         transform_expression=candidate.transform_expression,
         transform_explanation=candidate.transform_explanation,
@@ -149,6 +166,49 @@ def _canonical_candidate(
         import_error=candidate.import_error,
         review_status=candidate.review_status,
     )
+
+
+def _expand_placeholder_transform_text(
+    candidate: FieldLineageCandidate,
+    previous_by_target: Dict[Tuple[str, str], FieldLineageCandidate],
+) -> FieldLineageCandidate:
+    """Expand LLM shorthand such as "同上" using a prior row for the same target field."""
+    key = (
+        candidate.target_table.strip().lower(),
+        candidate.target_field.strip().lower(),
+    )
+    previous = previous_by_target.get(key)
+
+    def expand(value: str, previous_value: str) -> str:
+        if is_placeholder_transform_text(value):
+            return previous_value if not is_placeholder_transform_text(previous_value) else ""
+        return value
+
+    expanded = replace(
+        candidate,
+        transform_expression=expand(
+            candidate.transform_expression,
+            previous.transform_expression if previous else "",
+        ),
+        transform_explanation=expand(
+            candidate.transform_explanation,
+            previous.transform_explanation if previous else "",
+        ),
+        evidence_sql=expand(
+            candidate.evidence_sql,
+            previous.evidence_sql if previous else "",
+        ),
+    )
+    if any(
+        value.strip() and not is_placeholder_transform_text(value)
+        for value in (
+            expanded.transform_expression,
+            expanded.transform_explanation,
+            expanded.evidence_sql,
+        )
+    ):
+        previous_by_target[key] = expanded
+    return expanded
 
 
 def _unresolved_to_candidate_row(
@@ -298,6 +358,7 @@ def write_candidate_workbook(
     ws.append(CANDIDATE_HEADERS)
     schema_fields = _target_schema_field_set(source_input)
     emitted_target_fields: Set[str] = set()
+    previous_by_target: Dict[Tuple[str, str], FieldLineageCandidate] = {}
     create_like_source_table = _create_like_source_table(source_input)
     for candidate in candidates:
         candidate = _canonical_candidate(source_input, candidate)
@@ -307,6 +368,7 @@ def write_candidate_workbook(
             continue
         if not _is_known_target_field(candidate.target_field, schema_fields):
             continue
+        candidate = _expand_placeholder_transform_text(candidate, previous_by_target)
         emitted_target_fields.add(candidate.target_field.strip().lower())
         ws.append(_candidate_to_row(candidate))
     remaining_unresolved_fields: List[UnresolvedField] = []
@@ -423,11 +485,10 @@ def load_approved_review_rows(
     ws = wb["candidate_lineage"]
     headers = [str(cell.value or "").strip() for cell in ws[1]]
     approved: List[FieldLineageCandidate] = []
+    previous_by_target: Dict[Tuple[str, str], FieldLineageCandidate] = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
         rec = _row_dict(headers, list(row))
         status_value = rec.get("review_status", "").upper()
-        if status_value not in {status.value for status in statuses}:
-            continue
         if is_partition_field(rec.get("target_field", "")):
             continue
         for expanded_rec in _expand_multi_source_tables(rec):
@@ -436,11 +497,13 @@ def load_approved_review_rows(
                 expanded_rec.get("source_table", ""),
             ):
                 continue
-            approved.append(
+            candidate = _expand_placeholder_transform_text(
                 FieldLineageCandidate(
                     target_table=expanded_rec.get("target_table", "").lower(),
                     target_field=expanded_rec.get("target_field", "").lower(),
-                    source_table=expanded_rec.get("source_table", "").lower(),
+                    source_table=normalize_source_table_name(
+                        expanded_rec.get("source_table", "")
+                    ),
                     source_field=expanded_rec.get("source_field", "").lower(),
                     transform_expression=expanded_rec.get("transform_expression", ""),
                     transform_explanation=expanded_rec.get("transform_explanation", ""),
@@ -450,6 +513,10 @@ def load_approved_review_rows(
                     reviewer_notes=expanded_rec.get("reviewer_notes", ""),
                     import_error=expanded_rec.get("import_error", ""),
                     review_status=FieldLineageReviewStatus.APPROVED,
-                )
+                ),
+                previous_by_target,
             )
+            if status_value not in {status.value for status in statuses}:
+                continue
+            approved.append(candidate)
     return approved

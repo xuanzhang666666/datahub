@@ -14,6 +14,7 @@ from job_info_sync_datahub.field_lineage_datahub_reader import (
     extract_field_lineage_input_with_debug,
     extract_schema_field_names,
     extract_schema_partition_field_names,
+    extract_target_partition_fields_from_script,
     has_confirmed_field_lineage,
     make_hive_dataset_urn,
     missing_field_lineage_source_reason,
@@ -23,11 +24,15 @@ from job_info_sync_datahub.field_lineage_datahub_reader import (
 )
 from job_info_sync_datahub.field_lineage_batch_summary import write_batch_summary_workbook
 from job_info_sync_datahub.field_lineage_cli import main as field_lineage_cli_main
+from job_info_sync_datahub.field_lineage_constants import (
+    is_runtime_date_variable_expression,
+)
 from job_info_sync_datahub.field_lineage_excel import (
     load_approved_review_rows,
     write_candidate_workbook,
 )
 from job_info_sync_datahub.field_lineage_llm import (
+    FIELD_LINEAGE_SYSTEM_PROMPT,
     build_field_lineage_user_message,
     build_field_lineage_request_debug_info,
     parse_field_lineage_payload,
@@ -197,13 +202,29 @@ def test_extract_schema_partition_field_names_from_partition_key_type() -> None:
                     {"fieldPath": "sku_code", "nativeDataType": "string"},
                     {"fieldPath": "kpt", "nativeDataType": "Partition Key"},
                     {"fieldPath": "biz_hour", "type": "Partition Key"},
+                    {"fieldPath": "[version=2.0].[type=string].version", "isPartitioningKey": True},
                 ]
             }
         }
     }
 
-    assert extract_schema_field_names(payload) == ["sku_code", "kpt", "biz_hour"]
-    assert extract_schema_partition_field_names(payload) == ["kpt", "biz_hour"]
+    assert extract_schema_field_names(payload) == ["sku_code", "kpt", "biz_hour", "version"]
+    assert extract_schema_partition_field_names(payload) == ["kpt", "biz_hour", "version"]
+
+
+def test_extract_target_partition_fields_from_script_for_target_write() -> None:
+    script = """
+    insert overwrite table data_build.dm_site_selection_project_location_type_sign_v1
+    partition (dt='20260608', version='1.1.0')
+    select project_id, location_type, store_code from tmp;
+    analyze table data_build.dm_site_selection_project_location_type_sign_v1
+    partition (dt='20260608') compute statistics;
+    """
+
+    assert extract_target_partition_fields_from_script(
+        script,
+        "data_build.dm_site_selection_project_location_type_sign_v1",
+    ) == ["dt", "version"]
 
 
 def test_extract_schema_field_names_ignores_nested_struct_subfields() -> None:
@@ -484,6 +505,32 @@ def test_parse_field_lineage_payload_non_high_confidence_stays_pending() -> None
     assert parsed.mappings[0].review_status == FieldLineageReviewStatus.PENDING
 
 
+def test_field_lineage_prompt_requires_complex_map_field_mappings() -> None:
+    assert "map/struct/json" in FIELD_LINEAGE_SYSTEM_PROMPT
+    assert "map key 字符串常量不算来源字段" in FIELD_LINEAGE_SYSTEM_PROMPT
+    assert "复杂类型本身不是 unresolved 的理由" in FIELD_LINEAGE_SYSTEM_PROMPT
+
+
+def test_field_lineage_prompt_describes_auto_approved_and_constant_fields() -> None:
+    assert "confidence 仅作为参考" in FIELD_LINEAGE_SYSTEM_PROMPT
+    assert "source_table 和 source_field 留空" in FIELD_LINEAGE_SYSTEM_PROMPT
+    assert "evidence_sql 必须回指到输入 ETL 脚本中的 SQL 片段" in FIELD_LINEAGE_SYSTEM_PROMPT
+    assert "未写库名时，必须按 `default.<表名>` 输出 source_table" in FIELD_LINEAGE_SYSTEM_PROMPT
+    assert "禁止在 transform_expression、transform_explanation、evidence_sql 中输出“同上”" in FIELD_LINEAGE_SYSTEM_PROMPT
+    assert "调度运行时日期变量也属于常量" in FIELD_LINEAGE_SYSTEM_PROMPT
+    assert "CSV、本地文件、手工维护文件、API 拉取" in FIELD_LINEAGE_SYSTEM_PROMPT
+
+
+def test_runtime_date_variable_expressions_are_constants() -> None:
+    assert is_runtime_date_variable_expression("${DATE}")
+    assert is_runtime_date_variable_expression("$FORMAT_DATE")
+    assert is_runtime_date_variable_expression("'${DATE_SUB7DAY}'")
+    assert is_runtime_date_variable_expression("cast(${FDATE_ADD1MONTH} as string)")
+    assert is_runtime_date_variable_expression("${MONTH_SUB1MONTH_FIRSTDAY}")
+    assert is_runtime_date_variable_expression("{{ LAST_YEAR_MONTH }}")
+    assert not is_runtime_date_variable_expression("${SOURCE_ID}")
+
+
 def test_build_field_lineage_request_debug_info_counts_prompt_size() -> None:
     source = FieldLineageInput(
         dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
@@ -504,6 +551,22 @@ def test_build_field_lineage_request_debug_info_counts_prompt_size() -> None:
     assert debug["timeout_sec"] == 90
     assert debug["user_message_chars"] > len(source.etl_script)
     assert debug["system_prompt_chars"] > 0
+
+
+def test_build_field_lineage_user_message_includes_partition_fields() -> None:
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select store_id from ods.store_info",
+        execute_shell="sh dim_store_info",
+        target_schema_fields=["store_id", "version"],
+        target_partition_fields=["version"],
+    )
+
+    message = build_field_lineage_user_message(source)
+
+    assert "目标表分区字段（不需要输出字段血缘）:" in message
+    assert "- version" in message
 
 
 def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
@@ -553,6 +616,220 @@ def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
         for row in wb["source_context"].iter_rows(min_row=2, max_col=2)
     }
     assert context_values["debug_artifacts_dir"] == str(tmp_path / "debug")
+
+
+def test_write_candidate_workbook_defaults_unqualified_source_table_to_default(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_build.target"),
+        table_name="data_build.target",
+        etl_script="select project_id from dm_source",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_build.target",
+                target_field="project_id",
+                source_table="dm_source",
+                source_field="project_id",
+                transform_expression="project_id",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    assert wb["candidate_lineage"]["D2"].value == "default.dm_source"
+    approved = load_approved_review_rows(output)
+    grouped = group_approved_rows(approved)
+    assert grouped[0].sources == (("default.dm_source", "project_id"),)
+
+
+def test_write_candidate_workbook_expands_same_as_above_for_same_target(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_logistics.target"),
+        table_name="data_logistics.target",
+        etl_script="select length, width from default.dim_sku_info_spec",
+        execute_shell="sh run.sh",
+    )
+    expression = "round(percentile_approx(vol, 0.50), 3)"
+    explanation = (
+        "基于 default.dim_sku_info_spec 表的 length, width, height 字段计算体积后，"
+        "按小分类分组取 50 分位值。"
+    )
+    evidence = "round(percentile_approx(vol, 0.50),3) as section_vol_1b2"
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_logistics.target",
+                target_field="section_vol_1b2",
+                source_table="default.dim_sku_info_spec",
+                source_field="length",
+                transform_expression=expression,
+                transform_explanation=explanation,
+                evidence_sql=evidence,
+                confidence="MEDIUM",
+            ),
+            FieldLineageCandidate(
+                target_table="data_logistics.target",
+                target_field="section_vol_1b2",
+                source_table="default.dim_sku_info_spec",
+                source_field="width",
+                transform_expression="同上",
+                transform_explanation="同上",
+                evidence_sql="同上",
+                confidence="MEDIUM",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    ws = wb["candidate_lineage"]
+    assert ws["F3"].value == expression
+    assert ws["G3"].value == explanation
+    assert ws["H3"].value == evidence
+
+
+def test_auto_review_marks_same_as_above_without_prior_context_for_review(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_logistics.target"),
+        table_name="data_logistics.target",
+        etl_script="select length from default.dim_sku_info_spec",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_logistics.target",
+                target_field="section_vol_1b2",
+                source_table="default.dim_sku_info_spec",
+                source_field="length",
+                transform_expression="同上",
+                transform_explanation="同上",
+                evidence_sql="同上",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    assert wb["candidate_lineage"]["A2"].value == "NEEDS_REVIEW"
+
+
+def test_load_review_rows_expands_same_as_above_before_import(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_logistics.target"),
+        table_name="data_logistics.target",
+        etl_script="select length, width from default.dim_sku_info_spec",
+        execute_shell="sh run.sh",
+    )
+    expression = "round(percentile_approx(vol, 0.50), 3)"
+    explanation = "基于 length, width, height 字段计算体积后取 50 分位值。"
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_logistics.target",
+                target_field="section_vol_1b2",
+                source_table="default.dim_sku_info_spec",
+                source_field="length",
+                transform_expression=expression,
+                transform_explanation=explanation,
+                evidence_sql="select section_vol_1b2",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="data_logistics.target",
+                target_field="section_vol_1b2",
+                source_table="default.dim_sku_info_spec",
+                source_field="width",
+                transform_expression="同上",
+                transform_explanation="同上",
+                evidence_sql="同上",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+    wb = load_workbook(output)
+    ws = wb["candidate_lineage"]
+    ws["F3"] = "同上"
+    ws["G3"] = "同上"
+    ws["H3"] = "同上"
+    wb.save(output)
+
+    approved = load_approved_review_rows(output)
+
+    assert approved[1].transform_expression == expression
+    assert approved[1].transform_explanation == explanation
+    assert approved[1].evidence_sql == "select section_vol_1b2"
+
+
+def test_group_approved_rows_filters_same_as_above_transform_text() -> None:
+    grouped = group_approved_rows(
+        [
+            FieldLineageCandidate(
+                target_table="data_logistics.target",
+                target_field="section_vol_1b2",
+                source_table="default.dim_sku_info_spec",
+                source_field="length",
+                transform_expression="同上",
+                transform_explanation="同上",
+                confidence="HIGH",
+            )
+        ]
+    )
+
+    assert grouped[0].transform_operation == ""
+    assert grouped[0].transform_explanation == ""
+
+
+def test_group_approved_rows_keeps_explained_offline_source_without_upstreams() -> None:
+    grouped = group_approved_rows(
+        [
+            FieldLineageCandidate(
+                target_table="data_factory.target",
+                target_field="manual_store_name",
+                source_table="",
+                source_field="",
+                transform_expression="pandas.read_csv('/data/manual/store.csv')['store_name']",
+                transform_explanation=(
+                    "字段来自本地 CSV 文件 /data/manual/store.csv 的 store_name 列，"
+                    "无法映射到 Hive 物理字段。"
+                ),
+                confidence="MEDIUM",
+            )
+        ]
+    )
+
+    assert len(grouped) == 1
+    assert grouped[0].sources == ()
+    assert "read_csv" in grouped[0].transform_operation
+    assert "本地 CSV" in grouped[0].transform_operation
 
 
 def test_load_review_rows_returns_approved_and_auto_approved_by_default(tmp_path: Path) -> None:
@@ -689,6 +966,15 @@ def test_auto_review_marks_risky_high_confidence_rows_for_review(tmp_path: Path)
                 transform_expression="cast(${SOURCE_ID} as bigint)",
                 confidence="HIGH",
             ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="missing_source_field",
+                source_table="ods.store_info",
+                source_field="",
+                transform_expression="if(id is null, name, id)",
+                confidence="HIGH",
+                review_status=FieldLineageReviewStatus.AUTO_APPROVED,
+            ),
         ],
         unresolved_fields=[],
         llm_model="deepseek-test",
@@ -700,8 +986,136 @@ def test_auto_review_marks_risky_high_confidence_rows_for_review(tmp_path: Path)
     assert rows == [
         ("AUTO_APPROVED", "default.dim_store_info"),
         ("NEEDS_REVIEW", "default.dim_store_info"),
+        ("AUTO_APPROVED", "default.dim_store_info"),
         ("NEEDS_REVIEW", "default.dim_store_info"),
     ]
+
+
+def test_auto_review_allows_unresolved_variable_in_evidence_sql(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_build.location_type"),
+        table_name="data_build.location_type",
+        etl_script="select t1.store_code from source t1 where dt='${DATE}'",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_build.location_type",
+                target_field="store_code",
+                source_table="data_build.dwd_store_construction_project_upload_info_v1",
+                source_field="store_code",
+                transform_expression="t1.store_code",
+                evidence_sql="left join source t1 on t1.dt = '${DATE}' select t1.store_code",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    status = wb["candidate_lineage"]["A2"].value
+    assert status == "AUTO_APPROVED"
+
+
+def test_auto_review_approves_runtime_variable_string_constant(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_factory.target"),
+        table_name="data_factory.target",
+        etl_script="select '${FORMAT_DATE}' as cal_date",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_factory.target",
+                target_field="cal_date",
+                source_table="",
+                source_field="",
+                transform_expression="'${FORMAT_DATE}'",
+                transform_explanation=(
+                    "取调度日期变量 FORMAT_DATE 作为业务日期，表示数据计算对应的日历日期。"
+                ),
+                evidence_sql="'${FORMAT_DATE}' as cal_date",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    assert wb["candidate_lineage"]["A2"].value == "AUTO_APPROVED"
+
+
+def test_auto_review_approves_medium_confidence_hive_source(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_factory.target"),
+        table_name="data_factory.target",
+        etl_script="select cast(order_id as string) as order_id from ods.order_detail",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_factory.target",
+                target_field="order_id",
+                source_table="ods.order_detail",
+                source_field="order_id",
+                transform_expression="cast(order_id as string)",
+                transform_explanation="取 ods.order_detail.order_id 并转换为字符串。",
+                confidence="MEDIUM",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    assert wb["candidate_lineage"]["A2"].value == "AUTO_APPROVED"
+
+
+def test_auto_review_approves_explained_offline_source(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_factory.target"),
+        table_name="data_factory.target",
+        etl_script="df = pandas.read_csv('/data/manual/store.csv')",
+        execute_shell="python job.py",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_factory.target",
+                target_field="manual_store_name",
+                source_table="",
+                source_field="",
+                transform_expression="pandas.read_csv('/data/manual/store.csv')['store_name']",
+                transform_explanation=(
+                    "字段来自本地 CSV 文件 /data/manual/store.csv 的 store_name 列，"
+                    "无法映射到 Hive 物理字段。"
+                ),
+                confidence="MEDIUM",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    assert wb["candidate_lineage"]["A2"].value == "AUTO_APPROVED"
 
 
 def test_write_candidate_workbook_excludes_partition_fields(tmp_path: Path) -> None:
@@ -824,6 +1238,57 @@ def test_write_candidate_workbook_excludes_hr_partition_from_schema_fill(
     assert target_fields == ["sku_code"]
 
 
+def test_write_candidate_workbook_excludes_version_partition_from_schema_fill(
+    tmp_path: Path,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn(
+            "data_build.dm_site_selection_competitor_daily_sales_v1"
+        ),
+        table_name="data_build.dm_site_selection_competitor_daily_sales_v1",
+        etl_script="select site_id from ods.site_selection",
+        execute_shell="sh run.sh",
+        target_schema_fields=["site_id", "version"],
+        target_partition_fields=["version"],
+    )
+
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table=source.table_name,
+                target_field="site_id",
+                source_table="ods.site_selection",
+                source_field="site_id",
+                transform_expression="site_id",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[
+            UnresolvedField(
+                target_field="version",
+                reason="DataHub DDL 字段未在 LLM 输出中找到，请按 Hive insert select 顺序确认来源",
+            )
+        ],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(workbook)
+    target_fields = [
+        row[0]
+        for row in wb["candidate_lineage"].iter_rows(
+            min_row=2,
+            min_col=3,
+            max_col=3,
+            values_only=True,
+        )
+    ]
+    assert target_fields == ["site_id"]
+    assert list(wb["unresolved_fields"].iter_rows(min_row=2, values_only=True)) == []
+
+
 def test_write_candidate_workbook_excludes_schema_partition_key_fields(
     tmp_path: Path,
 ) -> None:
@@ -918,6 +1383,49 @@ def test_write_candidate_workbook_auto_approves_null_constant_field(tmp_path: Pa
     assert vendor_row["transform_expression"] == "NULL"
 
 
+def test_write_candidate_workbook_auto_approves_aliased_null_constant_field(
+    tmp_path: Path,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn(
+            "data_build.dm_site_selection_competitor_daily_sales_v1"
+        ),
+        table_name="data_build.dm_site_selection_competitor_daily_sales_v1",
+        etl_script="select null as seasonal_coefficient",
+        execute_shell="sh run.sh",
+        target_schema_fields=["seasonal_coefficient"],
+    )
+
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table=source.table_name,
+                target_field="seasonal_coefficient",
+                source_table="",
+                source_field="",
+                transform_expression="null as seasonal_coefficient",
+                transform_explanation="该字段写入 NULL 常量，无上游来源字段，表示季节系数暂未计算。",
+                evidence_sql="null as seasonal_coefficient",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(workbook)
+    assert wb["candidate_lineage"]["A2"].value == "AUTO_APPROVED"
+
+    approved = load_approved_review_rows(workbook)
+    grouped = group_approved_rows(approved)
+    assert len(grouped) == 1
+    assert grouped[0].sources == ()
+    assert "null as seasonal_coefficient" in grouped[0].transform_operation
+
+
 def test_write_candidate_workbook_auto_approves_unresolved_null_constant_field(
     tmp_path: Path,
 ) -> None:
@@ -958,6 +1466,48 @@ def test_write_candidate_workbook_auto_approves_unresolved_null_constant_field(
     assert vendor_row["source_field"] is None
     assert vendor_row["transform_expression"] == "NULL"
     assert vendor_row["evidence_sql"] == "null as vendor_code"
+    assert list(wb["unresolved_fields"].iter_rows(min_row=2, values_only=True)) == []
+
+
+def test_write_candidate_workbook_auto_approves_hardcoded_null_unresolved_field(
+    tmp_path: Path,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn(
+            "data_build.dm_site_selection_competitor_daily_sales_v1"
+        ),
+        table_name="data_build.dm_site_selection_competitor_daily_sales_v1",
+        etl_script="select null as seasonal_coefficient",
+        execute_shell="sh run.sh",
+        target_schema_fields=["seasonal_coefficient"],
+    )
+
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[],
+        unresolved_fields=[
+            UnresolvedField(
+                target_field="seasonal_coefficient",
+                reason="硬编码为 null，无来源字段",
+            )
+        ],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(workbook)
+    headers = [cell.value for cell in wb["candidate_lineage"][1]]
+    row = dict(zip(headers, next(wb["candidate_lineage"].iter_rows(min_row=2, values_only=True))))
+    assert row["review_status"] == "AUTO_APPROVED"
+    assert row["target_field"] == "seasonal_coefficient"
+    assert row["source_table"] is None
+    assert row["source_field"] is None
+    assert row["transform_expression"] == "NULL"
+    assert row["transform_explanation"] == (
+        "目标字段 seasonal_coefficient 由常量 NULL 写入，无上游来源字段。"
+    )
+    assert row["evidence_sql"] == "NULL AS seasonal_coefficient"
     assert list(wb["unresolved_fields"].iter_rows(min_row=2, values_only=True)) == []
 
 
@@ -1576,7 +2126,7 @@ def test_verify_field_lineage_completeness_marks_data_availability_flag(
 
     monkeypatch.setattr(
         "job_info_sync_datahub.field_lineage_writer.fetch_schema_fields_with_partitions",
-        lambda *args, **kwargs: (["store_id", "store_name", "dt", "kpt"], ["kpt"]),
+        lambda *args, **kwargs: (["store_id", "store_name", "dt", "version"], ["version"]),
     )
     monkeypatch.setattr(
         "job_info_sync_datahub.field_lineage_writer.fetch_structured_properties",
@@ -1615,7 +2165,7 @@ def test_verify_field_lineage_completeness_marks_data_availability_flag(
 
     assert result["is_complete"] is True
     assert result["schema_field_count"] == 2
-    assert result["partition_fields"] == ["kpt"]
+    assert result["partition_fields"] == ["version"]
     assert result["covered_field_count"] == 2
     assert result["missing_fields"] == []
     assert result["marked_data_availability_flag"] is True
@@ -1716,6 +2266,10 @@ def test_export_cli_skips_when_field_lineage_already_confirmed(
 ) -> None:
     output = tmp_path / "confirmed.xlsx"
     monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.fetch_deprecation",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
         "job_info_sync_datahub.field_lineage_cli.fetch_structured_properties",
         lambda *args, **kwargs: _structured_properties_payload(
             etl_script="select 1",
@@ -1733,6 +2287,40 @@ def test_export_cli_skips_when_field_lineage_already_confirmed(
             "export",
             "--table",
             "default.dim_store_info",
+            "--output",
+            str(output),
+            "--gms-url",
+            "http://localhost:8080",
+        ]
+    )
+
+    assert exit_code == 3
+    assert not output.exists()
+
+
+def test_export_cli_skips_deprecated_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "deprecated.xlsx"
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.fetch_deprecation",
+        lambda *args, **kwargs: {"deprecation": {"value": {"deprecated": True}}},
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.fetch_structured_properties",
+        lambda *args, **kwargs: pytest.fail("deprecated dataset should skip before structuredProperties"),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.call_llm_extract_field_lineage",
+        lambda *args, **kwargs: pytest.fail("deprecated dataset should skip LLM"),
+    )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "export",
+            "--table",
+            "default.deprecated_table",
             "--output",
             str(output),
             "--gms-url",
@@ -1768,6 +2356,35 @@ def test_build_fine_grained_allows_constant_target_field_without_upstreams() -> 
     assert fg.upstreams == []
     assert len(fg.downstreams) == 1
     assert "NULL" in fg.transformOperation
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("datahub") is None,
+    reason="acryl-datahub not installed",
+)
+def test_build_fine_grained_allows_offline_source_without_upstreams() -> None:
+    group = group_approved_rows(
+        [
+            FieldLineageCandidate(
+                target_table="data_factory.target",
+                target_field="manual_store_name",
+                source_table="",
+                source_field="",
+                transform_expression="pandas.read_csv('/data/manual/store.csv')['store_name']",
+                transform_explanation=(
+                    "字段来自本地 CSV 文件 /data/manual/store.csv 的 store_name 列，"
+                    "无法映射到 Hive 物理字段。"
+                ),
+                confidence="MEDIUM",
+            )
+        ]
+    )[0]
+
+    fg = build_fine_grained_lineage_class(group)
+
+    assert fg.upstreams == []
+    assert len(fg.downstreams) == 1
+    assert "read_csv" in fg.transformOperation
 
 
 @pytest.mark.skipif(

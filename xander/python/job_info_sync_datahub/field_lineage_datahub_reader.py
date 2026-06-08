@@ -40,6 +40,12 @@ _IGNORED_UNRESOLVED_VARS = {
 _SHELL_FUNCTION_START_RE = re.compile(
     r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\{"
 )
+_TARGET_WRITE_PARTITION_RE = re.compile(
+    r"\b(?:insert\s+(?:overwrite|into)\s+table|create\s+table)\s+"
+    r"(?P<table>`?[\w.]+`?)\s+"
+    r"(?:[^;]*?)\bpartition\s*\((?P<partition>[^)]*)\)",
+    re.I | re.S,
+)
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,30 @@ def build_target_table_aliases(table_name: str) -> List[str]:
     return [alias for alias in aliases if alias != normalized]
 
 
+def extract_target_partition_fields_from_script(
+    etl_script: str,
+    table_name: str,
+    aliases: Optional[List[str]] = None,
+) -> List[str]:
+    """Extract target partition fields from write statements in the ETL script."""
+    target_tables = {table_name.strip().strip("`").lower()}
+    target_tables.update(alias.strip().strip("`").lower() for alias in aliases or [])
+    names: List[str] = []
+    seen: set[str] = set()
+    for match in _TARGET_WRITE_PARTITION_RE.finditer(etl_script or ""):
+        target = match.group("table").strip().strip("`").lower()
+        if target not in target_tables:
+            continue
+        for item in match.group("partition").split(","):
+            raw_name = item.split("=", 1)[0].strip().strip("`").lower()
+            if not raw_name or not re.match(r"^[a-z_][a-z0-9_]*$", raw_name):
+                continue
+            if raw_name not in seen:
+                names.append(raw_name)
+                seen.add(raw_name)
+    return names
+
+
 def strip_markdown_code_fence(value: str) -> str:
     """Remove a single Markdown code fence wrapper if present."""
     match = _CODE_FENCE_RE.match(value or "")
@@ -105,6 +135,43 @@ def structured_properties_url(gms_url: str, dataset_urn: str) -> str:
 def schema_metadata_url(gms_url: str, dataset_urn: str) -> str:
     encoded = urllib.parse.quote(dataset_urn, safe="")
     return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/schemaMetadata"
+
+
+def deprecation_url(gms_url: str, dataset_urn: str) -> str:
+    encoded = urllib.parse.quote(dataset_urn, safe="")
+    return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/deprecation"
+
+
+def fetch_deprecation(
+    gms_url: str,
+    dataset_urn: str,
+    token: Optional[str] = None,
+    timeout_sec: int = 60,
+) -> Dict[str, Any]:
+    """Fetch the deprecation aspect for one dataset."""
+    req = urllib.request.Request(
+        deprecation_url(gms_url, dataset_urn),
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return {}
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GET deprecation HTTP {exc.code}: {detail}") from exc
+
+
+def is_deprecated_dataset_payload(payload: Dict[str, Any]) -> bool:
+    current: Any = payload
+    for key in ("deprecation", "value"):
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+    return isinstance(current, dict) and current.get("deprecated") is True
 
 
 def fetch_structured_properties(
@@ -242,6 +309,8 @@ def _schema_field_name(field: Dict[str, Any]) -> str:
 
 
 def _schema_field_is_partition_key(field: Dict[str, Any]) -> bool:
+    if field.get("isPartitioningKey") is True:
+        return True
     candidates: List[str] = []
     for key in ("nativeDataType", "type", "fieldType"):
         value = field.get(key)

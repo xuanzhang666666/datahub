@@ -18,9 +18,12 @@ if __name__ == "__main__" and __package__ is None:
 
 from .field_lineage_datahub_reader import (
     extract_field_lineage_input_with_debug,
+    extract_target_partition_fields_from_script,
+    fetch_deprecation,
     fetch_schema_fields_with_partitions,
     fetch_structured_properties,
     has_confirmed_field_lineage,
+    is_deprecated_dataset_payload,
     make_hive_dataset_urn,
     missing_field_lineage_source_reason,
     write_field_lineage_debug_artifacts,
@@ -97,6 +100,14 @@ def _cmd_export(args: argparse.Namespace) -> int:
     _log(f"platform_instance={args.platform_instance} env={args.env}")
     _log(f"output={args.output}")
     _log(f"llm_timeout_sec={args.llm_timeout_sec}")
+    _log("reading DataHub deprecation ...")
+    if is_deprecated_dataset_payload(
+        fetch_deprecation(args.gms_url, dataset_urn, token=args.gms_token)
+    ):
+        skip_reason = "Dataset 已标记废弃，跳过字段血缘导出"
+        _log(f"SKIP: {skip_reason}")
+        print(f"FIELD_LINEAGE_SKIP_REASON={skip_reason}", flush=True)
+        return EXIT_SKIP_NO_SOURCE
     _log("reading DataHub structuredProperties ...")
     payload = fetch_structured_properties(
         args.gms_url,
@@ -129,6 +140,14 @@ def _cmd_export(args: argparse.Namespace) -> int:
         target_schema_fields = []
         target_partition_fields = []
         _log(f"warning: schemaMetadata read failed, continue without DDL order: {exc}")
+    script_partition_fields = extract_target_partition_fields_from_script(
+        source_input.etl_script,
+        source_input.table_name,
+        aliases=source_input.target_table_aliases,
+    )
+    target_partition_fields = list(
+        dict.fromkeys([*target_partition_fields, *script_partition_fields])
+    )
     source_input = replace(
         source_input,
         target_schema_fields=target_schema_fields,

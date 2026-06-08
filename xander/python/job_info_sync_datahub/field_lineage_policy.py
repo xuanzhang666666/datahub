@@ -13,6 +13,13 @@ def normalize_table_name(table_name: str) -> str:
     return table_name.strip().lower()
 
 
+def normalize_source_table_name(table_name: str) -> str:
+    normalized = normalize_table_name(table_name)
+    if normalized and "." not in normalized:
+        return f"default.{normalized}"
+    return normalized
+
+
 def is_self_dependency(target_table: str, source_table: str) -> bool:
     target = normalize_table_name(target_table)
     source = normalize_table_name(source_table)

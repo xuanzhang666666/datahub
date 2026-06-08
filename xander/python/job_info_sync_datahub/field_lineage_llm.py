@@ -48,7 +48,7 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
 
 规则:
 - 只生成候选结果，宁可把不确定字段放到 unresolved_fields，也不要编造来源。
-- Python 脚本中的 SQL 字符串、临时表、多段 SQL 可综合判断，但 evidence_sql 必须回指到原始脚本片段。
+- Python 脚本中的 SQL 字符串、临时表、多段 SQL 可综合判断，但 evidence_sql 必须回指到输入 ETL 脚本中的 SQL 片段。
 - 如果 ETL 脚本是 Python 文件，必须按 Python 初始化与执行顺序分析：先看 import、全局变量、配置读取、函数/类定义，再看 `if __name__ == "__main__"`、main()/run() 调用链、spark.sql/cursor.execute 等实际执行点；不要只解析最后一个 SQL 字符串。
 - **每条 mapping 必须填写 transform_expression**（如 `coalesce(a,b)`、`cast(x as bigint)`、或直接列名），用于 DataHub UI 展示 LOGIC。
 - **每条 mapping 必须填写 transform_explanation**（中文，面向业务同学），固定两段信息：
@@ -59,12 +59,23 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
 - transform_explanation 多来源（coalesce）示例（同一目标字段的多条 mapping 可共用同一段说明）：
   `优先取 ods.bach_store 表中的 store_address 字段，为空时取 ods.hd_store 表中的 store_address 字段，表示门店地址按优先级兜底合并。`
 - 禁止只写“直映”“同名字段”等过短描述；必须出现具体的来源表名与来源字段名。
+- Hive SQL 中来源表未写库名时，必须按 `default.<表名>` 输出 source_table；不要按目标表所在库名推断来源库。
 - 同一目标字段若有多来源（如 coalesce），可为每个来源各写一条 mapping，transform_expression 和 transform_explanation 填同一完整内容（含全部来源表字段）。
+- 禁止在 transform_expression、transform_explanation、evidence_sql 中输出“同上”“同前”“same as above”等占位文本；同一目标字段有多条 mapping 时，每一条都必须重复填写完整表达式、完整中文说明和完整证据 SQL。
+- 如果目标字段由常量生成（如 `NULL AS vendor_code`、字符串/数字字面量、运行时日期函数），可以输出一条无来源字段 mapping：source_table 和 source_field 留空，transform_expression 填常量表达式，transform_explanation 说明该字段由常量写入、无上游来源字段。
+- 调度运行时日期变量也属于常量，例如 `${DATE}`、`${FORMAT_DATE}`、`${DATE_SUB7DAY}`、`${FDATE_ADD1MONTH}`、`${MONTH_SUB1MONTH_FIRSTDAY}`；它们在作业执行时会替换为具体日期，不需要来源表字段，不应放入 unresolved_fields。
+- 如果目标字段来自 CSV、本地文件、手工维护文件、API 拉取等线下或外部来源，且无法映射到底层 Hive 物理字段，不要放入 unresolved_fields；输出一条普通 mapping，source_table 和 source_field 留空，transform_expression 填文件读取/API 取数字段等表达式，transform_explanation 说明线下来源路径、字段或业务含义。
+- unresolved_fields 只用于完全无法判断目标字段来自 Hive 字段、常量还是线下/外部来源的情况。
+- 如果来源字段来自 CTE、子查询、临时表或 SELECT 别名，必须继续向上递归追溯到真实物理 Hive 表字段；不要把 CTE 名、子查询别名或派生字段当作最终来源。
+- 如果一个目标字段表达式依赖多个物理字段（如 case/if/sum/round/concat/coalesce），必须为每个物理来源字段各输出一条 mapping，source_table 和 source_field 都不能为空；不要只填 source_table 后把 source_field 留空。
+- 如果目标字段是 map/struct/json 等复杂类型（例如 `map(...) as extend_map`），复杂类型本身不是 unresolved 的理由；只有无法追到物理来源字段时才放入 unresolved_fields。目标字段仍然是 `extend_map`，对 map value/struct value 中实际参与计算的每个物理来源字段各输出一条 mapping，map key 字符串常量不算来源字段。
+- map/struct/json 的 transform_expression 填完整构造表达式或能覆盖该字段的核心表达式；transform_explanation 说明该字段由哪些来源指标组装成复杂类型。
+- 如果目标字段由 CTE 字段二次加工得到，例如 `c.material_code`、`a.yuanliao_code`，需要找到该 CTE 字段在上游 CTE/子查询中的定义，再输出最终物理表字段，如 `component_first_sku_code`、`component_second_sku_code` 等。
 - Hive `INSERT INTO/OVERWRITE target SELECT ...` 未显式指定目标字段列表时，目标字段必须按 DataHub DDL 字段顺序与 SELECT 表达式位置对齐，不按 SELECT 输出别名或表达式名匹配。分区字段不做字段血缘。
 - 例：目标表 DDL 字段为 `col1,col2,col3`，SQL 为 `insert overwrite table ods_table1 partition(dt='20250606') select user_name as col1, col2, user_age from ods_table3`，则 `user_name` 写入 `col1`，`col2` 写入 `col2`，`user_age` 写入 `col3`。
 - 如果脚本写入 `not_verified_<目标表名>`，它是数据校验中间表，字段血缘必须折叠到真实目标表；不要因为 ETL 只直接写入 not_verified 表就输出“未直接向目标表写入数据”。
 - 如果脚本使用 `CREATE TABLE target LIKE source` 创建目标表，表示目标表结构与 source 一致；字段血缘按同名字段一一对应，例如 `target.col1 <- source.col1`。
-- review_status 不需要输出；导出 Excel 时 confidence=HIGH 的行会默认 APPROVED，其余为 PENDING。
+- review_status 不需要输出；导出 Excel 时只要 Hive 来源字段明确、常量明确或线下来源说明明确，都会自动标记 AUTO_APPROVED；confidence 仅作为参考。
 - target_table 必须是本次输入表。
 """
 
@@ -154,6 +165,13 @@ def build_field_lineage_user_message(source_input: FieldLineageInput) -> str:
             f"{numbered_fields}\n\n"
             "重要：Hive insert select 未写目标列清单时，必须按上面字段顺序与 SELECT 表达式位置对齐。\n\n"
         )
+    partition_section = ""
+    if source_input.target_partition_fields:
+        partition_lines = "\n".join(f"- {field}" for field in source_input.target_partition_fields)
+        partition_section = (
+            "目标表分区字段（不需要输出字段血缘）:\n"
+            f"{partition_lines}\n\n"
+        )
     alias_section = ""
     if source_input.target_table_aliases:
         alias_lines = "\n".join(
@@ -168,6 +186,7 @@ def build_field_lineage_user_message(source_input: FieldLineageInput) -> str:
     return (
         f"目标表: {source_input.table_name}\n\n"
         f"{schema_section}"
+        f"{partition_section}"
         f"{alias_section}"
         f"执行命令:\n{source_input.execute_shell}\n\n"
         f"ETL 脚本:\n{source_input.etl_script}"

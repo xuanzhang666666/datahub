@@ -23,6 +23,11 @@ fi
 # ── 并发与重试 ───────────────────────────────────────────────────────────────
 # FIELD_LINEAGE_CONCURRENCY  并发请求 LLM 数，默认 10
 # FIELD_LINEAGE_RETRY_COUNT    失败后额外重试次数，默认 1（共最多 2 次）
+# FIELD_LINEAGE_AUTO_IMPORT    导出 Excel 后自动导入 AUTO_APPROVED 字段血缘，默认 1
+# FIELD_LINEAGE_AUTO_IMPORT_CLEAR_EXISTING
+#                            自动导入时是否清空已有 fineGrainedLineages，默认 0（合并更新）
+# FIELD_LINEAGE_AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED
+#                            自动导入前是否要求整表 100% AUTO_APPROVED 且无 unresolved，默认 0
 #
 # ── 可选 ─────────────────────────────────────────────────────────────────────
 # DATAHUB_GMS_URL / DATAHUB_GMS_TOKEN / LINEAGE_PYTHON / FIELD_LINEAGE_PREVIEW_CHARS / FIELD_LINEAGE_LLM_TIMEOUT_SEC
@@ -59,6 +64,9 @@ PREVIEW_CHARS="${FIELD_LINEAGE_PREVIEW_CHARS:-8000}"
 LLM_TIMEOUT="${FIELD_LINEAGE_LLM_TIMEOUT_SEC:-240}"
 CONCURRENCY="${FIELD_LINEAGE_CONCURRENCY:-10}"
 RETRY_COUNT="${FIELD_LINEAGE_RETRY_COUNT:-1}"
+AUTO_IMPORT="${FIELD_LINEAGE_AUTO_IMPORT:-1}"
+AUTO_IMPORT_CLEAR_EXISTING="${FIELD_LINEAGE_AUTO_IMPORT_CLEAR_EXISTING:-0}"
+AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED="${FIELD_LINEAGE_AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED:-0}"
 
 if ! [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: FIELD_LINEAGE_CONCURRENCY 必须为正整数: $CONCURRENCY" >&2
@@ -68,6 +76,30 @@ if ! [[ "$RETRY_COUNT" =~ ^[0-9]+$ ]]; then
   echo "ERROR: FIELD_LINEAGE_RETRY_COUNT 必须为非负整数: $RETRY_COUNT" >&2
   exit 2
 fi
+case "$AUTO_IMPORT" in
+  1 | true | TRUE | yes | YES) AUTO_IMPORT=1 ;;
+  0 | false | FALSE | no | NO) AUTO_IMPORT=0 ;;
+  *)
+    echo "ERROR: FIELD_LINEAGE_AUTO_IMPORT 必须为 1/0/true/false: $AUTO_IMPORT" >&2
+    exit 2
+    ;;
+esac
+case "$AUTO_IMPORT_CLEAR_EXISTING" in
+  1 | true | TRUE | yes | YES) AUTO_IMPORT_CLEAR_EXISTING=1 ;;
+  0 | false | FALSE | no | NO) AUTO_IMPORT_CLEAR_EXISTING=0 ;;
+  *)
+    echo "ERROR: FIELD_LINEAGE_AUTO_IMPORT_CLEAR_EXISTING 必须为 1/0/true/false: $AUTO_IMPORT_CLEAR_EXISTING" >&2
+    exit 2
+    ;;
+esac
+case "$AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED" in
+  1 | true | TRUE | yes | YES) AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED=1 ;;
+  0 | false | FALSE | no | NO) AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED=0 ;;
+  *)
+    echo "ERROR: FIELD_LINEAGE_AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED 必须为 1/0/true/false: $AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED" >&2
+    exit 2
+    ;;
+esac
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
   [[ -z "$_cand" ]] && continue
@@ -245,6 +277,9 @@ echo "[INFO] batch output dir: $BATCH_OUTPUT_DIR"
 echo "[INFO] debug root: ${DEBUG_ROOT:-<excel-sibling-default>}"
 echo "[INFO] concurrency: $CONCURRENCY"
 echo "[INFO] retry on failure: $RETRY_COUNT"
+echo "[INFO] auto import AUTO_APPROVED: $([[ "$AUTO_IMPORT" -eq 1 ]] && echo yes || echo no)"
+echo "[INFO] auto import mode: $([[ "$AUTO_IMPORT_CLEAR_EXISTING" -eq 1 ]] && echo clear_import || echo merge_update)"
+echo "[INFO] auto import require full auto approved: $([[ "$AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED" -eq 1 ]] && echo yes || echo no)"
 echo "[INFO] table count: ${#TABLE_LIST[@]}"
 echo "[INFO] tables: ${TABLE_LIST[*]}"
 echo "[INFO] gms url: $DATAHUB_GMS_URL"
@@ -287,7 +322,7 @@ _error() {
 
 _progress_status_count() {
   local _status="$1"
-  find "$STATUS_DIR" -maxdepth 1 -type f -name '*.status' -exec cat {} \; 2>/dev/null \
+  find "$STATUS_DIR" -maxdepth 1 -type f \( -name '*.status' -o -name '*.import_status' \) -exec cat {} \; 2>/dev/null \
     | awk -v status="$_status" '$0 == status { count++ } END { print count + 0 }'
 }
 
@@ -296,6 +331,7 @@ _print_progress() {
   local status_file="$2"
   local _lock_dir="$STATUS_DIR/progress.lock"
   local _status _status_label _done _ok_count _skip_count _fail_count
+  local _import_done _import_ok_count _import_skip_count _import_fail_count
 
   while ! mkdir "$_lock_dir" 2>/dev/null; do
     sleep 0.1
@@ -312,13 +348,127 @@ _print_progress() {
   _ok_count="$(_progress_status_count 0)"
   _skip_count="$(_progress_status_count 2)"
   _fail_count="$(_progress_status_count 1)"
-  echo "[PROGRESS] field lineage export ${_done}/${#TABLE_LIST[@]} done, ok=${_ok_count}, skipped=${_skip_count}, failed=${_fail_count}, latest=${table}, status=${_status_label}"
+  _import_done="$(find "$STATUS_DIR" -maxdepth 1 -type f -name '*.import_status' 2>/dev/null | wc -l | tr -d ' ')"
+  _import_ok_count="$(_progress_status_count import:0)"
+  _import_skip_count="$(_progress_status_count import:2)"
+  _import_fail_count="$(_progress_status_count import:1)"
+  echo "[PROGRESS] field lineage export ${_done}/${#TABLE_LIST[@]} done, ok=${_ok_count}, skipped=${_skip_count}, failed=${_fail_count}, latest=${table}, status=${_status_label}; auto_import ${_import_done}/${#TABLE_LIST[@]} done, ok=${_import_ok_count}, skipped=${_import_skip_count}, failed=${_import_fail_count}"
+}
+
+_json_get_import_meta() {
+  local plan_file="$1"
+  PYTHONPATH="$PYTHONPATH_ROOT" "$PYTHON" -c '
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    payload = json.load(f)
+tables = payload.get("write_result", {}).get("tables", {})
+is_complete = False
+marked = False
+covered = 0
+schema_count = 0
+missing_count = 0
+field_count = 0
+for table_result in tables.values():
+    if not isinstance(table_result, dict):
+        continue
+    field_count += int(table_result.get("field_count", 0) or 0)
+    completeness = table_result.get("field_lineage_completeness")
+    if isinstance(completeness, dict):
+        is_complete = bool(completeness.get("is_complete"))
+        marked = bool(completeness.get("marked_data_availability_flag"))
+        covered = int(completeness.get("covered_field_count", 0) or 0)
+        schema_count = int(completeness.get("schema_field_count", 0) or 0)
+        missing = completeness.get("missing_fields")
+        missing_count = len(missing) if isinstance(missing, list) else 0
+print(f"{int(is_complete)} {int(marked)} {covered} {schema_count} {missing_count} {field_count}")
+' "$plan_file"
+}
+
+_auto_import_one_table() {
+  local TABLE_NAME="$1"
+  local OUTPUT_FILE="$2"
+  local IMPORT_STATUS_FILE="$3"
+  local IMPORT_PLAN_FILE="${OUTPUT_FILE%.xlsx}_auto_import_plan.json"
+  local _cli_out _cli_rc _skip_reason _clear_arg _require_full_arg
+  local _is_complete _marked _covered _schema_count _missing_count _field_count
+
+  rm -f "$IMPORT_STATUS_FILE" "${IMPORT_STATUS_FILE}.skip_reason" "$IMPORT_PLAN_FILE"
+  if [[ "$AUTO_IMPORT" -ne 1 ]]; then
+    echo "auto import disabled" >"${IMPORT_STATUS_FILE}.skip_reason"
+    echo "import:2" >"$IMPORT_STATUS_FILE"
+    return 0
+  fi
+
+  _log "$TABLE_NAME" "auto import AUTO_APPROVED started -> $IMPORT_PLAN_FILE"
+  _cli_out="$(mktemp "${TMPDIR:-/tmp}/field_lineage_import_cli.XXXXXX")"
+  if [[ "$AUTO_IMPORT_CLEAR_EXISTING" -eq 1 ]]; then
+    _clear_arg="--clear-existing"
+  else
+    _clear_arg="--no-clear-existing"
+  fi
+  _require_full_arg="--no-require-full-auto-approved"
+  if [[ "$AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED" -eq 1 ]]; then
+    _require_full_arg="--require-full-auto-approved"
+  fi
+
+  set +e
+  _run_cli \
+    import-reviewed \
+    --input "$OUTPUT_FILE" \
+    --output "$IMPORT_PLAN_FILE" \
+    --gms-url "$DATAHUB_GMS_URL" \
+    --write \
+    --import-statuses AUTO_APPROVED \
+    "$_clear_arg" \
+    "$_require_full_arg" \
+    >"$_cli_out" 2>&1 7>&-
+  _cli_rc=$?
+  set -e
+  cat "$_cli_out"
+
+  if [[ "$_cli_rc" -eq 0 ]]; then
+    if [[ -f "$IMPORT_PLAN_FILE" ]]; then
+      _import_meta="$(_json_get_import_meta "$IMPORT_PLAN_FILE")"
+      read -r _is_complete _marked _covered _schema_count _missing_count _field_count <<< "$_import_meta"
+      echo "complete=$_is_complete marked=$_marked covered=$_covered schema=$_schema_count missing=$_missing_count imported_fields=$_field_count" >"${IMPORT_STATUS_FILE}.meta"
+      _log "$TABLE_NAME" "auto import ok: imported_fields=${_field_count}, completeness=${_is_complete}, covered=${_covered}/${_schema_count}, missing=${_missing_count}, marked_flag=${_marked}, plan=$IMPORT_PLAN_FILE"
+    else
+      _log "$TABLE_NAME" "auto import ok: plan not found: $IMPORT_PLAN_FILE"
+    fi
+    rm -f "$_cli_out"
+    echo "import:0" >"$IMPORT_STATUS_FILE"
+    return 0
+  fi
+
+  if [[ "$_cli_rc" -eq 4 || "$_cli_rc" -eq 6 ]]; then
+    _skip_reason="$(grep '^FIELD_LINEAGE_SKIP_REASON=' "$_cli_out" | tail -1 | sed 's/^FIELD_LINEAGE_SKIP_REASON=//')"
+    if [[ -z "$_skip_reason" && "$_cli_rc" -eq 4 ]]; then
+      _skip_reason="AUTO_APPROVED 行为空，等待人工审核"
+    fi
+    if [[ -z "$_skip_reason" ]]; then
+      _skip_reason="未满足自动导入条件，等待人工审核"
+    fi
+    rm -f "$_cli_out"
+    _warn "$TABLE_NAME" "auto import skipped: $_skip_reason"
+    echo "$_skip_reason" >"${IMPORT_STATUS_FILE}.skip_reason"
+    echo "import:2" >"$IMPORT_STATUS_FILE"
+    return 0
+  fi
+
+  rm -f "$_cli_out"
+  _error "$TABLE_NAME" "auto import failed: rc=$_cli_rc"
+  echo "import:1" >"$IMPORT_STATUS_FILE"
+  return 1
 }
 
 _export_one_table() {
   local TABLE_NAME="$1"
   local OUTPUT_FILE="$2"
   local STATUS_FILE="$3"
+  local IMPORT_STATUS_FILE="$4"
   local max_attempts=$((RETRY_COUNT + 1))
   local attempt=1
   local _cli_out _cli_rc _skip_reason
@@ -361,6 +511,7 @@ _export_one_table() {
       rm -f "$_cli_out"
       _log "$TABLE_NAME" "export ok: $OUTPUT_FILE"
       echo 0 >"$STATUS_FILE"
+      _auto_import_one_table "$TABLE_NAME" "$OUTPUT_FILE" "$IMPORT_STATUS_FILE" || true
       return 0
     fi
 
@@ -370,6 +521,8 @@ _export_one_table() {
       _warn "$TABLE_NAME" "${_skip_reason:-structured property 无内容，已跳过}"
       echo "${_skip_reason:-structured property 无内容}" >"${STATUS_FILE}.skip_reason"
       echo 2 >"$STATUS_FILE"
+      echo "export skipped" >"${IMPORT_STATUS_FILE}.skip_reason"
+      echo "import:2" >"$IMPORT_STATUS_FILE"
       return 0
     fi
 
@@ -379,6 +532,8 @@ _export_one_table() {
 
   _error "$TABLE_NAME" "export failed after $max_attempts attempt(s)"
   echo 1 >"$STATUS_FILE"
+  echo "export failed" >"${IMPORT_STATUS_FILE}.skip_reason"
+  echo "import:2" >"$IMPORT_STATUS_FILE"
   return 1
 }
 
@@ -393,10 +548,11 @@ for ((_i = 0; _i < CONCURRENCY; _i++)); do echo >&7; done
 for TABLE_NAME in "${TABLE_LIST[@]}"; do
   OUTPUT_FILE="$BATCH_OUTPUT_DIR/${BATCH_ID}_${TABLE_NAME}.xlsx"
   STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.status"
+  IMPORT_STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.import_status"
 
   read -r -u 7
   (
-    _export_one_table "$TABLE_NAME" "$OUTPUT_FILE" "$STATUS_FILE" || true
+    _export_one_table "$TABLE_NAME" "$OUTPUT_FILE" "$STATUS_FILE" "$IMPORT_STATUS_FILE" || true
     _print_progress "$TABLE_NAME" "$STATUS_FILE"
     echo >&7
   ) &
@@ -416,14 +572,21 @@ _FD7_OPEN=0
 _ok=0
 _skip=0
 _fail=0
+_import_ok=0
+_import_skip=0
+_import_fail=0
+_import_complete=0
+_import_marked=0
 _skipped_tables=()
+_import_skipped_tables=()
+_import_failed_tables=()
 for TABLE_NAME in "${TABLE_LIST[@]}"; do
   STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.status"
+  IMPORT_STATUS_FILE="$STATUS_DIR/${TABLE_NAME//./_}.import_status"
   if [[ ! -f "$STATUS_FILE" ]]; then
     _fail=$((_fail + 1))
-    continue
-  fi
-  case "$(cat "$STATUS_FILE")" in
+  else
+    case "$(cat "$STATUS_FILE")" in
     0) _ok=$((_ok + 1)) ;;
     2)
       _skip=$((_skip + 1))
@@ -434,12 +597,45 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
       _skipped_tables+=("${TABLE_NAME}: ${_reason:-structured property 无内容}")
       ;;
     *) _fail=$((_fail + 1)) ;;
+    esac
+  fi
+
+  if [[ ! -f "$IMPORT_STATUS_FILE" ]]; then
+    _import_skip=$((_import_skip + 1))
+    _import_skipped_tables+=("${TABLE_NAME}: 未执行自动导入")
+    continue
+  fi
+  case "$(cat "$IMPORT_STATUS_FILE")" in
+    import:0)
+      _import_ok=$((_import_ok + 1))
+      if [[ -f "${IMPORT_STATUS_FILE}.meta" ]]; then
+        if grep -q 'complete=1' "${IMPORT_STATUS_FILE}.meta"; then
+          _import_complete=$((_import_complete + 1))
+        fi
+        if grep -q 'marked=1' "${IMPORT_STATUS_FILE}.meta"; then
+          _import_marked=$((_import_marked + 1))
+        fi
+      fi
+      ;;
+    import:2)
+      _import_skip=$((_import_skip + 1))
+      _reason=""
+      if [[ -f "${IMPORT_STATUS_FILE}.skip_reason" ]]; then
+        _reason="$(cat "${IMPORT_STATUS_FILE}.skip_reason")"
+      fi
+      _import_skipped_tables+=("${TABLE_NAME}: ${_reason:-自动导入已跳过}")
+      ;;
+    *)
+      _import_fail=$((_import_fail + 1))
+      _import_failed_tables+=("$TABLE_NAME")
+      ;;
   esac
 done
 
 echo "[INFO] field lineage export finished at $(date -Iseconds)"
 echo "[INFO] batch id (auto): $BATCH_ID"
 echo "[INFO] succeeded: ${_ok}/${#TABLE_LIST[@]}, skipped: ${_skip}, failed: ${_fail}"
+echo "[INFO] auto import summary: succeeded=${_import_ok}/${#TABLE_LIST[@]}, skipped=${_import_skip}, failed=${_import_fail}, complete=${_import_complete}, marked_field_lineage_flag=${_import_marked}"
 
 _write_batch_summary_once || true
 
@@ -451,6 +647,20 @@ if [[ "$_skip" -gt 0 ]]; then
   echo "[WARN] 若因 structured property 无内容跳过，请先在 DataHub 补全 Etl Script (blf.data.warehouse.etl_script) 后重新导出。"
 fi
 
-if [[ "$_fail" -gt 0 ]]; then
+if [[ "$_import_skip" -gt 0 ]]; then
+  echo "[WARN] ========== 以下表已跳过自动导入 =========="
+  for _entry in "${_import_skipped_tables[@]}"; do
+    echo "[WARN]   ${_entry}"
+  done
+fi
+
+if [[ "$_import_fail" -gt 0 ]]; then
+  echo "[ERROR] ========== 以下表自动导入失败 ==========" >&2
+  for _entry in "${_import_failed_tables[@]}"; do
+    echo "[ERROR]   ${_entry}" >&2
+  done
+fi
+
+if [[ "$_fail" -gt 0 || "$_import_fail" -gt 0 ]]; then
   exit 1
 fi
