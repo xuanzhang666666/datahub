@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -16,12 +19,15 @@ from .field_lineage_models import (
     review_status_from_confidence,
 )
 from .llm_client import (
+    LlmConfig,
     call_openai_compatible_chat_json,
     get_llm_config,
     normalize_openai_v1_base,
 )
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
+DEFAULT_FIELD_LINEAGE_LLM_BATCH_SIZE = 40
+DEFAULT_FIELD_LINEAGE_LLM_BATCH_CONCURRENCY = 4
 
 FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘分析专家。
 你会收到一个 Hive 表的 ETL 脚本和执行命令。请只输出 JSON 对象，不要 markdown。
@@ -183,11 +189,23 @@ def build_field_lineage_user_message(source_input: FieldLineageInput) -> str:
             f"{alias_lines}\n\n"
             "重要：这些别名表的写入要折叠成目标表字段血缘，不要判定为未写入目标表。\n\n"
         )
+    requested_section = ""
+    if source_input.requested_target_fields:
+        requested_lines = "\n".join(
+            f"- [TARGET] {field}" for field in source_input.requested_target_fields
+        )
+        requested_section = (
+            "本批次仅解析以下目标字段:\n"
+            f"{requested_lines}\n\n"
+            "重要：只允许为本批次字段输出 mappings 或 unresolved_fields；"
+            "完整 DDL 字段顺序仅用于 Hive INSERT SELECT 位置对齐。\n\n"
+        )
     return (
         f"目标表: {source_input.table_name}\n\n"
         f"{schema_section}"
         f"{partition_section}"
         f"{alias_section}"
+        f"{requested_section}"
         f"执行命令:\n{source_input.execute_shell}\n\n"
         f"ETL 脚本:\n{source_input.etl_script}"
     )
@@ -214,12 +232,14 @@ def build_field_lineage_request_debug_info(
     }
 
 
-def call_llm_extract_field_lineage(
+def _call_llm_extract_field_lineage_once(
     source_input: FieldLineageInput,
-    timeout_sec: int = 180,
+    *,
+    cfg: LlmConfig,
+    timeout_sec: int,
+    batch_index: int = 1,
+    batch_count: int = 1,
 ) -> Tuple[FieldLineageParseResult, str]:
-    """Call an OpenAI-compatible LLM and parse field-lineage candidates."""
-    cfg = get_llm_config()
     base = normalize_openai_v1_base(cfg.base_v1)
     user_message = build_field_lineage_user_message(source_input)
     payload: Dict[str, Any] = {
@@ -239,7 +259,7 @@ def call_llm_extract_field_lineage(
         timeout_sec=timeout_sec,
     )
     _log(
-        "request prepared: "
+        f"request prepared: batch={batch_index}/{batch_count} "
         f"provider={cfg.provider} base={debug_info['llm_base']} model={debug_info['llm_model']} "
         f"timeout_sec={debug_info['timeout_sec']} "
         f"system_prompt_chars={debug_info['system_prompt_chars']} "
@@ -251,7 +271,10 @@ def call_llm_extract_field_lineage(
         f"request_bytes={len(data)}"
     )
     start = time.perf_counter()
-    _log(f"HTTP request started: provider={cfg.provider} model={cfg.model}")
+    _log(
+        f"HTTP request started: batch={batch_index}/{batch_count} "
+        f"provider={cfg.provider} model={cfg.model}"
+    )
     raw_payload = call_openai_compatible_chat_json(
         cfg,
         system_prompt=FIELD_LINEAGE_SYSTEM_PROMPT,
@@ -261,13 +284,151 @@ def call_llm_extract_field_lineage(
     elapsed_sec = time.perf_counter() - start
     content = json.dumps(raw_payload, ensure_ascii=False)
     _log(
-        "HTTP response parsed: "
+        f"HTTP response parsed: batch={batch_index}/{batch_count} "
         f"elapsed_sec={elapsed_sec:.1f} content_chars={len(content)}"
     )
     parsed = parse_field_lineage_payload(content)
+    requested = {
+        field.strip().lower()
+        for field in source_input.requested_target_fields
+        if field.strip()
+    }
+    if requested:
+        parsed = FieldLineageParseResult(
+            target_table=parsed.target_table,
+            mappings=[
+                mapping
+                for mapping in parsed.mappings
+                if mapping.target_field in requested
+            ],
+            unresolved_fields=[
+                unresolved
+                for unresolved in parsed.unresolved_fields
+                if unresolved.target_field in requested
+            ],
+        )
     _log(
-        "message parsed: "
+        f"message parsed: batch={batch_index}/{batch_count} "
         f"candidate_count={len(parsed.mappings)} "
         f"unresolved_field_count={len(parsed.unresolved_fields)}"
     )
     return parsed, cfg.model
+
+
+def _field_lineage_batch_size() -> int:
+    raw = os.getenv("FIELD_LINEAGE_LLM_BATCH_SIZE", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return DEFAULT_FIELD_LINEAGE_LLM_BATCH_SIZE
+
+
+def _field_lineage_batch_concurrency() -> int:
+    raw = os.getenv("FIELD_LINEAGE_LLM_BATCH_CONCURRENCY", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return DEFAULT_FIELD_LINEAGE_LLM_BATCH_CONCURRENCY
+
+
+def _deduplicate_mappings(
+    mappings: List[FieldLineageCandidate],
+) -> List[FieldLineageCandidate]:
+    return list(dict.fromkeys(mappings))
+
+
+def _deduplicate_unresolved_fields(
+    unresolved_fields: List[UnresolvedField],
+) -> List[UnresolvedField]:
+    by_field: Dict[str, UnresolvedField] = {}
+    for unresolved in unresolved_fields:
+        by_field.setdefault(unresolved.target_field, unresolved)
+    return list(by_field.values())
+
+
+def call_llm_extract_field_lineage(
+    source_input: FieldLineageInput,
+    timeout_sec: int = 180,
+) -> Tuple[FieldLineageParseResult, str]:
+    """Call the LLM in target-field batches while sending the complete ETL each time."""
+    cfg = get_llm_config()
+    partition_fields = {
+        field.strip().lower()
+        for field in source_input.target_partition_fields
+        if field.strip()
+    }
+    target_fields = [
+        field.strip().lower()
+        for field in source_input.target_schema_fields
+        if field.strip() and field.strip().lower() not in partition_fields
+    ]
+    target_fields = list(dict.fromkeys(target_fields))
+    batch_size = _field_lineage_batch_size()
+    if not target_fields or len(target_fields) <= batch_size:
+        return _call_llm_extract_field_lineage_once(
+            source_input,
+            cfg=cfg,
+            timeout_sec=timeout_sec,
+        )
+
+    batches = [
+        target_fields[index : index + batch_size]
+        for index in range(0, len(target_fields), batch_size)
+    ]
+    _log(
+        "batched extraction enabled: "
+        f"target_field_count={len(target_fields)} batch_size={batch_size} "
+        f"batch_count={len(batches)} "
+        f"batch_concurrency={min(_field_lineage_batch_concurrency(), len(batches))} "
+        f"etl_script_chars={len(source_input.etl_script)}"
+    )
+    mappings: List[FieldLineageCandidate] = []
+    unresolved_fields: List[UnresolvedField] = []
+    target_table = source_input.table_name
+    batch_results: Dict[int, FieldLineageParseResult] = {}
+    batch_concurrency = min(_field_lineage_batch_concurrency(), len(batches))
+    with ThreadPoolExecutor(
+        max_workers=batch_concurrency,
+        thread_name_prefix="field-lineage-batch",
+    ) as executor:
+        futures = {}
+        for index, batch in enumerate(batches, start=1):
+            _log(
+                f"batch fields: batch={index}/{len(batches)} "
+                f"count={len(batch)} first={batch[0]} last={batch[-1]}"
+            )
+            future = executor.submit(
+                _call_llm_extract_field_lineage_once,
+                replace(source_input, requested_target_fields=batch),
+                cfg=cfg,
+                timeout_sec=timeout_sec,
+                batch_index=index,
+                batch_count=len(batches),
+            )
+            futures[future] = index
+
+        for future in as_completed(futures):
+            index = futures[future]
+            parsed, _ = future.result()
+            batch_results[index] = parsed
+            _log(
+                f"batch completed: batch={index}/{len(batches)} "
+                f"completed_count={len(batch_results)}/{len(batches)}"
+            )
+
+    for index in range(1, len(batches) + 1):
+        parsed = batch_results[index]
+        if parsed.target_table:
+            target_table = parsed.target_table
+        mappings.extend(parsed.mappings)
+        unresolved_fields.extend(parsed.unresolved_fields)
+
+    merged = FieldLineageParseResult(
+        target_table=target_table,
+        mappings=_deduplicate_mappings(mappings),
+        unresolved_fields=_deduplicate_unresolved_fields(unresolved_fields),
+    )
+    _log(
+        "batched extraction merged: "
+        f"candidate_count={len(merged.mappings)} "
+        f"unresolved_field_count={len(merged.unresolved_fields)}"
+    )
+    return merged, cfg.model

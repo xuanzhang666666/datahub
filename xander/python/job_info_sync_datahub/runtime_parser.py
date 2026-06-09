@@ -325,14 +325,25 @@ def candidate_gitlab_paths(job_path: str, jfn: str, job_dir: str = "jobs") -> Li
     """
     first_seg = job_path.split("/")[0]
     jp = job_path.strip().strip("/")
-    return list(
-        dict.fromkeys(
-            [
-                f"{job_dir}/{first_seg}/{jfn}",
-                f"{job_dir}/{jp}.job",
-                f"{job_dir}/{jp}.py",
-                f"{job_dir}/{jp}.yml",
-                f"{job_dir}/{jp}/{jfn}",
-            ]
-        )
+    paths: List[str] = []
+    if "/" in jp:
+        parent_parts = [part for part in jp.split("/")[:-1] if part]
+        for depth in range(len(parent_parts), 0, -1):
+            paths.append(f"{job_dir}/{'/'.join(parent_parts[:depth])}/{jfn}")
+
+    jfn_stem = re.sub(r"\.(?:job|py|yml)$", "", jfn)
+    parts = [part for part in jfn_stem.split("_") if part]
+    for depth in (3, 2, 1):
+        if len(parts) > depth:
+            paths.append(f"{job_dir}/{'/'.join(parts[:depth])}/{jfn}")
+
+    paths.extend(
+        [
+            f"{job_dir}/{first_seg}/{jfn}",
+            f"{job_dir}/{jp}.job",
+            f"{job_dir}/{jp}.py",
+            f"{job_dir}/{jp}.yml",
+            f"{job_dir}/{jp}/{jfn}",
+        ]
     )
+    return list(dict.fromkeys(paths))

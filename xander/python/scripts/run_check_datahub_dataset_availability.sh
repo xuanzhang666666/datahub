@@ -4,7 +4,8 @@
 # Jenkins 参数：
 #   TABLE_NAMES       Multi-line：每行一个 db.table；为空时可用 TABLE_PRE 自动发现
 #   TABLE_PRE         表名前缀过滤，如 pdw → 遍历 *.pdw* datasets（仅 TABLE_NAMES 为空时生效）
-#   SET_AVAILABLE_FLAGS 1=仅遍历 TABLE_NAMES，将 Data Availability Flag 设置为 ["DDL", "表血缘"]
+#   SET_AVAILABLE_FLAGS 1=仅遍历 TABLE_NAMES，按 AVAILABLE_FLAGS 更新 Data Availability Flag
+#   AVAILABLE_FLAGS    要写入的标记，逗号或换行分隔，仅支持 DDL、表血缘、字段血缘；默认 DDL,表血缘
 #   DRY_RUN           1=只生成报告和日志，不写 DataHub（默认）；0=写入 data_availability_flag
 #   DATAHUB_GMS_URL   GMS 地址，默认 http://localhost:8080
 #   DATAHUB_GMS_TOKEN GMS token（无鉴权时可不填）
@@ -49,6 +50,7 @@ export DATAHUB_GMS_TOKEN="${DATAHUB_GMS_TOKEN:-eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5
 TABLE_NAMES="${TABLE_NAMES:-}"
 TABLE_PRE="${TABLE_PRE:-}"
 SET_AVAILABLE_FLAGS="${SET_AVAILABLE_FLAGS:-0}"
+AVAILABLE_FLAGS="${AVAILABLE_FLAGS:-DDL,表血缘}"
 if [[ "$SET_AVAILABLE_FLAGS" == "1" && -z "${TABLE_NAMES//[[:space:]]/}" ]]; then
   echo "ERROR: SET_AVAILABLE_FLAGS=1 时必须填写 TABLE_NAMES。" >&2
   exit 2
@@ -84,7 +86,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   ARGS+=(--dry-run)
 fi
 if [[ "$SET_AVAILABLE_FLAGS" == "1" ]]; then
-  ARGS+=(--set-available-flags)
+  ARGS+=(--set-available-flags --available-flags "$AVAILABLE_FLAGS")
 fi
 if [[ -n "${DATAHUB_GMS_TOKEN:-}" ]]; then
   ARGS+=(--token "$DATAHUB_GMS_TOKEN")
@@ -106,6 +108,7 @@ echo " DATAHUB_GMS_URL=$GMS_URL"
 echo " DRY_RUN=$DRY_RUN"
 echo " TABLE_PRE=${TABLE_PRE:-}"
 echo " SET_AVAILABLE_FLAGS=$SET_AVAILABLE_FLAGS"
+echo " AVAILABLE_FLAGS=$AVAILABLE_FLAGS"
 echo "==================================================================="
 
 cd "$PYTHONPATH_ROOT"

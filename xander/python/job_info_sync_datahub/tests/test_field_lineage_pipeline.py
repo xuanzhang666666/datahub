@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import threading
 
 import pytest
 from openpyxl import load_workbook
@@ -35,6 +36,7 @@ from job_info_sync_datahub.field_lineage_llm import (
     FIELD_LINEAGE_SYSTEM_PROMPT,
     build_field_lineage_user_message,
     build_field_lineage_request_debug_info,
+    call_llm_extract_field_lineage,
     parse_field_lineage_payload,
 )
 from job_info_sync_datahub.field_lineage_models import (
@@ -567,6 +569,76 @@ def test_build_field_lineage_user_message_includes_partition_fields() -> None:
 
     assert "目标表分区字段（不需要输出字段血缘）:" in message
     assert "- version" in message
+
+
+def test_field_lineage_llm_batches_target_fields_with_full_etl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dw_target"),
+        table_name="default.dw_target",
+        etl_script="FULL_ETL select col1, col2, col3, col4 from default.ods_source",
+        execute_shell="sh run.sh",
+        target_schema_fields=["col1", "col2", "dt", "col3", "col4"],
+        target_partition_fields=["dt"],
+    )
+    messages: list[str] = []
+    concurrent_calls = threading.Barrier(2)
+
+    class Config:
+        base_v1 = "http://llm/v1"
+        api_key = "key"
+        model = "test-model"
+        provider = "test"
+
+    def fake_call(config, *, system_prompt, user_message, timeout_sec):
+        messages.append(user_message)
+        concurrent_calls.wait(timeout=1)
+        requested = [
+            line.removeprefix("- [TARGET] ").strip()
+            for line in user_message.splitlines()
+            if line.startswith("- [TARGET] ")
+        ]
+        assert len(requested) <= 2
+        assert "FULL_ETL" in user_message
+        return {
+            "target_table": "default.dw_target",
+            "mappings": [
+                {
+                    "target_field": field,
+                    "source_table": "default.ods_source",
+                    "source_field": field,
+                    "transform_expression": field,
+                    "transform_explanation": f"取 default.ods_source 的 {field}",
+                    "evidence_sql": f"select {field}",
+                    "confidence": "HIGH",
+                }
+                for field in requested
+            ],
+            "unresolved_fields": [],
+        }
+
+    monkeypatch.setenv("FIELD_LINEAGE_LLM_BATCH_SIZE", "2")
+    monkeypatch.setenv("FIELD_LINEAGE_LLM_BATCH_CONCURRENCY", "2")
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_llm.get_llm_config", lambda: Config()
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_llm.call_openai_compatible_chat_json",
+        fake_call,
+    )
+
+    parsed, model = call_llm_extract_field_lineage(source, timeout_sec=10)
+
+    assert model == "test-model"
+    assert len(messages) == 2
+    assert {mapping.target_field for mapping in parsed.mappings} == {
+        "col1",
+        "col2",
+        "col3",
+        "col4",
+    }
+    assert all("- [TARGET] dt" not in message for message in messages)
 
 
 def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:

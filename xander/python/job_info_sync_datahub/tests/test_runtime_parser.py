@@ -207,3 +207,36 @@ def test_candidate_paths_dedup() -> None:
     paths = candidate_gitlab_paths("pdw_opc_flag/pdw_opc_flag_contact", "pdw_opc_flag_pdw_opc_flag_contact.job")
     assert len(paths) == len(set(paths))
     assert paths[0].startswith("jobs/pdw_opc_flag/")
+
+
+def test_candidate_paths_include_underscore_derived_nested_dirs() -> None:
+    paths = candidate_gitlab_paths(
+        "pdw_order_store_111_order_detail_shipment_main",
+        "pdw_order_store_111_order_detail_shipment_main.job",
+    )
+
+    assert (
+        "jobs/pdw/order/store/pdw_order_store_111_order_detail_shipment_main.job"
+        in paths
+    )
+
+
+def test_candidate_paths_include_runner_dir_with_full_job_file_name() -> None:
+    paths = candidate_gitlab_paths(
+        "pdw/order/store/111_order_detail_shipment_main",
+        "pdw_order_store_111_order_detail_shipment_main.job",
+    )
+
+    assert paths[0] == (
+        "jobs/pdw/order/store/"
+        "pdw_order_store_111_order_detail_shipment_main.job"
+    )
+
+
+def test_candidate_paths_include_filename_derived_nested_dirs_for_partial_runner_path() -> None:
+    paths = candidate_gitlab_paths(
+        "pdw/order/store_129_order_detail",
+        "pdw_order_store_129_order_detail.job",
+    )
+
+    assert "jobs/pdw/order/store/pdw_order_store_129_order_detail.job" in paths

@@ -22,6 +22,10 @@ fi
 #
 # ── 并发与重试 ───────────────────────────────────────────────────────────────
 # FIELD_LINEAGE_CONCURRENCY  并发请求 LLM 数，默认 10
+# FIELD_LINEAGE_LLM_BATCH_SIZE
+#                            单次 LLM 解析的非分区目标字段数，默认 40；每批仍发送完整 ETL
+# FIELD_LINEAGE_LLM_BATCH_CONCURRENCY
+#                            单张表内部同时请求的字段批次数，默认 4
 # FIELD_LINEAGE_RETRY_COUNT    失败后额外重试次数，默认 1（共最多 2 次）
 # FIELD_LINEAGE_AUTO_IMPORT    导出 Excel 后自动导入 AUTO_APPROVED 字段血缘，默认 1
 # FIELD_LINEAGE_AUTO_IMPORT_CLEAR_EXISTING
@@ -63,6 +67,8 @@ DEBUG_ROOT="${FIELD_LINEAGE_DEBUG_DIR:-${WORKSPACE:+$WORKSPACE/field_lineage_deb
 PREVIEW_CHARS="${FIELD_LINEAGE_PREVIEW_CHARS:-8000}"
 LLM_TIMEOUT="${FIELD_LINEAGE_LLM_TIMEOUT_SEC:-240}"
 CONCURRENCY="${FIELD_LINEAGE_CONCURRENCY:-10}"
+export FIELD_LINEAGE_LLM_BATCH_SIZE="${FIELD_LINEAGE_LLM_BATCH_SIZE:-40}"
+export FIELD_LINEAGE_LLM_BATCH_CONCURRENCY="${FIELD_LINEAGE_LLM_BATCH_CONCURRENCY:-4}"
 RETRY_COUNT="${FIELD_LINEAGE_RETRY_COUNT:-1}"
 AUTO_IMPORT="${FIELD_LINEAGE_AUTO_IMPORT:-1}"
 AUTO_IMPORT_CLEAR_EXISTING="${FIELD_LINEAGE_AUTO_IMPORT_CLEAR_EXISTING:-0}"
@@ -70,6 +76,14 @@ AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED="${FIELD_LINEAGE_AUTO_IMPORT_REQUIRE_FULL
 
 if ! [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: FIELD_LINEAGE_CONCURRENCY 必须为正整数: $CONCURRENCY" >&2
+  exit 2
+fi
+if ! [[ "$FIELD_LINEAGE_LLM_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: FIELD_LINEAGE_LLM_BATCH_SIZE 必须为正整数: $FIELD_LINEAGE_LLM_BATCH_SIZE" >&2
+  exit 2
+fi
+if ! [[ "$FIELD_LINEAGE_LLM_BATCH_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: FIELD_LINEAGE_LLM_BATCH_CONCURRENCY 必须为正整数: $FIELD_LINEAGE_LLM_BATCH_CONCURRENCY" >&2
   exit 2
 fi
 if ! [[ "$RETRY_COUNT" =~ ^[0-9]+$ ]]; then
@@ -276,6 +290,8 @@ echo "[INFO] output root: $OUTPUT_DIR"
 echo "[INFO] batch output dir: $BATCH_OUTPUT_DIR"
 echo "[INFO] debug root: ${DEBUG_ROOT:-<excel-sibling-default>}"
 echo "[INFO] concurrency: $CONCURRENCY"
+echo "[INFO] llm target field batch size: $FIELD_LINEAGE_LLM_BATCH_SIZE (complete ETL sent per batch)"
+echo "[INFO] llm target field batch concurrency: $FIELD_LINEAGE_LLM_BATCH_CONCURRENCY"
 echo "[INFO] retry on failure: $RETRY_COUNT"
 echo "[INFO] auto import AUTO_APPROVED: $([[ "$AUTO_IMPORT" -eq 1 ]] && echo yes || echo no)"
 echo "[INFO] auto import mode: $([[ "$AUTO_IMPORT_CLEAR_EXISTING" -eq 1 ]] && echo clear_import || echo merge_update)"
@@ -424,10 +440,9 @@ _auto_import_one_table() {
     --import-statuses AUTO_APPROVED \
     "$_clear_arg" \
     "$_require_full_arg" \
-    >"$_cli_out" 2>&1 7>&-
-  _cli_rc=$?
+    2>&1 7>&- | tee "$_cli_out"
+  _cli_rc=${PIPESTATUS[0]}
   set -e
-  cat "$_cli_out"
 
   if [[ "$_cli_rc" -eq 0 ]]; then
     if [[ -f "$IMPORT_PLAN_FILE" ]]; then
@@ -502,10 +517,9 @@ _export_one_table() {
       mkdir -p "$DEBUG_DIR"
       _export_args+=(--debug-dir "$DEBUG_DIR")
     fi
-    _run_cli "${_export_args[@]}" >"$_cli_out" 2>&1 7>&-
-    _cli_rc=$?
+    _run_cli "${_export_args[@]}" 2>&1 7>&- | tee "$_cli_out"
+    _cli_rc=${PIPESTATUS[0]}
     set -e
-    cat "$_cli_out"
 
     if [[ "$_cli_rc" -eq 0 ]]; then
       rm -f "$_cli_out"

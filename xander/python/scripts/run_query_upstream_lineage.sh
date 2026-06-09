@@ -18,6 +18,8 @@
 # NO_CHECK_PROPS      设为 1 时跳过结构化属性检查
 # UPSTREAM_LINEAGE_XLSX  上游明细 Excel 输出路径，默认在 Jenkins WORKSPACE 下生成
 #
+# 输出指标：field_lineage_coverage=有血缘字段去重数/DDL字段数，分子分母均过滤 Partition Key
+#
 # ── 退出码 ────────────────────────────────────────────────────────────────────
 # 0  正常；如有上游表缺少结构化属性，会按缺少项分组打印
 # 1  查询 DataHub 失败

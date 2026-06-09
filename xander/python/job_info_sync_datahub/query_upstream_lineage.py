@@ -49,6 +49,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .field_lineage_datahub_reader import (
+    extract_schema_field_names,
+    extract_schema_partition_field_names,
     extract_property_texts,
     fetch_structured_properties,
     make_hive_dataset_urn,
@@ -370,6 +372,91 @@ def _unwrap_aspect(payload: Dict[str, Any], aspect_name: str) -> Dict[str, Any]:
     return current if isinstance(current, dict) else {}
 
 
+def calculate_field_lineage_coverage(
+    schema_payload: Dict[str, Any],
+    upstream_lineage_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Calculate unique downstream field coverage, excluding all DDL partition fields."""
+    ddl_fields = {field.lower() for field in extract_schema_field_names(schema_payload)}
+    partition_fields = {
+        field.lower() for field in extract_schema_partition_field_names(schema_payload)
+    }
+    eligible_fields = ddl_fields - partition_fields
+    lineage_fields = downstream_field_names_from_upstream_lineage(upstream_lineage_payload)
+    covered_fields = eligible_fields & lineage_fields
+    percent = round(len(covered_fields) * 100 / len(eligible_fields), 2) if eligible_fields else 0.0
+    return {
+        "field_lineage_coverage_percent": percent,
+        "field_lineage_covered_field_count": len(covered_fields),
+        "ddl_non_partition_field_count": len(eligible_fields),
+        "partition_fields": sorted(partition_fields),
+    }
+
+
+def downstream_field_names_from_upstream_lineage(payload: Dict[str, Any]) -> Set[str]:
+    """Extract unique downstream field names from fine-grained lineage."""
+    aspect = _unwrap_aspect(payload, "upstreamLineage")
+    fine_grained = aspect.get("fineGrainedLineages")
+    fields: Set[str] = set()
+    if not isinstance(fine_grained, list):
+        return fields
+    for lineage in fine_grained:
+        if not isinstance(lineage, dict) or not isinstance(lineage.get("downstreams"), list):
+            continue
+        for downstream in lineage["downstreams"]:
+            if not isinstance(downstream, str) or "," not in downstream:
+                continue
+            field_name = urllib.parse.unquote(
+                downstream.rsplit(",", 1)[-1].strip().rstrip(")")
+            ).strip().lower()
+            if field_name:
+                fields.add(field_name)
+    return fields
+
+
+def read_field_lineage_coverage(
+    gms_url: str,
+    token: Optional[str],
+    dataset_urn: str,
+) -> Dict[str, Any]:
+    """Read schema and fine-grained lineage aspects, then calculate field coverage."""
+    schema_payload: Dict[str, Any] = {}
+    upstream_lineage_payload: Dict[str, Any] = {}
+    try:
+        schema_payload = _fetch_dataset_aspect(gms_url, dataset_urn, "schemaMetadata", token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(
+                f"[WARN] 查询 {urn_to_table_name(dataset_urn)} schemaMetadata 失败 HTTP {exc.code}",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} schemaMetadata 失败: {exc}",
+            file=sys.stderr,
+        )
+
+    try:
+        upstream_lineage_payload = _fetch_dataset_aspect(
+            gms_url,
+            dataset_urn,
+            "upstreamLineage",
+            token=token,
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(
+                f"[WARN] 查询 {urn_to_table_name(dataset_urn)} upstreamLineage 失败 HTTP {exc.code}",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} upstreamLineage 失败: {exc}",
+            file=sys.stderr,
+        )
+    return calculate_field_lineage_coverage(schema_payload, upstream_lineage_payload)
+
+
 def read_dataset_type(gms_url: str, token: Optional[str], dataset_urn: str) -> str:
     """Return view/table/dataset for report display."""
     if is_view_dataset(gms_url, token, dataset_urn):
@@ -467,6 +554,10 @@ def write_upstream_detail_xlsx(path: str, rows: List[Dict[str, Any]]) -> None:
         "data_availability_flag",
         "other_remark",
         "上游表数量",
+        "字段血缘覆盖率",
+        "有血缘字段数量(去重,已过滤分区字段)",
+        "DDL字段数量(已过滤分区字段)",
+        "分区字段",
     ]
     wb = Workbook()
     ws = wb.active
@@ -574,6 +665,7 @@ def run(
 
     if not all_upstream_urns:
         print("[INFO] 未找到任何上游表（DataHub 中无表级血缘记录）")
+        print("[INFO] field_lineage_coverage=0.00% (0/0, 已过滤分区字段)")
         if output_xlsx:
             write_upstream_detail_xlsx(output_xlsx, [])
             print(f"[INFO] 上游明细 Excel 已生成: {output_xlsx}")
@@ -590,6 +682,8 @@ def run(
     upstream_deprecated: Dict[str, bool] = {}
     upstream_documentation_generated: Dict[str, bool] = {}
     upstream_report_rows: List[Dict[str, Any]] = []
+    total_covered_field_count = 0
+    total_ddl_non_partition_field_count = 0
     for table_name in upstream_tables:
         urn = make_hive_dataset_urn(table_name, platform_instance, env)
         upstream_status[table_name] = read_upstream_structured_status(gms_url, token, urn)
@@ -601,6 +695,13 @@ def run(
         )
         data_availability_flag = raw_data_availability_flag or "-"
         other_remark = raw_other_remark or "-"
+        coverage = read_field_lineage_coverage(gms_url, token, urn)
+        covered_field_count = int(coverage["field_lineage_covered_field_count"])
+        ddl_non_partition_field_count = int(coverage["ddl_non_partition_field_count"])
+        coverage_percent = float(coverage["field_lineage_coverage_percent"])
+        partition_fields = coverage["partition_fields"]
+        total_covered_field_count += covered_field_count
+        total_ddl_non_partition_field_count += ddl_non_partition_field_count
         db_name, short_table_name = split_table_name(table_name)
         upstream_report_rows.append(
             {
@@ -617,9 +718,30 @@ def run(
                 "data_availability_flag": data_availability_flag,
                 "other_remark": other_remark,
                 "上游表数量": upstream_dependency_counts.get(urn, 0),
+                "字段血缘覆盖率": f"{coverage_percent:.2f}%",
+                "有血缘字段数量(去重,已过滤分区字段)": covered_field_count,
+                "DDL字段数量(已过滤分区字段)": ddl_non_partition_field_count,
+                "分区字段": ",".join(partition_fields) or "-",
             }
         )
-        print(f"  {table_name}\tdata_availability_flag={data_availability_flag}")
+        print(
+            f"  {table_name}\tdata_availability_flag={data_availability_flag}"
+            f"\tfield_lineage_coverage={coverage_percent:.2f}% "
+            f"({covered_field_count}/{ddl_non_partition_field_count}, 已过滤分区字段)"
+        )
+
+    total_coverage_percent = (
+        round(
+            total_covered_field_count * 100 / total_ddl_non_partition_field_count,
+            2,
+        )
+        if total_ddl_non_partition_field_count
+        else 0.0
+    )
+    print(
+        f"[INFO] field_lineage_coverage={total_coverage_percent:.2f}% "
+        f"({total_covered_field_count}/{total_ddl_non_partition_field_count}, 已过滤分区字段)"
+    )
 
     if output_xlsx:
         write_upstream_detail_xlsx(output_xlsx, upstream_report_rows)

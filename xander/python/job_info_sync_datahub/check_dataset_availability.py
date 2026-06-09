@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .field_lineage_datahub_reader import (
+    extract_schema_field_names,
+    extract_schema_partition_field_names,
     fetch_structured_properties,
     make_hive_dataset_urn,
     strip_markdown_code_fence,
@@ -44,6 +46,7 @@ from .table_documentation_full_discovery import (
 
 FLAG_DDL, FLAG_TABLE_LINEAGE, FLAG_FIELD_LINEAGE = DATA_AVAILABILITY_FLAG_ORDER
 FLAG_ORDER = list(DATA_AVAILABILITY_FLAG_ORDER)
+DEFAULT_MANUAL_AVAILABLE_FLAGS = [FLAG_DDL, FLAG_TABLE_LINEAGE]
 VALID_HIVE_TABLE_PREFIXES = ("dwa", "dwd", "pdim", "dim", "ods", "pdw", "app", "mid", "dm", "dw", "ai")
 
 LABELS = {
@@ -57,6 +60,31 @@ STRUCTURED_PROPERTY_RULES = {
     URN_SCHEDULE_URL: "structuredProperties: Schedule URL",
     URN_EXECUTE_SHELL: "structuredProperties: Execute Shell",
 }
+
+
+def parse_requested_available_flags(raw: str | Iterable[str] | None) -> list[str]:
+    """Parse user-requested Data Availability Flag values in canonical order."""
+    if raw is None:
+        return list(DEFAULT_MANUAL_AVAILABLE_FLAGS)
+    values: list[str] = []
+    if isinstance(raw, str):
+        pieces = re.split(r"[,，\n\r]+", raw)
+    else:
+        pieces = list(raw)
+    for piece in pieces:
+        value = str(piece).strip().strip('"').strip("'")
+        if not value:
+            continue
+        values.append(value)
+    if not values:
+        return list(DEFAULT_MANUAL_AVAILABLE_FLAGS)
+    unknown = sorted(set(values) - set(DATA_AVAILABILITY_FLAG_ORDER))
+    if unknown:
+        raise ValueError(
+            "不支持的 Data Availability Flag: "
+            f"{', '.join(unknown)}；仅支持 {', '.join(DATA_AVAILABILITY_FLAG_ORDER)}"
+        )
+    return sort_data_availability_flags(values)
 
 
 @dataclass
@@ -89,6 +117,11 @@ class AvailabilityResult:
     lineage_existing_upstreams: list[str] = field(default_factory=list)
     lineage_missing_upstreams: list[str] = field(default_factory=list)
     lineage_extra_upstreams: list[str] = field(default_factory=list)
+    ddl_non_partition_field_count: int = 0
+    field_lineage_covered_field_count: int = 0
+    field_lineage_coverage_percent: float = 0.0
+    field_lineage_missing_fields: list[str] = field(default_factory=list)
+    partition_fields: list[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -201,6 +234,12 @@ def format_result_log_lines(result: AvailabilityResult) -> list[str]:
     if failed_checks:
         summary += f" failed_checks={failed_checks}"
     lines = [summary]
+    lines.append(
+        "  字段血缘覆盖率: "
+        f"{result.field_lineage_coverage_percent:.2f}% "
+        f"({result.field_lineage_covered_field_count}/"
+        f"{result.ddl_non_partition_field_count}, 已过滤分区字段)"
+    )
 
     if result.error:
         lines.append(f"  [ERROR] {result.error}")
@@ -369,6 +408,58 @@ def schema_field_count(payload: dict[str, Any]) -> int:
     aspect = unwrap_aspect(payload, "schemaMetadata")
     fields = aspect.get("fields")
     return len(fields) if isinstance(fields, list) else 0
+
+
+def _field_name_from_schema_field_urn(urn: str) -> str:
+    if not urn.startswith("urn:li:schemaField:") or "," not in urn:
+        return ""
+    return urllib.parse.unquote(urn.rsplit(",", 1)[-1].strip().rstrip(")")).strip().lower()
+
+
+def downstream_field_names_from_upstream_lineage(payload: dict[str, Any]) -> set[str]:
+    aspect = unwrap_aspect(payload, "upstreamLineage")
+    fine_grained = aspect.get("fineGrainedLineages")
+    out: set[str] = set()
+    if not isinstance(fine_grained, list):
+        return out
+    for lineage in fine_grained:
+        if not isinstance(lineage, dict):
+            continue
+        downstreams = lineage.get("downstreams")
+        if not isinstance(downstreams, list):
+            continue
+        for downstream in downstreams:
+            if not isinstance(downstream, str):
+                continue
+            field_name = _field_name_from_schema_field_urn(downstream)
+            if field_name:
+                out.add(field_name)
+    return out
+
+
+def apply_field_lineage_coverage(
+    result: AvailabilityResult,
+    schema_payload: dict[str, Any],
+    upstream_lineage_payload: dict[str, Any],
+) -> None:
+    """Populate field-lineage coverage using unique non-partition DDL fields."""
+    ddl_fields = {field.lower() for field in extract_schema_field_names(schema_payload)}
+    partition_fields = {
+        field.lower() for field in extract_schema_partition_field_names(schema_payload)
+    }
+    eligible_fields = ddl_fields - partition_fields
+    lineage_fields = downstream_field_names_from_upstream_lineage(upstream_lineage_payload)
+    covered_fields = eligible_fields & lineage_fields
+
+    result.ddl_non_partition_field_count = len(eligible_fields)
+    result.field_lineage_covered_field_count = len(covered_fields)
+    result.field_lineage_coverage_percent = (
+        round(len(covered_fields) * 100 / len(eligible_fields), 2)
+        if eligible_fields
+        else 0.0
+    )
+    result.field_lineage_missing_fields = sorted(eligible_fields - covered_fields)
+    result.partition_fields = sorted(partition_fields)
 
 
 def view_logic_from_payload(payload: dict[str, Any]) -> str:
@@ -857,12 +948,16 @@ def check_one_dataset(
     view_payload = fetch_aspect_payload(gms_url, dataset_urn, "viewProperties", token=token)
     view_logic = view_logic_from_payload(view_payload)
     is_view = is_meaningful_text(view_logic)
-    schema_fields = schema_field_count(fetch_aspect_payload(gms_url, dataset_urn, "schemaMetadata", token=token))
+    schema_payload = fetch_aspect_payload(gms_url, dataset_urn, "schemaMetadata", token=token)
+    schema_fields = schema_field_count(schema_payload)
     documentation = editable_description_from_payload(
         fetch_aspect_payload(gms_url, dataset_urn, "editableDatasetProperties", token=token)
     )
+    upstream_lineage_payload = fetch_aspect_payload(
+        gms_url, dataset_urn, "upstreamLineage", token=token
+    )
     upstreams = upstream_tables_from_payload(
-        fetch_aspect_payload(gms_url, dataset_urn, "upstreamLineage", token=token),
+        upstream_lineage_payload,
         platform_instance=platform_instance,
     )
 
@@ -877,6 +972,7 @@ def check_one_dataset(
         upstreams=upstreams,
         existing_flags=existing_flags,
     )
+    apply_field_lineage_coverage(result, schema_payload, upstream_lineage_payload)
     if set(result.final_flags) == existing_flags:
         result.write_status = "NO_CHANGE"
     elif dry_run:
@@ -895,12 +991,13 @@ def set_available_flags_one_dataset(
     platform_instance: str,
     env: str,
     dry_run: bool,
+    target_flags: Optional[list[str]] = None,
 ) -> AvailabilityResult:
     normalized = table_name.strip().lower()
     dataset_urn = make_hive_dataset_urn(normalized, platform_instance, env)
     structured_payload = fetch_structured_properties_or_empty(gms_url, dataset_urn, token=token)
     existing_flags = extract_existing_flags(extract_structured_values(structured_payload))
-    final_flags = [FLAG_DDL, FLAG_TABLE_LINEAGE]
+    final_flags = parse_requested_available_flags(target_flags)
     result = AvailabilityResult(
         table_name=normalized,
         dataset_urn=dataset_urn,
@@ -908,8 +1005,13 @@ def set_available_flags_one_dataset(
         passed_flags=set(final_flags),
         existing_flags=existing_flags,
         final_flags=final_flags,
-        reason="手工设置 Data Availability Flag = [\"DDL\", \"表血缘\"]",
+        reason=f"手工设置 Data Availability Flag = {json.dumps(final_flags, ensure_ascii=False)}",
     )
+    schema_payload = fetch_aspect_payload(gms_url, dataset_urn, "schemaMetadata", token=token)
+    upstream_lineage_payload = fetch_aspect_payload(
+        gms_url, dataset_urn, "upstreamLineage", token=token
+    )
+    apply_field_lineage_coverage(result, schema_payload, upstream_lineage_payload)
     if set(final_flags) == existing_flags:
         result.write_status = "NO_CHANGE"
     elif dry_run:
@@ -957,6 +1059,11 @@ def write_xlsx_report(path: str, rows: list[dict[str, Any]]) -> None:
         "write_status",
         "reason",
         "issues",
+        "field_lineage_coverage_percent",
+        "field_lineage_covered_field_count",
+        "ddl_non_partition_field_count",
+        "field_lineage_missing_fields",
+        "partition_fields",
         "lineage_documented_upstreams",
         "lineage_existing_upstreams",
         "lineage_missing_upstreams",
@@ -983,6 +1090,13 @@ def write_xlsx_report(path: str, rows: list[dict[str, Any]]) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out)
+
+
+def format_field_lineage_coverage_summary(rows: list[dict[str, Any]]) -> str:
+    covered = sum(int(row.get("field_lineage_covered_field_count") or 0) for row in rows)
+    ddl_fields = sum(int(row.get("ddl_non_partition_field_count") or 0) for row in rows)
+    percent = round(covered * 100 / ddl_fields, 2) if ddl_fields else 0.0
+    return f"field_lineage_coverage={percent:.2f}% ({covered}/{ddl_fields}, 已过滤分区字段)"
 
 
 def run(
@@ -1043,6 +1157,7 @@ def run(
         f"(WARN=检查未通过但已读 GMS；FAIL=请求异常)",
         flush=True,
     )
+    print(f"[DONE] {format_field_lineage_coverage_summary(rows)}", flush=True)
     print(f"[DONE] jsonl: {jsonl_path}", flush=True)
     print(f"[DONE] xlsx: {xlsx_path}", flush=True)
     return 1 if failures else 0
@@ -1056,6 +1171,7 @@ def run_set_available_flags(
     platform_instance: str,
     env: str,
     dry_run: bool,
+    target_flags: list[str],
     jsonl_path: str,
     xlsx_path: str,
 ) -> int:
@@ -1072,6 +1188,7 @@ def run_set_available_flags(
                 platform_instance=platform_instance,
                 env=env,
                 dry_run=dry_run,
+                target_flags=target_flags,
             )
         except Exception as exc:
             failures += 1
@@ -1096,6 +1213,7 @@ def run_set_available_flags(
     ok_count = sum(1 for r in rows if r.get("status") == "OK")
     fail_count = sum(1 for r in rows if r.get("status") == "FAIL")
     print(f"[DONE] set_available_flags checked={len(rows)} ok={ok_count} fail={fail_count}", flush=True)
+    print(f"[DONE] {format_field_lineage_coverage_summary(rows)}", flush=True)
     print(f"[DONE] jsonl: {jsonl_path}", flush=True)
     print(f"[DONE] xlsx: {xlsx_path}", flush=True)
     return 1 if failures else 0
@@ -1112,6 +1230,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--env", default=os.getenv("DATAHUB_ENV", "PROD"))
     p.add_argument("--dry-run", action="store_true", default=os.getenv("DRY_RUN", "1") == "1")
     p.add_argument("--set-available-flags", action="store_true", default=os.getenv("SET_AVAILABLE_FLAGS", "0") == "1")
+    p.add_argument(
+        "--available-flags",
+        default=os.getenv("AVAILABLE_FLAGS", ""),
+        help='SET_AVAILABLE_FLAGS 模式下写入的 Data Availability Flag，逗号或换行分隔；默认 "DDL,表血缘"',
+    )
     p.add_argument("--jsonl", required=True)
     p.add_argument("--xlsx", required=True)
     return p.parse_args(argv)
@@ -1129,6 +1252,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not table_names:
             print("ERROR: SET_AVAILABLE_FLAGS/--set-available-flags 只支持显式 TABLE_NAMES、--table-name 或 --table-list-file", file=sys.stderr)
             return 2
+        try:
+            target_flags = parse_requested_available_flags(args.available_flags)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         return run_set_available_flags(
             table_names,
             gms_url=args.datahub_gms,
@@ -1136,6 +1264,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             platform_instance=args.platform_instance,
             env=args.env,
             dry_run=args.dry_run,
+            target_flags=target_flags,
             jsonl_path=args.jsonl,
             xlsx_path=args.xlsx,
         )

@@ -200,6 +200,58 @@ def test_extract_other_remark_reads_value() -> None:
     assert q.extract_other_remark(payload) == "已废弃，勿使用"
 
 
+def test_field_lineage_coverage_deduplicates_and_excludes_partition_fields() -> None:
+    schema_payload = {
+        "schemaMetadata": {
+            "value": {
+                "fields": [
+                    {"fieldPath": "store_code"},
+                    {"fieldPath": "sku_code"},
+                    {
+                        "fieldPath": "version",
+                        "type": {"type": {"com.linkedin.schema.StringType": {}}},
+                        "nativeDataType": "Partition Key",
+                    },
+                ]
+            }
+        }
+    }
+    upstream_lineage_payload = {
+        "upstreamLineage": {
+            "value": {
+                "fineGrainedLineages": [
+                    {
+                        "downstreams": [
+                            "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,"
+                            "blf-prod-hive.default.target,PROD),store_code)"
+                        ]
+                    },
+                    {
+                        "downstreams": [
+                            "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,"
+                            "blf-prod-hive.default.target,PROD),store_code)",
+                            "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,"
+                            "blf-prod-hive.default.target,PROD),version)",
+                        ]
+                    },
+                ]
+            }
+        }
+    }
+
+    coverage = q.calculate_field_lineage_coverage(
+        schema_payload,
+        upstream_lineage_payload,
+    )
+
+    assert coverage == {
+        "field_lineage_coverage_percent": 50.0,
+        "field_lineage_covered_field_count": 1,
+        "ddl_non_partition_field_count": 2,
+        "partition_fields": ["version"],
+    }
+
+
 def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) -> None:
     upstream_a = q.make_hive_dataset_urn("data_smartorder.dw_sku_display_snap")
     upstream_b = q.make_hive_dataset_urn("default.dim_store_info")
@@ -220,6 +272,16 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
     )
     monkeypatch.setattr(q, "is_deprecated_dataset", lambda _gms_url, _token, urn: urn == upstream_b)
     monkeypatch.setattr(q, "is_llm_generated_documentation", lambda _gms_url, _token, urn: urn == upstream_a)
+    monkeypatch.setattr(
+        q,
+        "read_field_lineage_coverage",
+        lambda _gms_url, _token, urn: {
+            "field_lineage_coverage_percent": 50.0 if urn == upstream_a else 0.0,
+            "field_lineage_covered_field_count": 1 if urn == upstream_a else 0,
+            "ddl_non_partition_field_count": 2 if urn == upstream_a else 0,
+            "partition_fields": ["dt"] if urn == upstream_a else [],
+        },
+    )
 
     def _fetch_structured_properties(*args, **kwargs):
         urn = args[1]
@@ -268,6 +330,10 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "data_availability_flag",
         "other_remark",
         "上游表数量",
+        "字段血缘覆盖率",
+        "有血缘字段数量(去重,已过滤分区字段)",
+        "DDL字段数量(已过滤分区字段)",
+        "分区字段",
     )
     by_full_name = {row[3]: row for row in rows[1:]}
     assert by_full_name["data_smartorder.dw_sku_display_snap"] == (
@@ -284,6 +350,10 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "DDL, 表血缘",
         "-",
         2,
+        "50.00%",
+        1,
+        2,
+        "dt",
     )
     assert by_full_name["default.dim_store_info"] == (
         "default",
@@ -299,6 +369,10 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "DDL, 表血缘",
         "view 无调度",
         0,
+        "0.00%",
+        0,
+        0,
+        "-",
     )
 
 

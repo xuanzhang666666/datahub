@@ -4,7 +4,72 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from job_info_sync_datahub import check_dataset_availability as mod
+
+
+def test_field_lineage_coverage_deduplicates_and_excludes_all_partition_fields() -> None:
+    result = mod.AvailabilityResult(
+        table_name="dw.target",
+        dataset_urn="urn:dataset:dw.target",
+        dataset_type="table",
+    )
+    schema_payload = {
+        "schemaMetadata": {
+            "value": {
+                "fields": [
+                    {"fieldPath": "id"},
+                    {"fieldPath": "name"},
+                    {"fieldPath": "version", "nativeDataType": "Partition Key"},
+                    {"fieldPath": "biz_hour", "isPartitioningKey": True},
+                ]
+            }
+        }
+    }
+    upstream_lineage_payload = {
+        "upstreamLineage": {
+            "value": {
+                "fineGrainedLineages": [
+                    {
+                        "downstreams": [
+                            "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,dw.target,PROD),id)"
+                        ]
+                    },
+                    {
+                        "downstreams": [
+                            "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,dw.target,PROD),id)",
+                            "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,dw.target,PROD),version)",
+                            "urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,dw.target,PROD),unexpected)",
+                        ]
+                    },
+                ]
+            }
+        }
+    }
+
+    mod.apply_field_lineage_coverage(result, schema_payload, upstream_lineage_payload)
+
+    assert result.ddl_non_partition_field_count == 2
+    assert result.field_lineage_covered_field_count == 1
+    assert result.field_lineage_coverage_percent == 50.0
+    assert result.field_lineage_missing_fields == ["name"]
+    assert result.partition_fields == ["biz_hour", "version"]
+
+
+def test_format_field_lineage_coverage_summary_uses_non_partition_counts() -> None:
+    assert mod.format_field_lineage_coverage_summary(
+        [
+            {
+                "field_lineage_covered_field_count": 2,
+                "ddl_non_partition_field_count": 4,
+            },
+            {
+                "field_lineage_covered_field_count": 1,
+                "ddl_non_partition_field_count": 2,
+            },
+        ]
+    ) == "field_lineage_coverage=50.00% (3/6, 已过滤分区字段)"
 
 
 def test_table_basic_check_requires_structured_properties_and_schema_fields() -> None:
@@ -452,6 +517,7 @@ def test_set_available_flags_one_dataset_writes_exact_ddl_and_table_lineage(monk
         captured["flags"] = flags
 
     monkeypatch.setattr(mod, "patch_data_availability_flags", fake_patch)
+    monkeypatch.setattr(mod, "fetch_aspect_payload", lambda *args, **kwargs: {})
 
     result = mod.set_available_flags_one_dataset(
         "dw.target",
@@ -467,6 +533,61 @@ def test_set_available_flags_one_dataset_writes_exact_ddl_and_table_lineage(monk
     assert result.existing_flags == {"字段血缘"}
     assert result.final_flags == ["DDL", "表血缘"]
     assert result.write_status == "UPDATED"
+
+
+def test_set_available_flags_one_dataset_uses_requested_flags(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        mod,
+        "fetch_structured_properties_or_empty",
+        lambda gms_url, dataset_urn, token=None: {
+            "structuredProperties": {
+                "value": {
+                    "properties": [
+                        {
+                            "propertyUrn": mod.URN_DATA_AVAILABILITY_FLAG,
+                            "values": [{"string": "表血缘"}],
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    def fake_patch(gms_url, dataset_urn, flags, token=None):
+        captured["flags"] = flags
+
+    monkeypatch.setattr(mod, "patch_data_availability_flags", fake_patch)
+    monkeypatch.setattr(mod, "fetch_aspect_payload", lambda *args, **kwargs: {})
+
+    result = mod.set_available_flags_one_dataset(
+        "dw.target",
+        gms_url="http://gms",
+        token=None,
+        platform_instance="blf-prod-hive",
+        env="PROD",
+        dry_run=False,
+        target_flags=["字段血缘", "DDL"],
+    )
+
+    assert captured["flags"] == ["DDL", "字段血缘"]
+    assert result.final_flags == ["DDL", "字段血缘"]
+    assert result.reason == '手工设置 Data Availability Flag = ["DDL", "字段血缘"]'
+
+
+def test_parse_requested_available_flags_normalizes_and_validates() -> None:
+    assert mod.parse_requested_available_flags("字段血缘, DDL") == ["DDL", "字段血缘"]
+    assert mod.parse_requested_available_flags("DDL\n表血缘\n字段血缘") == [
+        "DDL",
+        "表血缘",
+        "字段血缘",
+    ]
+
+
+def test_parse_requested_available_flags_rejects_unknown_flag() -> None:
+    with pytest.raises(ValueError, match="不支持的 Data Availability Flag"):
+        mod.parse_requested_available_flags("DDL,未知")
 
 
 def test_main_set_available_flags_requires_explicit_table_names(monkeypatch, tmp_path) -> None:
