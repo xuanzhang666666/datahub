@@ -414,6 +414,194 @@ def downstream_field_names_from_upstream_lineage(payload: Dict[str, Any]) -> Set
     return fields
 
 
+def _parse_schema_field_urn(value: Any) -> Optional[Tuple[str, str]]:
+    prefix = "urn:li:schemaField:("
+    if (
+        not isinstance(value, str)
+        or not value.startswith(prefix)
+        or not value.endswith(")")
+    ):
+        return None
+    inner = value[len(prefix) : -1]
+    if "," not in inner:
+        return None
+    dataset_urn, field_name = inner.rsplit(",", 1)
+    dataset_urn = dataset_urn.strip()
+    field_name = urllib.parse.unquote(field_name.strip()).lower()
+    if not dataset_urn.startswith("urn:li:dataset:(") or not field_name:
+        return None
+    return dataset_urn, field_name
+
+
+def _read_schema_fields(
+    gms_url: str,
+    token: Optional[str],
+    dataset_urn: str,
+    cache: Dict[str, Optional[Set[str]]],
+) -> Optional[Set[str]]:
+    if dataset_urn in cache:
+        return cache[dataset_urn]
+    try:
+        payload = _fetch_dataset_aspect(gms_url, dataset_urn, "schemaMetadata", token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(
+                f"[WARN] 查询 {urn_to_table_name(dataset_urn)} schemaMetadata 失败 HTTP {exc.code}",
+                file=sys.stderr,
+            )
+        cache[dataset_urn] = None
+        return None
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} schemaMetadata 失败: {exc}",
+            file=sys.stderr,
+        )
+        cache[dataset_urn] = None
+        return None
+    fields = {field.lower() for field in extract_schema_field_names(payload)}
+    cache[dataset_urn] = fields
+    return fields
+
+
+def _dataset_entity_exists(
+    gms_url: str,
+    token: Optional[str],
+    dataset_urn: str,
+    cache: Dict[str, Optional[bool]],
+) -> Optional[bool]:
+    if dataset_urn in cache:
+        return cache[dataset_urn]
+    try:
+        _fetch_dataset_aspect(gms_url, dataset_urn, "datasetProperties", token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(
+                f"[WARN] 查询 {urn_to_table_name(dataset_urn)} datasetProperties 失败 HTTP {exc.code}",
+                file=sys.stderr,
+            )
+            cache[dataset_urn] = None
+            return None
+        cache[dataset_urn] = False
+        return False
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} datasetProperties 失败: {exc}",
+            file=sys.stderr,
+        )
+        cache[dataset_urn] = None
+        return None
+    cache[dataset_urn] = True
+    return True
+
+
+def read_direct_lineage_anomalies(
+    gms_url: str,
+    token: Optional[str],
+    dataset_urn: str,
+) -> Dict[str, List[str]]:
+    """Validate this Dataset's direct table lineage and fine-grained field relations."""
+    try:
+        payload = _fetch_dataset_aspect(gms_url, dataset_urn, "upstreamLineage", token=token)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(
+                f"[WARN] 查询 {urn_to_table_name(dataset_urn)} upstreamLineage 失败 HTTP {exc.code}",
+                file=sys.stderr,
+            )
+        return {"table_lineage_anomalies": [], "field_lineage_anomalies": []}
+    except Exception as exc:
+        print(
+            f"[WARN] 查询 {urn_to_table_name(dataset_urn)} upstreamLineage 失败: {exc}",
+            file=sys.stderr,
+        )
+        return {
+            "table_lineage_anomalies": [f"血缘读取失败: {exc}"],
+            "field_lineage_anomalies": [f"血缘读取失败: {exc}"],
+        }
+
+    aspect = _unwrap_aspect(payload, "upstreamLineage")
+    direct_upstreams = {
+        item.get("dataset")
+        for item in aspect.get("upstreams") or []
+        if isinstance(item, dict) and isinstance(item.get("dataset"), str)
+    }
+    schema_cache: Dict[str, Optional[Set[str]]] = {}
+    entity_cache: Dict[str, Optional[bool]] = {}
+    target_fields = _read_schema_fields(gms_url, token, dataset_urn, schema_cache)
+    table_anomalies: Set[str] = set()
+    field_anomalies: Set[str] = set()
+
+    for upstream_urn in direct_upstreams:
+        upstream_exists = _dataset_entity_exists(
+            gms_url,
+            token,
+            upstream_urn,
+            entity_cache,
+        )
+        if upstream_exists is False:
+            table_anomalies.add(
+                f"上游Dataset不存在: {urn_to_table_name(upstream_urn)}"
+            )
+        elif upstream_exists is None:
+            table_anomalies.add(
+                f"上游Dataset存在性检查失败: {urn_to_table_name(upstream_urn)}"
+            )
+
+    for fine_index, fine_grained in enumerate(
+        aspect.get("fineGrainedLineages") or [],
+        start=1,
+    ):
+        if not isinstance(fine_grained, dict):
+            field_anomalies.add(f"字段血缘格式无效: fineGrainedLineages[{fine_index}]")
+            continue
+
+        for upstream_value in fine_grained.get("upstreams") or []:
+            parsed_upstream = _parse_schema_field_urn(upstream_value)
+            if parsed_upstream is None:
+                field_anomalies.add(f"字段源URN无效: {upstream_value}")
+                continue
+            source_urn, source_field = parsed_upstream
+            source_name = f"{urn_to_table_name(source_urn)}.{source_field}"
+            source_fields = _read_schema_fields(gms_url, token, source_urn, schema_cache)
+            source_exists = _dataset_entity_exists(
+                gms_url,
+                token,
+                source_urn,
+                entity_cache,
+            )
+            if source_exists is False:
+                field_anomalies.add(f"字段源Dataset不存在: {source_name}")
+            elif source_exists is None:
+                field_anomalies.add(f"字段源Dataset存在性检查失败: {source_name}")
+            elif source_fields is None:
+                field_anomalies.add(f"字段源Schema缺失: {source_name}")
+            elif source_field not in source_fields:
+                field_anomalies.add(f"字段源字段不存在: {source_name}")
+            if source_urn == dataset_urn:
+                field_anomalies.add(f"字段源指向目标表自身: {source_name}")
+            elif source_urn not in direct_upstreams:
+                field_anomalies.add(f"字段源不属于直接上游: {source_name}")
+
+        for downstream_value in fine_grained.get("downstreams") or []:
+            parsed_downstream = _parse_schema_field_urn(downstream_value)
+            if parsed_downstream is None:
+                field_anomalies.add(f"目标字段URN无效: {downstream_value}")
+                continue
+            downstream_urn, downstream_field = parsed_downstream
+            downstream_name = f"{urn_to_table_name(downstream_urn)}.{downstream_field}"
+            if downstream_urn != dataset_urn:
+                field_anomalies.add(f"目标字段不属于当前表: {downstream_name}")
+            elif target_fields is None:
+                field_anomalies.add(f"目标Schema缺失: {urn_to_table_name(dataset_urn)}")
+            elif downstream_field not in target_fields:
+                field_anomalies.add(f"目标字段不存在: {downstream_name}")
+
+    return {
+        "table_lineage_anomalies": sorted(table_anomalies),
+        "field_lineage_anomalies": sorted(field_anomalies),
+    }
+
+
 def read_field_lineage_coverage(
     gms_url: str,
     token: Optional[str],
@@ -544,7 +732,7 @@ def write_upstream_detail_xlsx(path: str, rows: List[Dict[str, Any]]) -> None:
         "库名",
         "表名",
         "表名前辍",
-        "完整表表",
+        "完整表名",
         "表类型",
         "标记废弃",
         "Documentation生成",
@@ -554,6 +742,8 @@ def write_upstream_detail_xlsx(path: str, rows: List[Dict[str, Any]]) -> None:
         "data_availability_flag",
         "other_remark",
         "上游表数量",
+        "表血缘异常",
+        "字段血缘异常",
         "字段血缘覆盖率",
         "有血缘字段数量(去重,已过滤分区字段)",
         "DDL字段数量(已过滤分区字段)",
@@ -696,6 +886,7 @@ def run(
         data_availability_flag = raw_data_availability_flag or "-"
         other_remark = raw_other_remark or "-"
         coverage = read_field_lineage_coverage(gms_url, token, urn)
+        lineage_anomalies = read_direct_lineage_anomalies(gms_url, token, urn)
         covered_field_count = int(coverage["field_lineage_covered_field_count"])
         ddl_non_partition_field_count = int(coverage["ddl_non_partition_field_count"])
         coverage_percent = float(coverage["field_lineage_coverage_percent"])
@@ -708,7 +899,7 @@ def run(
                 "库名": db_name,
                 "表名": short_table_name,
                 "表名前辍": table_name_prefix(short_table_name),
-                "完整表表": table_name,
+                "完整表名": table_name,
                 "表类型": upstream_types[table_name],
                 "标记废弃": _yes_or_dash(upstream_deprecated[table_name]),
                 "Documentation生成": _yes_or_dash(upstream_documentation_generated[table_name]),
@@ -718,6 +909,12 @@ def run(
                 "data_availability_flag": data_availability_flag,
                 "other_remark": other_remark,
                 "上游表数量": upstream_dependency_counts.get(urn, 0),
+                "表血缘异常": (
+                    "\n".join(lineage_anomalies["table_lineage_anomalies"]) or "-"
+                ),
+                "字段血缘异常": (
+                    "\n".join(lineage_anomalies["field_lineage_anomalies"]) or "-"
+                ),
                 "字段血缘覆盖率": f"{coverage_percent:.2f}%",
                 "有血缘字段数量(去重,已过滤分区字段)": covered_field_count,
                 "DDL字段数量(已过滤分区字段)": ddl_non_partition_field_count,

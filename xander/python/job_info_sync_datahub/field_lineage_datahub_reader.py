@@ -12,7 +12,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .field_lineage_models import FieldLineageInput
+from .field_lineage_models import FieldLineageInput, SourceTableValidation
+from .field_lineage_policy import normalize_source_table_name
 from .sql_extractor import compute_format_date_vars
 from .structured_properties import (
     URN_DATA_AVAILABILITY_FLAG,
@@ -137,6 +138,11 @@ def schema_metadata_url(gms_url: str, dataset_urn: str) -> str:
     return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/schemaMetadata"
 
 
+def upstream_lineage_url(gms_url: str, dataset_urn: str) -> str:
+    encoded = urllib.parse.quote(dataset_urn, safe="")
+    return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/upstreamLineage"
+
+
 def deprecation_url(gms_url: str, dataset_urn: str) -> str:
     encoded = urllib.parse.quote(dataset_urn, safe="")
     return f"{gms_url.rstrip('/')}/openapi/v3/entity/dataset/{encoded}/deprecation"
@@ -243,6 +249,133 @@ def fetch_schema_fields_with_partitions(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"GET schemaMetadata HTTP {exc.code}: {detail}") from exc
+
+
+def fetch_upstream_table_names(
+    gms_url: str,
+    dataset_urn: str,
+    token: Optional[str] = None,
+    platform_instance: str = "blf-prod-hive",
+    timeout_sec: int = 60,
+) -> List[str]:
+    """Fetch the target dataset's current table-level upstream names."""
+    req = urllib.request.Request(
+        upstream_lineage_url(gms_url, dataset_urn),
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            return extract_upstream_table_names(payload, platform_instance)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return []
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GET upstreamLineage HTTP {exc.code}: {detail}") from exc
+
+
+def extract_upstream_table_names(
+    payload: Dict[str, Any],
+    platform_instance: str = "blf-prod-hive",
+) -> List[str]:
+    """Extract normalized `db.table` names from an upstreamLineage payload."""
+    current: Any = payload
+    for key in ("upstreamLineage", "value"):
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+    upstreams = current.get("upstreams") if isinstance(current, dict) else None
+    if not isinstance(upstreams, list):
+        return []
+    names: set[str] = set()
+    for item in upstreams:
+        if not isinstance(item, dict) or not isinstance(item.get("dataset"), str):
+            continue
+        table_name = _hive_dataset_urn_to_table_name(item["dataset"], platform_instance)
+        if table_name != item["dataset"] and "." in table_name:
+            names.add(normalize_source_table_name(table_name))
+    return sorted(names)
+
+
+def _hive_dataset_urn_to_table_name(dataset_urn: str, platform_instance: str) -> str:
+    prefix = "urn:li:dataset:("
+    if not dataset_urn.startswith(prefix):
+        return dataset_urn
+    inner = dataset_urn[len(prefix) :].removesuffix(")")
+    parts = inner.split(",", 2)
+    if len(parts) < 2:
+        return dataset_urn
+    name = parts[1].strip()
+    instance_prefix = f"{platform_instance}."
+    return name.removeprefix(instance_prefix)
+
+
+def dataset_schema_exists(
+    gms_url: str,
+    table_name: str,
+    token: Optional[str] = None,
+    platform_instance: str = "blf-prod-hive",
+    env: str = "PROD",
+    timeout_sec: int = 60,
+) -> bool:
+    """Return whether DataHub contains schemaMetadata for a candidate source table."""
+    dataset_urn = make_hive_dataset_urn(table_name, platform_instance, env)
+    req = urllib.request.Request(
+        schema_metadata_url(gms_url, dataset_urn),
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec):
+            return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GET schemaMetadata HTTP {exc.code}: {detail}") from exc
+
+
+def validate_source_tables(
+    gms_url: str,
+    target_dataset_urn: str,
+    source_tables: Iterable[str],
+    token: Optional[str] = None,
+    platform_instance: str = "blf-prod-hive",
+    env: str = "PROD",
+) -> Dict[str, SourceTableValidation]:
+    """Validate candidate sources against DataHub datasets and target table upstreams."""
+    target_upstreams = set(
+        fetch_upstream_table_names(
+            gms_url,
+            target_dataset_urn,
+            token=token,
+            platform_instance=platform_instance,
+        )
+    )
+    results: Dict[str, SourceTableValidation] = {}
+    for source_table in sorted(
+        {
+            normalize_source_table_name(table)
+            for table in source_tables
+            if table and table.strip()
+        }
+    ):
+        results[source_table] = SourceTableValidation(
+            source_table=source_table,
+            dataset_exists=dataset_schema_exists(
+                gms_url,
+                source_table,
+                token=token,
+                platform_instance=platform_instance,
+                env=env,
+            ),
+            in_target_upstreams=source_table in target_upstreams,
+        )
+    return results
 
 
 def extract_schema_field_names(payload: Dict[str, Any]) -> List[str]:

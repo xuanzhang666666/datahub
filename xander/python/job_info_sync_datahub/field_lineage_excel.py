@@ -16,6 +16,7 @@ from .field_lineage_models import (
     FieldLineageCandidate,
     FieldLineageInput,
     FieldLineageReviewStatus,
+    SourceTableValidation,
     UnresolvedField,
 )
 from .field_lineage_constants import (
@@ -25,9 +26,15 @@ from .field_lineage_constants import (
     is_placeholder_transform_text,
 )
 from .field_lineage_policy import (
+    ephemeral_source_fold_note,
+    has_residual_sql_alias_in_source_table,
+    has_unsafe_source_field_pattern,
+    is_ephemeral_source_table,
     is_partition_field,
     is_self_dependency,
+    normalize_source_field_name,
     normalize_source_table_name,
+    resolve_ephemeral_source_table,
 )
 
 CANDIDATE_HEADERS = [
@@ -47,6 +54,12 @@ CANDIDATE_HEADERS = [
 
 UNRESOLVED_HEADERS = ["target_field", "reason"]
 CONTEXT_HEADERS = ["key", "value"]
+SOURCE_VALIDATION_HEADERS = [
+    "source_table",
+    "dataset_exists",
+    "in_target_upstreams",
+    "validation_error",
+]
 DEFAULT_IMPORT_STATUSES = {
     FieldLineageReviewStatus.APPROVED,
     FieldLineageReviewStatus.AUTO_APPROVED,
@@ -76,6 +89,8 @@ def _style_sheet(ws) -> None:
 
 
 def _effective_review_status(candidate: FieldLineageCandidate) -> FieldLineageReviewStatus:
+    if candidate.import_error.strip():
+        return FieldLineageReviewStatus.NEEDS_REVIEW
     if candidate.review_status in {
         FieldLineageReviewStatus.APPROVED,
         FieldLineageReviewStatus.REJECTED,
@@ -117,7 +132,11 @@ def _is_safe_for_auto_approval(candidate: FieldLineageCandidate) -> bool:
     is_constant = is_constant_transform_expression(candidate.transform_expression)
     if has_partial_source:
         return False
-    if "," in candidate.source_field:
+    if has_unsafe_source_field_pattern(candidate.source_field):
+        return False
+    if has_residual_sql_alias_in_source_table(candidate.source_table):
+        return False
+    if has_source_table and is_ephemeral_source_table(candidate.source_table):
         return False
     if has_source or is_constant:
         return True
@@ -156,7 +175,7 @@ def _canonical_candidate(
         target_table=target_table,
         target_field=candidate.target_field,
         source_table=normalize_source_table_name(candidate.source_table),
-        source_field=candidate.source_field,
+        source_field=normalize_source_field_name(candidate.source_field),
         transform_expression=candidate.transform_expression,
         transform_explanation=candidate.transform_explanation,
         evidence_sql=candidate.evidence_sql,
@@ -165,6 +184,36 @@ def _canonical_candidate(
         reviewer_notes=candidate.reviewer_notes,
         import_error=candidate.import_error,
         review_status=candidate.review_status,
+    )
+
+
+def _source_validation_error(validation: SourceTableValidation) -> str:
+    if not validation.dataset_exists:
+        return f"SOURCE_DATASET_NOT_FOUND: {validation.source_table}"
+    if not validation.in_target_upstreams:
+        return f"SOURCE_NOT_IN_TABLE_UPSTREAMS: {validation.source_table}"
+    return ""
+
+
+def _apply_source_table_validation(
+    candidate: FieldLineageCandidate,
+    source_table_validations: Optional[Dict[str, SourceTableValidation]],
+) -> FieldLineageCandidate:
+    if source_table_validations is None or not candidate.source_table.strip():
+        return candidate
+    validation = source_table_validations.get(candidate.source_table)
+    validation_error = (
+        _source_validation_error(validation)
+        if validation is not None
+        else f"SOURCE_VALIDATION_MISSING: {candidate.source_table}"
+    )
+    if not validation_error:
+        return candidate
+    errors = [value for value in (candidate.import_error, validation_error) if value]
+    return replace(
+        candidate,
+        import_error="；".join(errors),
+        review_status=FieldLineageReviewStatus.NEEDS_REVIEW,
     )
 
 
@@ -350,6 +399,7 @@ def write_candidate_workbook(
     unresolved_fields: Iterable[UnresolvedField],
     llm_model: str,
     debug_dir: Optional[Path] = None,
+    source_table_validations: Optional[Dict[str, SourceTableValidation]] = None,
 ) -> None:
     """Write reviewable field-lineage candidates to an Excel workbook."""
     wb = Workbook()
@@ -362,6 +412,7 @@ def write_candidate_workbook(
     create_like_source_table = _create_like_source_table(source_input)
     for candidate in candidates:
         candidate = _canonical_candidate(source_input, candidate)
+        candidate = _apply_source_table_validation(candidate, source_table_validations)
         if _is_target_partition_field(source_input, candidate.target_field):
             continue
         if is_self_dependency(candidate.target_table, candidate.source_table):
@@ -436,6 +487,20 @@ def write_candidate_workbook(
     context_ws.append(["generated_at", datetime.now(timezone.utc).isoformat()])
     _style_sheet(context_ws)
 
+    if source_table_validations is not None:
+        validation_ws = wb.create_sheet("source_validation")
+        validation_ws.append(SOURCE_VALIDATION_HEADERS)
+        for source_table, validation in sorted(source_table_validations.items()):
+            validation_ws.append(
+                [
+                    source_table,
+                    validation.dataset_exists,
+                    validation.in_target_upstreams,
+                    _source_validation_error(validation),
+                ]
+            )
+        _style_sheet(validation_ws)
+
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
 
@@ -446,6 +511,105 @@ def _row_dict(headers: List[str], values: List[object]) -> Dict[str, str]:
         value = values[idx] if idx < len(values) else ""
         out[header] = "" if value is None else str(value).strip()
     return out
+
+
+def sanitize_field_lineage_candidate(
+    candidate: FieldLineageCandidate,
+) -> FieldLineageCandidate:
+    return replace(
+        candidate,
+        source_table=normalize_source_table_name(candidate.source_table),
+        source_field=normalize_source_field_name(candidate.source_field),
+    )
+
+
+def fold_ephemeral_source_candidates(
+    candidates: List[FieldLineageCandidate],
+    upstream_tables: Set[str],
+) -> List[FieldLineageCandidate]:
+    """Fold tmp_/not_verified_ source_table names toward direct upstream tables."""
+    folded: List[FieldLineageCandidate] = []
+    for candidate in candidates:
+        sanitized = sanitize_field_lineage_candidate(candidate)
+        if not sanitized.source_table.strip():
+            folded.append(sanitized)
+            continue
+        resolved, reason = resolve_ephemeral_source_table(
+            sanitized.source_table,
+            upstream_tables,
+        )
+        if reason.startswith("folded_"):
+            note = ephemeral_source_fold_note(sanitized.source_table, resolved, reason)
+            notes = "; ".join(item for item in (sanitized.llm_notes, note) if item)
+            if is_ephemeral_source_table(resolved):
+                err = (
+                    f"EPHEMERAL_SOURCE_MUST_FOLD: {sanitized.source_table}"
+                    f" (resolved={resolved}, {reason})"
+                )
+                errors = "; ".join(item for item in (sanitized.import_error, err) if item)
+                folded.append(
+                    replace(
+                        sanitized,
+                        source_table=resolved,
+                        llm_notes=notes,
+                        import_error=errors,
+                        review_status=FieldLineageReviewStatus.NEEDS_REVIEW,
+                    )
+                )
+            else:
+                folded.append(replace(sanitized, source_table=resolved, llm_notes=notes))
+            continue
+        if is_ephemeral_source_table(sanitized.source_table):
+            err = f"EPHEMERAL_SOURCE_MUST_FOLD: {sanitized.source_table}"
+            errors = "; ".join(item for item in (sanitized.import_error, err) if item)
+            folded.append(
+                replace(
+                    sanitized,
+                    import_error=errors,
+                    review_status=FieldLineageReviewStatus.NEEDS_REVIEW,
+                )
+            )
+            continue
+        folded.append(sanitized)
+    return folded
+
+
+def validate_import_candidates(
+    candidates: List[FieldLineageCandidate],
+    source_table_validations: Dict[str, SourceTableValidation],
+) -> Tuple[List[FieldLineageCandidate], List[str]]:
+    """Sanitize and reject import rows that are still unsafe or fail source validation."""
+    accepted: List[FieldLineageCandidate] = []
+    errors: List[str] = []
+    for candidate in candidates:
+        sanitized = sanitize_field_lineage_candidate(candidate)
+        issues: List[str] = []
+        has_source_table = bool(sanitized.source_table.strip())
+        has_source_field = bool(sanitized.source_field.strip())
+        if has_source_table != has_source_field:
+            issues.append("SOURCE_TABLE_FIELD_MISMATCH")
+        if has_unsafe_source_field_pattern(sanitized.source_field):
+            issues.append(f"SOURCE_FIELD_UNSAFE: {sanitized.source_field}")
+        if has_residual_sql_alias_in_source_table(sanitized.source_table):
+            issues.append(f"SOURCE_TABLE_ALIAS: {sanitized.source_table}")
+        if has_source_table and is_ephemeral_source_table(sanitized.source_table):
+            issues.append(f"EPHEMERAL_SOURCE_TABLE: {sanitized.source_table}")
+        if has_source_table:
+            validation = source_table_validations.get(sanitized.source_table)
+            validation_error = (
+                _source_validation_error(validation)
+                if validation is not None
+                else f"SOURCE_VALIDATION_MISSING: {sanitized.source_table}"
+            )
+            if validation_error:
+                issues.append(validation_error)
+        if issues:
+            errors.append(
+                f"{sanitized.target_table}.{sanitized.target_field}: {'; '.join(issues)}"
+            )
+            continue
+        accepted.append(sanitized)
+    return accepted, errors
 
 
 def _expand_multi_source_tables(rec: Dict[str, str]) -> List[Dict[str, str]]:
@@ -497,24 +661,24 @@ def load_approved_review_rows(
                 expanded_rec.get("source_table", ""),
             ):
                 continue
-            candidate = _expand_placeholder_transform_text(
-                FieldLineageCandidate(
-                    target_table=expanded_rec.get("target_table", "").lower(),
-                    target_field=expanded_rec.get("target_field", "").lower(),
-                    source_table=normalize_source_table_name(
-                        expanded_rec.get("source_table", "")
+            candidate = sanitize_field_lineage_candidate(
+                _expand_placeholder_transform_text(
+                    FieldLineageCandidate(
+                        target_table=expanded_rec.get("target_table", "").lower(),
+                        target_field=expanded_rec.get("target_field", "").lower(),
+                        source_table=expanded_rec.get("source_table", ""),
+                        source_field=expanded_rec.get("source_field", ""),
+                        transform_expression=expanded_rec.get("transform_expression", ""),
+                        transform_explanation=expanded_rec.get("transform_explanation", ""),
+                        evidence_sql=expanded_rec.get("evidence_sql", ""),
+                        confidence=expanded_rec.get("confidence", "").upper(),
+                        llm_notes=expanded_rec.get("llm_notes", ""),
+                        reviewer_notes=expanded_rec.get("reviewer_notes", ""),
+                        import_error=expanded_rec.get("import_error", ""),
+                        review_status=FieldLineageReviewStatus.APPROVED,
                     ),
-                    source_field=expanded_rec.get("source_field", "").lower(),
-                    transform_expression=expanded_rec.get("transform_expression", ""),
-                    transform_explanation=expanded_rec.get("transform_explanation", ""),
-                    evidence_sql=expanded_rec.get("evidence_sql", ""),
-                    confidence=expanded_rec.get("confidence", "").upper(),
-                    llm_notes=expanded_rec.get("llm_notes", ""),
-                    reviewer_notes=expanded_rec.get("reviewer_notes", ""),
-                    import_error=expanded_rec.get("import_error", ""),
-                    review_status=FieldLineageReviewStatus.APPROVED,
-                ),
-                previous_by_target,
+                    previous_by_target,
+                )
             )
             if status_value not in {status.value for status in statuses}:
                 continue

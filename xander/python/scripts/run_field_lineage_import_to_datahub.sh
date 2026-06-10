@@ -26,6 +26,7 @@ fi
 # FIELD_LINEAGE_CLEAR_EXISTING 默认 1；1=清空导入，0=合并更新（替换本次字段，保留其它旧字段）
 # FIELD_LINEAGE_IMPORT_STATUSES 默认 AUTO_APPROVED,APPROVED；可设为 APPROVED 只导入人工审核行
 # FIELD_LINEAGE_REQUIRE_FULL_AUTO_APPROVED 默认 1；1=仅当 AUTO_APPROVED=100% 且 unresolved=0 才自动导入
+# FIELD_LINEAGE_FORCE_REFRESH  1 时忽略「字段血缘」已确认保护，允许覆盖写入
 #
 # Jenkins：BATCH_CODE + TABLES（Multi-line String Parameter），Execute shell 直接引用即可
 #   sh /data/datahub/scripts/run_field_lineage_import_to_datahub.sh
@@ -57,6 +58,7 @@ DRY_RUN_FLAG="${FIELD_LINEAGE_DRY_RUN:-${DRY_RUN:-0}}"
 CLEAR_EXISTING_FLAG="${FIELD_LINEAGE_CLEAR_EXISTING:-1}"
 IMPORT_STATUSES="${FIELD_LINEAGE_IMPORT_STATUSES:-AUTO_APPROVED,APPROVED}"
 REQUIRE_FULL_AUTO_APPROVED_FLAG="${FIELD_LINEAGE_REQUIRE_FULL_AUTO_APPROVED:-1}"
+FORCE_REFRESH_FLAG="${FIELD_LINEAGE_FORCE_REFRESH:-0}"
 
 for _cand in "${LINEAGE_ENV_FILE:-}" "$SCRIPT_DIR/lineage.env" ${WORKSPACE:+"$WORKSPACE/lineage.env"}; do
   [[ -z "$_cand" ]] && continue
@@ -139,6 +141,16 @@ case "$(echo "$REQUIRE_FULL_AUTO_APPROVED_FLAG" | tr '[:upper:]' '[:lower:]')" i
     ;;
 esac
 
+IMPORT_FORCE_REFRESH=0
+case "$(echo "$FORCE_REFRESH_FLAG" | tr '[:upper:]' '[:lower:]')" in
+  1 | true | yes) IMPORT_FORCE_REFRESH=1 ;;
+  0 | false | no | "") IMPORT_FORCE_REFRESH=0 ;;
+  *)
+    echo "ERROR: FIELD_LINEAGE_FORCE_REFRESH 无法识别: $FORCE_REFRESH_FLAG" >&2
+    exit 2
+    ;;
+esac
+
 if [[ ! -d "$INPUT_DIR" ]]; then
   echo "ERROR: Excel 目录不存在: $INPUT_DIR" >&2
   exit 1
@@ -154,6 +166,7 @@ echo "[INFO] write to datahub: $([[ "$IMPORT_WRITE" -eq 1 ]] && echo yes || echo
 echo "[INFO] import mode: $([[ "$IMPORT_CLEAR_EXISTING" -eq 1 ]] && echo clear_import || echo merge_update)"
 echo "[INFO] import statuses: $IMPORT_STATUSES"
 echo "[INFO] require full auto approved: $([[ "$IMPORT_REQUIRE_FULL_AUTO_APPROVED" -eq 1 ]] && echo yes || echo no)"
+echo "[INFO] force refresh field lineage: $([[ "$IMPORT_FORCE_REFRESH" -eq 1 ]] && echo yes || echo no)"
 echo "[INFO] table count: ${#TABLE_LIST[@]}"
 echo "[INFO] tables: ${TABLE_LIST[*]}"
 echo "[INFO] gms url: $DATAHUB_GMS_URL"
@@ -215,6 +228,9 @@ for TABLE_NAME in "${TABLE_LIST[@]}"; do
   fi
   if [[ "$IMPORT_REQUIRE_FULL_AUTO_APPROVED" -eq 1 ]]; then
     IMPORT_ARGS+=(--require-full-auto-approved)
+  fi
+  if [[ "$IMPORT_FORCE_REFRESH" -eq 1 ]]; then
+    IMPORT_ARGS+=(--force-refresh-field-lineage)
   fi
 
   set +e

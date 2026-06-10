@@ -16,11 +16,13 @@ from job_info_sync_datahub.field_lineage_datahub_reader import (
     extract_schema_field_names,
     extract_schema_partition_field_names,
     extract_target_partition_fields_from_script,
+    extract_upstream_table_names,
     has_confirmed_field_lineage,
     make_hive_dataset_urn,
     missing_field_lineage_source_reason,
     strip_commented_sql_for_llm,
     strip_markdown_code_fence,
+    validate_source_tables,
     write_field_lineage_debug_artifacts,
 )
 from job_info_sync_datahub.field_lineage_batch_summary import write_batch_summary_workbook
@@ -29,8 +31,22 @@ from job_info_sync_datahub.field_lineage_constants import (
     is_runtime_date_variable_expression,
 )
 from job_info_sync_datahub.field_lineage_excel import (
+    fold_ephemeral_source_candidates,
     load_approved_review_rows,
+    validate_import_candidates,
     write_candidate_workbook,
+)
+from job_info_sync_datahub.field_lineage_policy import (
+    is_ephemeral_source_table,
+    normalize_source_field_name,
+    normalize_source_table_name,
+    resolve_ephemeral_source_table,
+    strip_sql_table_alias,
+)
+from job_info_sync_datahub.field_lineage_urn_repair import (
+    fix_malformed_hive_table_name,
+    resolve_table_against_upstreams,
+    split_merged_source_table,
 )
 from job_info_sync_datahub.field_lineage_llm import (
     FIELD_LINEAGE_SYSTEM_PROMPT,
@@ -43,6 +59,7 @@ from job_info_sync_datahub.field_lineage_models import (
     FieldLineageCandidate,
     FieldLineageInput,
     FieldLineageReviewStatus,
+    SourceTableValidation,
     UnresolvedField,
 )
 from job_info_sync_datahub.field_lineage_writer import (
@@ -690,6 +707,250 @@ def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
     assert context_values["debug_artifacts_dir"] == str(tmp_path / "debug")
 
 
+def test_fix_malformed_hive_table_name_recovers_pdw_prefix() -> None:
+    assert (
+        fix_malformed_hive_table_name("pdw.order_store_91_order_detail_receipt_main")
+        == "default.pdw_order_store_91_order_detail_receipt_main"
+    )
+
+
+def test_field_lineage_system_prompt_documents_tmp_fold_rules() -> None:
+    for fragment in ("tmp_*", "not_verified_*", "折叠", "直接上游"):
+        assert fragment in FIELD_LINEAGE_SYSTEM_PROMPT
+
+
+def test_is_ephemeral_source_table_detects_tmp_and_not_verified() -> None:
+    assert is_ephemeral_source_table("data_md.tmp_czx_exp_stores_order_batch")
+    assert is_ephemeral_source_table("default.not_verified_dim_store_info")
+    assert is_ephemeral_source_table("data_finance.tmp_foo_${date}")
+    assert not is_ephemeral_source_table("default.pdw_order_store_91")
+
+
+def test_resolve_ephemeral_source_table_folds_tmp_mid_to_mid_upstream() -> None:
+    upstreams = {"default.mid_store_sku_info_bach_v2", "default.pdw_bach_baseinfo_product_sku"}
+    resolved, reason = resolve_ephemeral_source_table(
+        "default.tmp_mid_store_sku_info_bach_v2",
+        upstreams,
+    )
+    assert resolved == "default.mid_store_sku_info_bach_v2"
+    assert reason == "folded_tmp_same_db"
+
+
+def test_resolve_ephemeral_source_table_folds_nested_tmp_chain() -> None:
+    upstreams = {"default.mid_store_sku_info_bach_v2"}
+    resolved, reason = resolve_ephemeral_source_table(
+        "default.tmp_tmp_mid_store_sku_info_bach_v2",
+        upstreams,
+    )
+    assert resolved == "default.mid_store_sku_info_bach_v2"
+    assert reason == "folded_tmp_chain:2"
+
+
+def test_resolve_ephemeral_source_table_folds_five_level_tmp_chain() -> None:
+    upstreams = {"default.mid_store_sku_info_bach_v2"}
+    resolved, reason = resolve_ephemeral_source_table(
+        "default.tmp_tmp_tmp_tmp_tmp_mid_store_sku_info_bach_v2",
+        upstreams,
+    )
+    assert resolved == "default.mid_store_sku_info_bach_v2"
+    assert reason == "folded_tmp_chain:5"
+
+
+def test_resolve_ephemeral_source_table_unresolved_when_nested_tmp_exceeds_max_hops() -> None:
+    upstreams = {"default.mid_store_sku_info_bach_v2"}
+    # Six tmp_ prefixes need six strips; cap is five hops per invocation
+    resolved, reason = resolve_ephemeral_source_table(
+        "default.tmp_tmp_tmp_tmp_tmp_tmp_mid_store_sku_info_bach_v2",
+        upstreams,
+    )
+    assert resolved == "default.tmp_mid_store_sku_info_bach_v2"
+    assert is_ephemeral_source_table(resolved)
+    assert reason == "ephemeral_unresolved"
+
+
+def test_fold_ephemeral_source_candidates_blocks_still_ephemeral_after_fold() -> None:
+    upstreams = {"default.tmp_mid_store_sku_info_bach_v2"}
+    folded = fold_ephemeral_source_candidates(
+        [
+            FieldLineageCandidate(
+                target_table="default.mid_store_sku_info_bach_v2",
+                target_field="sku_code",
+                source_table="default.tmp_tmp_mid_store_sku_info_bach_v2",
+                source_field="sku_code",
+                transform_expression="sku_code",
+                confidence="HIGH",
+            ),
+        ],
+        upstreams,
+    )
+    assert folded[0].source_table == "default.tmp_mid_store_sku_info_bach_v2"
+    assert "EPHEMERAL_SOURCE_MUST_FOLD" in folded[0].import_error
+    assert folded[0].review_status == FieldLineageReviewStatus.NEEDS_REVIEW
+
+
+def test_fold_ephemeral_source_candidates_rewrites_or_blocks_tmp_sources() -> None:
+    upstreams = {"default.mid_store_sku_info_bach_v2"}
+    folded = fold_ephemeral_source_candidates(
+        [
+            FieldLineageCandidate(
+                target_table="default.mid_store_sku_info_bach_v2",
+                target_field="sku_code",
+                source_table="default.tmp_mid_store_sku_info_bach_v2",
+                source_field="sku_code",
+                transform_expression="sku_code",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.mid_store_sku_info_bach_v2",
+                target_field="vendor_code",
+                source_table="data_md.tmp_czx_exp_stores_order_batch",
+                source_field="store_code",
+                transform_expression="store_code",
+                confidence="HIGH",
+            ),
+        ],
+        upstreams,
+    )
+    assert folded[0].source_table == "default.mid_store_sku_info_bach_v2"
+    assert "folded_source:" in folded[0].llm_notes
+    assert "EPHEMERAL_SOURCE_MUST_FOLD" in folded[1].import_error
+    assert folded[1].review_status == FieldLineageReviewStatus.NEEDS_REVIEW
+
+
+def test_build_field_lineage_user_message_includes_allowed_upstreams() -> None:
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.mid_store_sku_info_bach_v2"),
+        table_name="default.mid_store_sku_info_bach_v2",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+        allowed_upstream_tables=[
+            "default.pdw_bach_baseinfo_product_sku",
+            "default.dim_logistics_sku_supplier",
+        ],
+    )
+    message = build_field_lineage_user_message(source)
+    assert "目标表直接上游" in message
+    assert "default.pdw_bach_baseinfo_product_sku" in message
+    assert "禁止 tmp_*" in message
+
+
+def test_split_merged_source_table_splits_db_table_field() -> None:
+    assert split_merged_source_table(
+        "data_logistics.dim_sku_info.purchase_tax_rate",
+        "",
+    ) == ("data_logistics.dim_sku_info", "purchase_tax_rate")
+    assert split_merged_source_table(
+        "default.pdw_order_store_209_order_detail_contract_time.sign_time",
+        "",
+    ) == (
+        "default.pdw_order_store_209_order_detail_contract_time",
+        "sign_time",
+    )
+    assert split_merged_source_table("default.dim_user_hr t2", "user_no") == (
+        "default.dim_user_hr",
+        "user_no",
+    )
+
+
+def test_resolve_table_against_upstreams_matches_leaf_name() -> None:
+    upstreams = {
+        "default.dim_sku_info",
+        "data_logistics.dw_inventory_store_adjustment_v1",
+    }
+    assert (
+        resolve_table_against_upstreams("data_logistics.dim_sku_info", upstreams)
+        == "default.dim_sku_info"
+    )
+    assert (
+        resolve_table_against_upstreams("default.dim_sku_info", upstreams)
+        == "default.dim_sku_info"
+    )
+    merged_table, _ = split_merged_source_table(
+        "data_logistics.dw_inventory_store_adjustment_v1.cost_price",
+        "",
+    )
+    assert (
+        resolve_table_against_upstreams(merged_table, upstreams)
+        == "data_logistics.dw_inventory_store_adjustment_v1"
+    )
+
+
+def test_normalize_source_table_and_field_strip_sql_aliases() -> None:
+    assert strip_sql_table_alias("default.dim_user_hr t2") == "default.dim_user_hr"
+    assert strip_sql_table_alias("default.dim_user_hr as t3") == "default.dim_user_hr"
+    assert normalize_source_table_name("default.dim_user_hr t2") == "default.dim_user_hr"
+    assert normalize_source_field_name("t2.user_no") == "user_no"
+    assert normalize_source_field_name("T3.USER_ID") == "user_id"
+
+
+def test_write_candidate_workbook_sanitizes_sql_alias_in_source_cells(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("data_build.dim_store_construction_user_info_v1"),
+        table_name="data_build.dim_store_construction_user_info_v1",
+        etl_script="select t2.user_no from default.dim_user_hr t2",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="data_build.dim_store_construction_user_info_v1",
+                target_field="user_no",
+                source_table="default.dim_user_hr t2",
+                source_field="t2.user_no",
+                transform_expression="t2.user_no",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="test-model",
+        source_table_validations={
+            "default.dim_user_hr": SourceTableValidation(
+                source_table="default.dim_user_hr",
+                dataset_exists=True,
+                in_target_upstreams=True,
+            )
+        },
+    )
+
+    wb = load_workbook(output)
+    assert wb["candidate_lineage"]["A2"].value == "AUTO_APPROVED"
+    assert wb["candidate_lineage"]["D2"].value == "default.dim_user_hr"
+    assert wb["candidate_lineage"]["E2"].value == "user_no"
+
+    approved = load_approved_review_rows(output)
+    grouped = group_approved_rows(approved)
+    assert grouped[0].sources == (("default.dim_user_hr", "user_no"),)
+
+
+def test_validate_import_candidates_rejects_unsafe_multi_source_field() -> None:
+    rows = [
+        FieldLineageCandidate(
+            target_table="default.dim_store_info",
+            target_field="bad_field",
+            source_table="default.ods_store_info",
+            source_field="t3.user_id, t4.user_id",
+            transform_expression="coalesce(t3.user_id, t4.user_id)",
+            confidence="HIGH",
+        )
+    ]
+    validations = {
+        "default.ods_store_info": SourceTableValidation(
+            source_table="default.ods_store_info",
+            dataset_exists=True,
+            in_target_upstreams=True,
+        )
+    }
+
+    accepted, errors = validate_import_candidates(rows, validations)
+
+    assert accepted == []
+    assert len(errors) == 1
+    assert "SOURCE_FIELD_UNSAFE" in errors[0]
+
+
 def test_write_candidate_workbook_defaults_unqualified_source_table_to_default(
     tmp_path: Path,
 ) -> None:
@@ -722,6 +983,184 @@ def test_write_candidate_workbook_defaults_unqualified_source_table_to_default(
     approved = load_approved_review_rows(output)
     grouped = group_approved_rows(approved)
     assert grouped[0].sources == (("default.dm_source", "project_id"),)
+
+
+def test_write_candidate_workbook_marks_missing_source_dataset_for_review(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.mid_store_info_bach"),
+        table_name="default.mid_store_info_bach",
+        etl_script="select shop_code from pdw_bach_baseinfo_shop_shop",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.mid_store_info_bach",
+                target_field="shop_code",
+                source_table="pdw.bach_baseinfo_shop_shop",
+                source_field="shop_code",
+                transform_expression="shop_code",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="test-model",
+        source_table_validations={
+            "pdw.bach_baseinfo_shop_shop": SourceTableValidation(
+                source_table="pdw.bach_baseinfo_shop_shop",
+                dataset_exists=False,
+                in_target_upstreams=False,
+            )
+        },
+    )
+
+    wb = load_workbook(output)
+    row = {
+        cell.value: wb["candidate_lineage"].cell(row=2, column=index).value
+        for index, cell in enumerate(wb["candidate_lineage"][1], start=1)
+    }
+    assert row["review_status"] == "NEEDS_REVIEW"
+    assert row["import_error"] == "SOURCE_DATASET_NOT_FOUND: pdw.bach_baseinfo_shop_shop"
+    assert wb["source_validation"]["A2"].value == "pdw.bach_baseinfo_shop_shop"
+    assert wb["source_validation"]["B2"].value is False
+
+
+def test_write_candidate_workbook_marks_source_outside_table_upstreams_for_review(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select id from default.ods_other",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_id",
+                source_table="default.ods_other",
+                source_field="id",
+                transform_expression="id",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="test-model",
+        source_table_validations={
+            "default.ods_other": SourceTableValidation(
+                source_table="default.ods_other",
+                dataset_exists=True,
+                in_target_upstreams=False,
+            )
+        },
+    )
+
+    wb = load_workbook(output)
+    assert wb["candidate_lineage"]["A2"].value == "NEEDS_REVIEW"
+    assert (
+        wb["candidate_lineage"]["L2"].value
+        == "SOURCE_NOT_IN_TABLE_UPSTREAMS: default.ods_other"
+    )
+
+
+def test_write_candidate_workbook_keeps_valid_source_auto_approved(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select id from default.ods_store_info",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_id",
+                source_table="default.ods_store_info",
+                source_field="id",
+                transform_expression="id",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="test-model",
+        source_table_validations={
+            "default.ods_store_info": SourceTableValidation(
+                source_table="default.ods_store_info",
+                dataset_exists=True,
+                in_target_upstreams=True,
+            )
+        },
+    )
+
+    wb = load_workbook(output)
+    assert wb["candidate_lineage"]["A2"].value == "AUTO_APPROVED"
+    assert wb["candidate_lineage"]["L2"].value is None
+
+
+def test_extract_upstream_table_names_uses_platform_instance() -> None:
+    payload = {
+        "upstreamLineage": {
+            "value": {
+                "upstreams": [
+                    {
+                        "dataset": (
+                            "urn:li:dataset:(urn:li:dataPlatform:hive,"
+                            "blf-prod-hive.default.pdw_bach_baseinfo_shop_shop,PROD)"
+                        )
+                    }
+                ]
+            }
+        }
+    }
+
+    assert extract_upstream_table_names(payload, "blf-prod-hive") == [
+        "default.pdw_bach_baseinfo_shop_shop"
+    ]
+
+
+def test_validate_source_tables_checks_existence_and_table_upstream_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_datahub_reader.fetch_upstream_table_names",
+        lambda *args, **kwargs: ["default.pdw_bach_baseinfo_shop_shop"],
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_datahub_reader.dataset_schema_exists",
+        lambda _gms, table, **kwargs: table == "default.pdw_bach_baseinfo_shop_shop",
+    )
+
+    result = validate_source_tables(
+        "http://localhost:8080",
+        make_hive_dataset_urn("default.mid_store_info_bach"),
+        [
+            "default.pdw_bach_baseinfo_shop_shop",
+            "pdw.bach_baseinfo_shop_shop",
+        ],
+    )
+
+    assert result["default.pdw_bach_baseinfo_shop_shop"] == SourceTableValidation(
+        source_table="default.pdw_bach_baseinfo_shop_shop",
+        dataset_exists=True,
+        in_target_upstreams=True,
+    )
+    assert result["pdw.bach_baseinfo_shop_shop"] == SourceTableValidation(
+        source_table="pdw.bach_baseinfo_shop_shop",
+        dataset_exists=False,
+        in_target_upstreams=False,
+    )
 
 
 def test_write_candidate_workbook_expands_same_as_above_for_same_target(
@@ -2730,6 +3169,63 @@ def test_import_reviewed_write_without_approved_exits_4(tmp_path: Path) -> None:
     assert exit_code == EXIT_NO_APPROVED_ROWS
 
 
+def test_import_reviewed_write_blocks_invalid_source_on_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from job_info_sync_datahub.field_lineage_cli import EXIT_IMPORT_VALIDATION_FAILED
+
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="bad_field",
+                source_table="default.ods_store_info",
+                source_field="t3.user_id, t4.user_id",
+                transform_expression="coalesce(t3.user_id, t4.user_id)",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+    wb = load_workbook(workbook)
+    wb["candidate_lineage"]["A2"] = "APPROVED"
+    wb.save(workbook)
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.validate_source_tables",
+        lambda *args, **kwargs: {
+            "default.ods_store_info": SourceTableValidation(
+                source_table="default.ods_store_info",
+                dataset_exists=True,
+                in_target_upstreams=True,
+            )
+        },
+    )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "import-reviewed",
+            "--input",
+            str(workbook),
+            "--write",
+            "--gms-url",
+            "http://localhost:8080",
+        ]
+    )
+
+    assert exit_code == EXIT_IMPORT_VALIDATION_FAILED
+
+
 def test_import_reviewed_write_blocks_confirmed_field_lineage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2758,6 +3254,16 @@ def test_import_reviewed_write_blocks_confirmed_field_lineage(
         llm_model="deepseek-test",
     )
     monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.validate_source_tables",
+        lambda *args, **kwargs: {
+            "ods.store_info": SourceTableValidation(
+                source_table="ods.store_info",
+                dataset_exists=True,
+                in_target_upstreams=True,
+            )
+        },
+    )
+    monkeypatch.setattr(
         "job_info_sync_datahub.field_lineage_cli.fetch_structured_properties",
         lambda *args, **kwargs: _structured_properties_payload(
             etl_script="select 1",
@@ -2778,6 +3284,71 @@ def test_import_reviewed_write_blocks_confirmed_field_lineage(
     )
 
     assert exit_code == 5
+
+
+def test_import_reviewed_write_allows_force_refresh_over_confirmed_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_id",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            )
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.validate_source_tables",
+        lambda *args, **kwargs: {
+            "ods.store_info": SourceTableValidation(
+                source_table="ods.store_info",
+                dataset_exists=True,
+                in_target_upstreams=True,
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.fetch_structured_properties",
+        lambda *args, **kwargs: _structured_properties_payload(
+            etl_script="select 1",
+            execute_shell="sh run.sh",
+            availability_flags=["DDL", "表血缘", "字段血缘"],
+        ),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.write_approved_field_lineages",
+        lambda *args, **kwargs: {"tables": {"default.dim_store_info": {"written": True, "field_count": 1}}},
+    )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "import-reviewed",
+            "--input",
+            str(workbook),
+            "--write",
+            "--force-refresh-field-lineage",
+            "--gms-url",
+            "http://localhost:8080",
+        ]
+    )
+
+    assert exit_code == 0
 
 
 @pytest.mark.skipif(

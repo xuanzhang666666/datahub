@@ -252,6 +252,114 @@ def test_field_lineage_coverage_deduplicates_and_excludes_partition_fields() -> 
     }
 
 
+def test_read_direct_lineage_anomalies_records_missing_datasets_and_invalid_fields(
+    monkeypatch,
+) -> None:
+    target_urn = q.make_hive_dataset_urn("default.target")
+    missing_direct_urn = q.make_hive_dataset_urn("default.missing_direct")
+    wrong_source_urn = q.make_hive_dataset_urn("pdw.wrong_source")
+
+    payloads = {
+        (target_urn, "schemaMetadata"): {
+            "schemaMetadata": {"value": {"fields": [{"fieldPath": "target_id"}]}}
+        },
+        (target_urn, "upstreamLineage"): {
+            "upstreamLineage": {
+                "value": {
+                    "upstreams": [{"dataset": missing_direct_urn}],
+                    "fineGrainedLineages": [
+                        {
+                            "upstreams": [
+                                f"urn:li:schemaField:({wrong_source_urn},source_id)"
+                            ],
+                            "downstreams": [
+                                f"urn:li:schemaField:({target_urn},missing_target_field)"
+                            ],
+                        }
+                    ],
+                }
+            }
+        },
+    }
+
+    def _fetch(_gms_url, dataset_urn, aspect_name, token=None):
+        key = (dataset_urn, aspect_name)
+        if key in payloads:
+            return payloads[key]
+        raise urllib.error.HTTPError(
+            url="http://gms",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+
+    monkeypatch.setattr(q, "_fetch_dataset_aspect", _fetch)
+
+    anomalies = q.read_direct_lineage_anomalies("http://gms", None, target_urn)
+
+    assert anomalies["table_lineage_anomalies"] == [
+        "上游Dataset不存在: default.missing_direct"
+    ]
+    assert "字段源Dataset不存在: pdw.wrong_source.source_id" in anomalies[
+        "field_lineage_anomalies"
+    ]
+    assert "字段源不属于直接上游: pdw.wrong_source.source_id" in anomalies[
+        "field_lineage_anomalies"
+    ]
+    assert "目标字段不存在: default.target.missing_target_field" in anomalies[
+        "field_lineage_anomalies"
+    ]
+
+
+def test_read_direct_lineage_anomalies_accepts_valid_direct_field_dependency(
+    monkeypatch,
+) -> None:
+    target_urn = q.make_hive_dataset_urn("default.target")
+    source_urn = q.make_hive_dataset_urn("default.source")
+    payloads = {
+        (target_urn, "schemaMetadata"): {
+            "schemaMetadata": {"value": {"fields": [{"fieldPath": "target_id"}]}}
+        },
+        (source_urn, "schemaMetadata"): {
+            "schemaMetadata": {"value": {"fields": [{"fieldPath": "source_id"}]}}
+        },
+        (source_urn, "datasetProperties"): {
+            "datasetProperties": {"value": {"name": "source"}}
+        },
+        (target_urn, "upstreamLineage"): {
+            "upstreamLineage": {
+                "value": {
+                    "upstreams": [{"dataset": source_urn}],
+                    "fineGrainedLineages": [
+                        {
+                            "upstreams": [
+                                f"urn:li:schemaField:({source_urn},source_id)"
+                            ],
+                            "downstreams": [
+                                f"urn:li:schemaField:({target_urn},target_id)"
+                            ],
+                        }
+                    ],
+                }
+            }
+        },
+    }
+
+    monkeypatch.setattr(
+        q,
+        "_fetch_dataset_aspect",
+        lambda _gms_url, dataset_urn, aspect_name, token=None: payloads[
+            (dataset_urn, aspect_name)
+        ],
+    )
+
+    assert q.read_direct_lineage_anomalies("http://gms", None, target_urn) == {
+        "table_lineage_anomalies": [],
+        "field_lineage_anomalies": [],
+    }
+
+
 def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) -> None:
     upstream_a = q.make_hive_dataset_urn("data_smartorder.dw_sku_display_snap")
     upstream_b = q.make_hive_dataset_urn("default.dim_store_info")
@@ -280,6 +388,22 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
             "field_lineage_covered_field_count": 1 if urn == upstream_a else 0,
             "ddl_non_partition_field_count": 2 if urn == upstream_a else 0,
             "partition_fields": ["dt"] if urn == upstream_a else [],
+        },
+    )
+    monkeypatch.setattr(
+        q,
+        "read_direct_lineage_anomalies",
+        lambda _gms_url, _token, urn: {
+            "table_lineage_anomalies": (
+                ["上游Dataset不存在: default.missing"]
+                if urn == upstream_a
+                else []
+            ),
+            "field_lineage_anomalies": (
+                ["字段源不存在: default.missing.id -> default.dim_store_info.id"]
+                if urn == upstream_b
+                else []
+            ),
         },
     )
 
@@ -320,7 +444,7 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "库名",
         "表名",
         "表名前辍",
-        "完整表表",
+        "完整表名",
         "表类型",
         "标记废弃",
         "Documentation生成",
@@ -330,6 +454,8 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "data_availability_flag",
         "other_remark",
         "上游表数量",
+        "表血缘异常",
+        "字段血缘异常",
         "字段血缘覆盖率",
         "有血缘字段数量(去重,已过滤分区字段)",
         "DDL字段数量(已过滤分区字段)",
@@ -350,6 +476,8 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "DDL, 表血缘",
         "-",
         2,
+        "上游Dataset不存在: default.missing",
+        "-",
         "50.00%",
         1,
         2,
@@ -369,6 +497,8 @@ def test_run_writes_deduplicated_upstream_detail_excel(monkeypatch, tmp_path) ->
         "DDL, 表血缘",
         "view 无调度",
         0,
+        "-",
+        "字段源不存在: default.missing.id -> default.dim_store_info.id",
         "0.00%",
         0,
         0,

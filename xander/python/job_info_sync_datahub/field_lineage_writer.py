@@ -26,6 +26,7 @@ from .field_lineage_models import FieldLineageCandidate
 from .field_lineage_policy import (
     is_partition_field,
     is_self_dependency,
+    normalize_source_field_name,
     normalize_source_table_name,
 )
 from .structured_properties import URN_DATA_AVAILABILITY_FLAG, sort_data_availability_flags
@@ -130,7 +131,7 @@ def group_approved_rows(rows: List[FieldLineageCandidate]) -> List[GroupedFieldL
         for item in items:
             src = (
                 normalize_source_table_name(item.source_table),
-                item.source_field.strip().lower(),
+                normalize_source_field_name(item.source_field),
             )
             if not src[0] and not src[1] and is_constant_transform_expression(
                 item.transform_expression

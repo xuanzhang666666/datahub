@@ -1,9 +1,11 @@
-"""Build A-side algorithm field contracts from DataHub dataset properties.
+"""Build A-side algorithm field contracts from the DataHub field-lineage graph.
 
-This module reads the BLF structured properties stored on Hive datasets,
-resolves ETL scripts with runtime variables from Execute Shell, parses upstream
-table and field lineage, and writes local report artifacts. It does not write
-anything back to DataHub.
+The CLI reads schemaMetadata, upstreamLineage, fineGrainedLineages, and the
+Data Availability Flag. It recursively traces all non-partition input fields
+without parsing ETL scripts, calling an LLM, or writing metadata back to DataHub.
+
+Legacy ETL parsing helpers remain in this module for compatibility with older
+callers and tests; the formal CLI path uses DataHub graph aspects only.
 """
 
 from __future__ import annotations
@@ -18,18 +20,21 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from openpyxl import Workbook
 
 from .field_lineage_datahub_reader import (
+    extract_data_availability_flags,
+    extract_schema_field_names,
+    extract_schema_partition_field_names,
     fetch_structured_properties,
     make_hive_dataset_urn,
     strip_markdown_code_fence,
 )
 from .lineage_parser import build_lineage_summary, parse_block_lineage
 from .models import FieldLineage, ParseStatus, SqlBlock, TableLineage
-from .query_upstream_lineage import normalize_table_name
+from .query_upstream_lineage import normalize_table_name, urn_to_table_name
 from .sql_extractor import compute_format_date_vars, extract_sql_blocks
 from .structured_properties import (
     URN_ETL_SCRIPT,
@@ -41,6 +46,17 @@ OK = "OK"
 MISSING_ETL_SCRIPT = "MISSING_ETL_SCRIPT"
 NO_RUNTIME_VARS = "NO_RUNTIME_VARS"
 SQL_PARSE_FAILED = "SQL_PARSE_FAILED"
+
+COMPLETE = "COMPLETE"
+MISSING_FIELD_LINEAGE = "MISSING_FIELD_LINEAGE"
+INVALID_SCHEMA_FIELD_URN = "INVALID_SCHEMA_FIELD_URN"
+DATASET_NOT_FOUND = "DATASET_NOT_FOUND"
+CYCLE_DETECTED = "CYCLE_DETECTED"
+MAX_DEPTH_REACHED = "MAX_DEPTH_REACHED"
+
+CONFIRMED = "CONFIRMED"
+RISK_UNCONFIRMED_NODE = "RISK_UNCONFIRMED_NODE"
+INCOMPLETE = "INCOMPLETE"
 
 
 @dataclass(frozen=True)
@@ -742,6 +758,608 @@ def _write_excel(results: Sequence[TableContractAnalysis], path: Path) -> None:
     wb.save(path)
 
 
+@dataclass
+class DatasetGraphSnapshot:
+    table_name: str
+    dataset_urn: str
+    schema_fields: List[str]
+    partition_fields: List[str]
+    field_descriptions: Dict[str, str]
+    table_upstreams: List[str]
+    field_edges: Dict[str, List[Tuple[str, str]]]
+    field_lineage_confirmed: bool
+    raw_aspects: Dict[str, Dict[str, Any]]
+
+
+@dataclass
+class FieldTracePath:
+    target_table: str
+    target_field: str
+    target_description: str
+    nodes: List[str]
+    transform_operations: List[str]
+    path_status: str
+    trust_status: str
+    unconfirmed_nodes: List[str] = field(default_factory=list)
+    question: str = ""
+
+    @property
+    def direct_upstream(self) -> str:
+        return self.nodes[1] if len(self.nodes) > 1 else ""
+
+    @property
+    def final_source(self) -> str:
+        return self.nodes[-1] if self.nodes else ""
+
+    @property
+    def path_length(self) -> int:
+        return max(0, len(self.nodes) - 1)
+
+
+@dataclass
+class FieldContractSummary:
+    target_table: str
+    target_field: str
+    target_description: str
+    path_count: int
+    path_status: str
+    trust_status: str
+    direct_upstreams: List[str]
+    final_sources: List[str]
+    transform_chains: List[str]
+    unconfirmed_nodes: List[str]
+    questions: List[str]
+
+
+@dataclass
+class FieldContractGraphResult:
+    input_tables: List[str]
+    max_depth: int
+    fields: List[FieldContractSummary]
+    paths: List[FieldTracePath]
+    open_questions: List[str]
+    snapshots: Dict[str, DatasetGraphSnapshot]
+
+
+GraphSnapshotLoader = Callable[[str], DatasetGraphSnapshot]
+
+
+def _split_field_node(node: str) -> Optional[Tuple[str, str]]:
+    normalized = node.strip().lower()
+    if normalized.startswith("__invalid__:"):
+        return None
+    parts = normalized.split(".")
+    if len(parts) < 3 or not parts[-1]:
+        return None
+    return ".".join(parts[:-1]), parts[-1]
+
+
+def _path_trust(status: str, unconfirmed_nodes: Sequence[str]) -> str:
+    if status != COMPLETE:
+        return INCOMPLETE
+    if unconfirmed_nodes:
+        return RISK_UNCONFIRMED_NODE
+    return CONFIRMED
+
+
+def trace_field_contract(
+    table_names: Sequence[str],
+    *,
+    snapshot_loader: GraphSnapshotLoader,
+    max_depth: int = 20,
+) -> FieldContractGraphResult:
+    """Trace all non-partition input fields through DataHub fine-grained lineage."""
+    normalized_inputs = list(dict.fromkeys(normalize_table_name(name) for name in table_names))
+    snapshots: Dict[str, DatasetGraphSnapshot] = {}
+    paths: List[FieldTracePath] = []
+
+    def load(table_name: str) -> DatasetGraphSnapshot:
+        normalized = normalize_table_name(table_name)
+        if normalized not in snapshots:
+            snapshots[normalized] = snapshot_loader(normalized)
+        return snapshots[normalized]
+
+    def finish(
+        *,
+        root_table: str,
+        root_field: str,
+        description: str,
+        nodes: List[str],
+        operations: List[str],
+        status: str,
+        unconfirmed: List[str],
+        question: str = "",
+    ) -> None:
+        paths.append(
+            FieldTracePath(
+                target_table=root_table,
+                target_field=root_field,
+                target_description=description,
+                nodes=nodes,
+                transform_operations=operations,
+                path_status=status,
+                trust_status=_path_trust(status, unconfirmed),
+                unconfirmed_nodes=list(dict.fromkeys(unconfirmed)),
+                question=question,
+            )
+        )
+
+    def walk(
+        *,
+        root_table: str,
+        root_field: str,
+        description: str,
+        node: str,
+        nodes: List[str],
+        operations: List[str],
+        visited: Set[str],
+        unconfirmed: List[str],
+        depth: int,
+    ) -> None:
+        parsed = _split_field_node(node)
+        if parsed is None:
+            finish(
+                root_table=root_table,
+                root_field=root_field,
+                description=description,
+                nodes=nodes,
+                operations=operations,
+                status=INVALID_SCHEMA_FIELD_URN,
+                unconfirmed=unconfirmed,
+                question=f"{root_table}.{root_field}: invalid schemaField URN/node {node}",
+            )
+            return
+        table_name, field_name = parsed
+        try:
+            snapshot = load(table_name)
+        except Exception as exc:
+            finish(
+                root_table=root_table,
+                root_field=root_field,
+                description=description,
+                nodes=nodes,
+                operations=operations,
+                status=DATASET_NOT_FOUND,
+                unconfirmed=unconfirmed,
+                question=f"{root_table}.{root_field}: dataset/schema unavailable at {node}: {exc}",
+            )
+            return
+
+        current_unconfirmed = list(unconfirmed)
+        if not snapshot.field_lineage_confirmed:
+            current_unconfirmed.append(node)
+        if field_name.lower() not in {field.lower() for field in snapshot.schema_fields}:
+            finish(
+                root_table=root_table,
+                root_field=root_field,
+                description=description,
+                nodes=nodes,
+                operations=operations,
+                status=INVALID_SCHEMA_FIELD_URN,
+                unconfirmed=current_unconfirmed,
+                question=f"{root_table}.{root_field}: field {node} not found in schemaMetadata",
+            )
+            return
+        edges = snapshot.field_edges.get(field_name.lower(), [])
+        if not edges:
+            if snapshot.table_upstreams:
+                finish(
+                    root_table=root_table,
+                    root_field=root_field,
+                    description=description,
+                    nodes=nodes,
+                    operations=operations,
+                    status=MISSING_FIELD_LINEAGE,
+                    unconfirmed=current_unconfirmed,
+                    question=(
+                        f"{root_table}.{root_field}: {node} has table upstreams but no field lineage"
+                    ),
+                )
+            else:
+                finish(
+                    root_table=root_table,
+                    root_field=root_field,
+                    description=description,
+                    nodes=nodes,
+                    operations=operations,
+                    status=COMPLETE,
+                    unconfirmed=current_unconfirmed,
+                )
+            return
+        if depth >= max_depth:
+            finish(
+                root_table=root_table,
+                root_field=root_field,
+                description=description,
+                nodes=nodes,
+                operations=operations,
+                status=MAX_DEPTH_REACHED,
+                unconfirmed=current_unconfirmed,
+                question=f"{root_table}.{root_field}: max depth {max_depth} reached at {node}",
+            )
+            return
+
+        for upstream_node, operation in edges:
+            if upstream_node in visited:
+                finish(
+                    root_table=root_table,
+                    root_field=root_field,
+                    description=description,
+                    nodes=[*nodes, upstream_node],
+                    operations=[*operations, operation],
+                    status=CYCLE_DETECTED,
+                    unconfirmed=current_unconfirmed,
+                    question=f"{root_table}.{root_field}: cycle detected at {upstream_node}",
+                )
+                continue
+            walk(
+                root_table=root_table,
+                root_field=root_field,
+                description=description,
+                node=upstream_node,
+                nodes=[*nodes, upstream_node],
+                operations=[*operations, operation],
+                visited={*visited, upstream_node},
+                unconfirmed=current_unconfirmed,
+                depth=depth + 1,
+            )
+
+    for table_name in normalized_inputs:
+        try:
+            root_snapshot = load(table_name)
+        except Exception as exc:
+            finish(
+                root_table=table_name,
+                root_field="*",
+                description="",
+                nodes=[f"{table_name}.*"],
+                operations=[],
+                status=DATASET_NOT_FOUND,
+                unconfirmed=[],
+                question=f"{table_name}: dataset/schema unavailable: {exc}",
+            )
+            continue
+        partition_fields = {field.lower() for field in root_snapshot.partition_fields}
+        for field_name in root_snapshot.schema_fields:
+            normalized_field = field_name.lower()
+            if normalized_field in partition_fields:
+                continue
+            node = f"{table_name}.{normalized_field}"
+            walk(
+                root_table=table_name,
+                root_field=normalized_field,
+                description=root_snapshot.field_descriptions.get(normalized_field, ""),
+                node=node,
+                nodes=[node],
+                operations=[],
+                visited={node},
+                unconfirmed=[],
+                depth=0,
+            )
+
+    field_summaries: List[FieldContractSummary] = []
+    grouped: Dict[Tuple[str, str], List[FieldTracePath]] = {}
+    for path in paths:
+        grouped.setdefault((path.target_table, path.target_field), []).append(path)
+    for (table_name, field_name), field_paths in sorted(grouped.items()):
+        statuses = {path.path_status for path in field_paths}
+        trust_statuses = {path.trust_status for path in field_paths}
+        summary_status = COMPLETE if statuses == {COMPLETE} else INCOMPLETE
+        if INCOMPLETE in trust_statuses:
+            summary_trust = INCOMPLETE
+        elif RISK_UNCONFIRMED_NODE in trust_statuses:
+            summary_trust = RISK_UNCONFIRMED_NODE
+        else:
+            summary_trust = CONFIRMED
+        field_summaries.append(
+            FieldContractSummary(
+                target_table=table_name,
+                target_field=field_name,
+                target_description=field_paths[0].target_description,
+                path_count=len(field_paths),
+                path_status=summary_status,
+                trust_status=summary_trust,
+                direct_upstreams=sorted({p.direct_upstream for p in field_paths if p.direct_upstream}),
+                final_sources=sorted({p.final_source for p in field_paths if p.final_source}),
+                transform_chains=[
+                    " -> ".join(operation for operation in p.transform_operations if operation)
+                    for p in field_paths
+                ],
+                unconfirmed_nodes=sorted(
+                    {node for p in field_paths for node in p.unconfirmed_nodes}
+                ),
+                questions=[p.question for p in field_paths if p.question],
+            )
+        )
+
+    questions = list(
+        dict.fromkeys(
+            [
+                *(path.question for path in paths if path.question),
+                *(
+                    f"{path.target_table}.{path.target_field}: unconfirmed field lineage node {node}"
+                    for path in paths
+                    for node in path.unconfirmed_nodes
+                ),
+            ]
+        )
+    )
+    return FieldContractGraphResult(
+        input_tables=normalized_inputs,
+        max_depth=max_depth,
+        fields=field_summaries,
+        paths=paths,
+        open_questions=questions,
+        snapshots=snapshots,
+    )
+
+
+def _unwrap_openapi_aspect(payload: Dict[str, Any], aspect_name: str) -> Dict[str, Any]:
+    current: Any = payload
+    for key in (aspect_name, "value"):
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+    return current if isinstance(current, dict) else {}
+
+
+def _fetch_openapi_aspect(
+    gms_url: str,
+    dataset_urn: str,
+    aspect_name: str,
+    token: Optional[str],
+    *,
+    required: bool = False,
+) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        _dataset_aspect_url(gms_url, dataset_urn, aspect_name),
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404 and not required:
+            return {}
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GET {aspect_name} HTTP {exc.code}: {detail}") from exc
+
+
+def _schema_field_descriptions(payload: Dict[str, Any]) -> Dict[str, str]:
+    aspect = _unwrap_openapi_aspect(payload, "schemaMetadata")
+    fields = aspect.get("fields")
+    descriptions: Dict[str, str] = {}
+    if not isinstance(fields, list):
+        return descriptions
+    for item in fields:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("fieldPath")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        description = item.get("description")
+        descriptions[name.strip().lower()] = description if isinstance(description, str) else ""
+    return descriptions
+
+
+def _schema_field_urn_to_node(
+    urn: str,
+    platform_instance: str,
+) -> Optional[str]:
+    prefix = "urn:li:schemaField:("
+    if not isinstance(urn, str) or not urn.startswith(prefix) or not urn.endswith(")"):
+        return None
+    inner = urn[len(prefix) : -1]
+    if "," not in inner:
+        return None
+    dataset_urn, field_name = inner.rsplit(",", 1)
+    table_name = urn_to_table_name(dataset_urn.strip(), platform_instance)
+    if table_name == dataset_urn.strip() or "." not in table_name:
+        return None
+    field_name = urllib.parse.unquote(field_name.strip())
+    if not field_name:
+        return None
+    return f"{normalize_table_name(table_name)}.{field_name.lower()}"
+
+
+def load_dataset_graph_snapshot(
+    table_name: str,
+    *,
+    gms_url: str,
+    token: Optional[str],
+    platform_instance: str,
+    env: str,
+) -> DatasetGraphSnapshot:
+    normalized = normalize_table_name(table_name)
+    dataset_urn = make_hive_dataset_urn(normalized, platform_instance, env)
+    schema_payload = _fetch_openapi_aspect(
+        gms_url, dataset_urn, "schemaMetadata", token, required=True
+    )
+    lineage_payload = _fetch_openapi_aspect(gms_url, dataset_urn, "upstreamLineage", token)
+    structured_payload = _fetch_openapi_aspect(
+        gms_url, dataset_urn, "structuredProperties", token
+    )
+    schema_fields = extract_schema_field_names(schema_payload)
+    if not schema_fields:
+        raise RuntimeError("schemaMetadata fields empty")
+
+    lineage_aspect = _unwrap_openapi_aspect(lineage_payload, "upstreamLineage")
+    table_upstreams: List[str] = []
+    for item in lineage_aspect.get("upstreams") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("dataset"), str):
+            continue
+        table_upstreams.append(
+            normalize_table_name(urn_to_table_name(item["dataset"], platform_instance))
+        )
+    field_edges: Dict[str, List[Tuple[str, str]]] = {}
+    for entry in lineage_aspect.get("fineGrainedLineages") or []:
+        if not isinstance(entry, dict):
+            continue
+        operation = entry.get("transformOperation")
+        operation_text = operation if isinstance(operation, str) else ""
+        upstream_nodes: List[str] = []
+        for upstream_urn in entry.get("upstreams") or []:
+            node = _schema_field_urn_to_node(upstream_urn, platform_instance)
+            upstream_nodes.append(node or f"__invalid__:{upstream_urn}")
+        for downstream_urn in entry.get("downstreams") or []:
+            downstream_node = _schema_field_urn_to_node(downstream_urn, platform_instance)
+            parsed = _split_field_node(downstream_node or "")
+            if parsed is None or parsed[0] != normalized:
+                continue
+            field_edges.setdefault(parsed[1], []).extend(
+                (upstream_node, operation_text) for upstream_node in upstream_nodes
+            )
+
+    return DatasetGraphSnapshot(
+        table_name=normalized,
+        dataset_urn=dataset_urn,
+        schema_fields=schema_fields,
+        partition_fields=extract_schema_partition_field_names(schema_payload),
+        field_descriptions=_schema_field_descriptions(schema_payload),
+        table_upstreams=sorted(set(table_upstreams)),
+        field_edges=field_edges,
+        field_lineage_confirmed="字段血缘" in extract_data_availability_flags(structured_payload),
+        raw_aspects={
+            "schemaMetadata": schema_payload,
+            "upstreamLineage": lineage_payload,
+            "structuredProperties": structured_payload,
+        },
+    )
+
+
+def _write_graph_excel(result: FieldContractGraphResult, path: Path) -> None:
+    def tables(nodes: Sequence[str]) -> str:
+        return "\n".join(
+            sorted(
+                {
+                    parsed[0]
+                    for node in nodes
+                    if (parsed := _split_field_node(node)) is not None
+                }
+            )
+        )
+
+    def fields(nodes: Sequence[str]) -> str:
+        return "\n".join(
+            sorted(
+                {
+                    parsed[1]
+                    for node in nodes
+                    if (parsed := _split_field_node(node)) is not None
+                }
+            )
+        )
+
+    wb = Workbook()
+    contract = wb.active
+    contract.title = "field_contract"
+    contract.append(
+        [
+            "算法目标表", "算法目标字段", "字段描述", "直接上游表", "直接上游字段",
+            "最终源头表", "最终源头字段",
+            "加工逻辑链", "路径数量", "路径状态", "信任状态", "未确认节点", "待确认问题",
+            "是否必需", "B侧候选表", "B侧候选字段", "适配状态",
+        ]
+    )
+    for item in result.fields:
+        contract.append(
+            [
+                item.target_table, item.target_field, item.target_description,
+                tables(item.direct_upstreams), fields(item.direct_upstreams),
+                tables(item.final_sources), fields(item.final_sources),
+                "\n".join(item.transform_chains), item.path_count, item.path_status,
+                item.trust_status, "\n".join(item.unconfirmed_nodes), "\n".join(item.questions),
+                "", "", "", "",
+            ]
+        )
+    trace = wb.create_sheet("trace_paths")
+    trace.append(
+        [
+            "算法目标表", "算法目标字段", "完整字段路径", "直接上游", "最终源头",
+            "加工逻辑链", "路径长度", "路径状态", "信任状态", "未确认节点", "待确认问题",
+        ]
+    )
+    for item in result.paths:
+        trace.append(
+            [
+                item.target_table, item.target_field, " -> ".join(item.nodes),
+                item.direct_upstream, item.final_source, "\n".join(item.transform_operations),
+                item.path_length, item.path_status, item.trust_status,
+                "\n".join(item.unconfirmed_nodes), item.question,
+            ]
+        )
+    questions = wb.create_sheet("open_questions")
+    questions.append(["待确认问题"])
+    for question in result.open_questions:
+        questions.append([question])
+    summary = wb.create_sheet("run_summary")
+    confirmed = sum(1 for item in result.fields if item.trust_status == CONFIRMED)
+    complete = sum(1 for item in result.fields if item.path_status == COMPLETE)
+    field_count = len(result.fields)
+    for row in [
+        ("input_table_count", len(result.input_tables)),
+        ("target_field_count", field_count),
+        ("trace_path_count", len(result.paths)),
+        ("complete_field_count", complete),
+        ("field_coverage_percent", round(complete * 100 / field_count, 2) if field_count else 0.0),
+        ("confirmed_field_count", confirmed),
+        ("confirmed_field_percent", round(confirmed * 100 / field_count, 2) if field_count else 0.0),
+        ("open_question_count", len(result.open_questions)),
+        ("max_depth", result.max_depth),
+    ]:
+        summary.append(row)
+    wb.save(path)
+
+
+def write_graph_contract_outputs(
+    result: FieldContractGraphResult,
+    output_dir: str | Path,
+) -> None:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "input_tables": result.input_tables,
+        "max_depth": result.max_depth,
+        "fields": [asdict(item) for item in result.fields],
+        "paths": [asdict(item) for item in result.paths],
+        "open_questions": result.open_questions,
+    }
+    (out / "field_lineage.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    report_lines = ["# A-side algorithm field contract", ""]
+    for table_name in result.input_tables:
+        fields = [field for field in result.fields if field.target_table == table_name]
+        report_lines.extend(
+            [
+                f"## {table_name}",
+                "",
+                f"- target_fields: {len(fields)}",
+                f"- complete_fields: {sum(1 for field in fields if field.path_status == COMPLETE)}",
+                f"- confirmed_fields: {sum(1 for field in fields if field.trust_status == CONFIRMED)}",
+                "",
+            ]
+        )
+    (out / "lineage_report.md").write_text("\n".join(report_lines), encoding="utf-8")
+    question_lines = ["# Open Questions", ""]
+    question_lines.extend(f"- {question}" for question in result.open_questions)
+    if not result.open_questions:
+        question_lines.append("- 无")
+    (out / "open_questions.md").write_text("\n".join(question_lines), encoding="utf-8")
+    raw_dir = out / "raw_aspects"
+    for table_name, snapshot in result.snapshots.items():
+        table_dir = raw_dir / table_name
+        table_dir.mkdir(parents=True, exist_ok=True)
+        for aspect_name, aspect_payload in snapshot.raw_aspects.items():
+            (table_dir / f"{aspect_name}.json").write_text(
+                json.dumps(aspect_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    _write_graph_excel(result, out / "field_contract.xlsx")
+
+
 def _read_table_names(args: argparse.Namespace) -> List[str]:
     names: List[str] = []
     for value in args.table or []:
@@ -785,7 +1403,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--token", default=os.getenv("DATAHUB_GMS_TOKEN"))
     parser.add_argument("--platform-instance", default=os.getenv("BLF_DATAHUB_PLATFORM_INSTANCE", "blf-prod-hive"))
     parser.add_argument("--env", default=os.getenv("DATAHUB_ENV", "PROD"))
-    parser.add_argument("--max-depth", type=int, default=int(os.getenv("FIELD_CONTRACT_MAX_DEPTH", "3")))
+    parser.add_argument("--max-depth", type=int, default=int(os.getenv("FIELD_CONTRACT_MAX_DEPTH", "20")))
     parser.add_argument("--output-dir", default=os.getenv("FIELD_CONTRACT_OUTPUT_DIR", "tmp/algorithm_field_contract"))
     args = parser.parse_args(argv)
 
@@ -793,15 +1411,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not table_names:
         parser.error("at least one --table, --table-file, or TABLE_NAMES env value is required")
 
-    results = analyze_tables(
+    result = trace_field_contract(
         table_names,
-        gms_url=args.gms_url,
-        token=args.token,
-        platform_instance=args.platform_instance,
-        env=args.env,
+        snapshot_loader=lambda table_name: load_dataset_graph_snapshot(
+            table_name,
+            gms_url=args.gms_url,
+            token=args.token,
+            platform_instance=args.platform_instance,
+            env=args.env,
+        ),
         max_depth=args.max_depth,
     )
-    write_contract_outputs(results, args.output_dir)
+    write_graph_contract_outputs(result, args.output_dir)
+    complete_fields = sum(1 for item in result.fields if item.path_status == COMPLETE)
+    confirmed_fields = sum(1 for item in result.fields if item.trust_status == CONFIRMED)
+    print(
+        "field contract summary: "
+        f"tables={len(result.input_tables)} fields={len(result.fields)} "
+        f"paths={len(result.paths)} complete_fields={complete_fields} "
+        f"confirmed_fields={confirmed_fields} open_questions={len(result.open_questions)}"
+    )
     print(f"wrote contract outputs to {args.output_dir}")
     return 0
 

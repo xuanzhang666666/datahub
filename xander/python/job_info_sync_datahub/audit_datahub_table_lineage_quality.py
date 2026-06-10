@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Audit current DataHub Hive table-level lineage quality.
+"""Audit current DataHub Hive table-level and field-level lineage quality.
 
 The audit is read-only. It scans DataHub dataset upstreamLineage aspects and
-checks whether lineage endpoints still exist in DataHub and Hive.
+checks whether table and field lineage endpoints still exist and agree with
+schemaMetadata and table-level upstreamLineage.
 """
 
 from __future__ import annotations
@@ -14,12 +15,17 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
-from .field_lineage_datahub_reader import make_hive_dataset_urn
+from .field_lineage_datahub_reader import (
+    extract_schema_field_names,
+    extract_schema_partition_field_names,
+    make_hive_dataset_urn,
+)
 from .hive_table_existence import query_hive_existing_fqtns
 from .query_upstream_lineage import urn_to_table_name
 from .check_dataset_availability import (
@@ -61,6 +67,17 @@ ISSUE_FLAG_CLAIMS_DDL_BUT_NO_SCHEMA_OR_VIEW_LOGIC = "flag_claims_ddl_but_no_sche
 ISSUE_VIEW_FLAG_INCOMPLETE = "view_flag_incomplete"
 ISSUE_VIEW_MISSING_DEFINITION = "view_missing_definition"
 ISSUE_VIEW_DEFINITION_NO_UPSTREAM = "view_definition_no_upstream"
+ISSUE_FIELD_LINEAGE_FLAG_BUT_NO_FINE_GRAINED = "field_lineage_flag_but_no_fine_grained"
+ISSUE_FIELD_LINEAGE_EXISTS_BUT_FLAG_MISSING = "field_lineage_exists_but_flag_missing"
+ISSUE_FIELD_LINEAGE_INVALID_SCHEMA_FIELD_URN = "field_lineage_invalid_schema_field_urn"
+ISSUE_FIELD_LINEAGE_SOURCE_DATASET_NOT_FOUND = "field_lineage_source_dataset_not_found"
+ISSUE_FIELD_LINEAGE_SOURCE_NOT_HIVE_PLATFORM = "field_lineage_source_not_hive_platform"
+ISSUE_FIELD_LINEAGE_SOURCE_NOT_TABLE_UPSTREAM = "field_lineage_source_not_table_upstream"
+ISSUE_FIELD_LINEAGE_SOURCE_FIELD_NOT_FOUND = "field_lineage_source_field_not_found"
+ISSUE_FIELD_LINEAGE_DOWNSTREAM_FIELD_NOT_FOUND = "field_lineage_downstream_field_not_found"
+ISSUE_FIELD_LINEAGE_DOWNSTREAM_DATASET_MISMATCH = "field_lineage_downstream_dataset_mismatch"
+ISSUE_FIELD_LINEAGE_SELF_DEPENDENCY = "field_lineage_self_dependency"
+ISSUE_FIELD_LINEAGE_TARGET_COVERAGE_INCOMPLETE = "field_lineage_target_coverage_incomplete"
 
 _LINEAGE_TABLE_PREFIXES_WITH_UPSTREAM = (
     "app_",
@@ -98,6 +115,50 @@ _ISSUE_DEFAULTS: Dict[str, tuple[str, str]] = {
     ISSUE_FLAG_MISSING_LINEAGE_BUT_HAS_UPSTREAM: ("P2", "已有 upstreamLineage 但 flag 缺表血缘，重跑 availability flag 更新。"),
     ISSUE_VIEW_FLAG_INCOMPLETE: ("P2", "view 已有 View Definition 与上游，更新 flag 为 DDL/表血缘/字段血缘。"),
     ISSUE_VIEW_MISSING_DEFINITION: ("P2", "对该 view 执行 Hive ingest full 模式，补齐 viewProperties.viewLogic。"),
+    ISSUE_FIELD_LINEAGE_FLAG_BUT_NO_FINE_GRAINED: (
+        "P1",
+        "data_availability_flag 声称字段血缘已确认，但 fineGrainedLineages 为空；重建字段血缘或修正 flag。",
+    ),
+    ISSUE_FIELD_LINEAGE_EXISTS_BUT_FLAG_MISSING: (
+        "P2",
+        "已有 fineGrainedLineages；核对正确后更新 data_availability_flag 为字段血缘。",
+    ),
+    ISSUE_FIELD_LINEAGE_INVALID_SCHEMA_FIELD_URN: (
+        "P1",
+        "修正字段血缘中的 schemaField URN，确保包含有效 Dataset URN 和字段名。",
+    ),
+    ISSUE_FIELD_LINEAGE_SOURCE_DATASET_NOT_FOUND: (
+        "P1",
+        "修正字段血缘源表名，或先将真实源 Dataset ingest 到 DataHub。",
+    ),
+    ISSUE_FIELD_LINEAGE_SOURCE_NOT_HIVE_PLATFORM: (
+        "P1",
+        "检查字段血缘源 Dataset 的 platform instance/env 是否正确。",
+    ),
+    ISSUE_FIELD_LINEAGE_SOURCE_NOT_TABLE_UPSTREAM: (
+        "P1",
+        "字段血缘源表必须属于目标表当前表级 upstreamLineage；修正字段血缘或补齐表级血缘。",
+    ),
+    ISSUE_FIELD_LINEAGE_SOURCE_FIELD_NOT_FOUND: (
+        "P1",
+        "修正字段血缘源字段名，或刷新源 Dataset schemaMetadata。",
+    ),
+    ISSUE_FIELD_LINEAGE_DOWNSTREAM_FIELD_NOT_FOUND: (
+        "P1",
+        "修正字段血缘目标字段名，或刷新目标 Dataset schemaMetadata。",
+    ),
+    ISSUE_FIELD_LINEAGE_DOWNSTREAM_DATASET_MISMATCH: (
+        "P1",
+        "fineGrainedLineages 的 downstream 必须属于当前目标 Dataset。",
+    ),
+    ISSUE_FIELD_LINEAGE_SELF_DEPENDENCY: (
+        "P1",
+        "移除目标表字段指向自身字段的无效字段血缘。",
+    ),
+    ISSUE_FIELD_LINEAGE_TARGET_COVERAGE_INCOMPLETE: (
+        "P1",
+        "补齐目标表非分区字段的字段血缘，或确认常量字段也有 downstream 字段记录。",
+    ),
 }
 
 
@@ -312,6 +373,42 @@ def _collect_documented_hive_tables(documentation_by_urn: Mapping[str, str]) -> 
     return needed
 
 
+def _parse_schema_field_urn(value: str) -> Optional[tuple[str, str]]:
+    prefix = "urn:li:schemaField:("
+    if not isinstance(value, str) or not value.startswith(prefix) or not value.endswith(")"):
+        return None
+    inner = value[len(prefix) : -1]
+    if "," not in inner:
+        return None
+    dataset_urn, field_name = inner.rsplit(",", 1)
+    dataset_urn = dataset_urn.strip()
+    field_name = urllib.parse.unquote(field_name.strip()).lower()
+    if not dataset_urn.startswith("urn:li:dataset:(") or not field_name:
+        return None
+    return dataset_urn, field_name
+
+
+def _field_lineage_issue(
+    issue_type: str,
+    target_table: str,
+    target_urn: str,
+    *,
+    upstream_table: str = "",
+    upstream_urn: str = "",
+    reason: str,
+    detail: str,
+) -> QualityIssue:
+    return QualityIssue(
+        issue_type=issue_type,
+        target_table=target_table,
+        upstream_table=upstream_table,
+        target_urn=target_urn,
+        upstream_urn=upstream_urn,
+        reason=reason,
+        detail=detail,
+    )
+
+
 def evaluate_lineage_quality(
     dataset_urns: Set[str],
     upstreams_by_target: Mapping[str, Sequence[str]],
@@ -328,6 +425,11 @@ def evaluate_lineage_quality(
     view_logic_by_urn: Optional[Mapping[str, str]] = None,
     schema_field_count_by_urn: Optional[Mapping[str, int]] = None,
     etl_script_by_urn: Optional[Mapping[str, str]] = None,
+    schema_fields_by_urn: Optional[Mapping[str, Set[str]]] = None,
+    schema_partition_fields_by_urn: Optional[Mapping[str, Set[str]]] = None,
+    fine_grained_lineages_by_target: Optional[
+        Mapping[str, Sequence[Mapping[str, Any]]]
+    ] = None,
 ) -> AuditResult:
     """Classify lineage quality issues from already fetched DataHub/Hive facts."""
     normalized_dataset_urns = {urn.strip() for urn in dataset_urns if urn and urn.strip()}
@@ -344,8 +446,17 @@ def evaluate_lineage_quality(
     view_logic = view_logic_by_urn or {}
     schema_field_counts = schema_field_count_by_urn or {}
     etl_scripts = etl_script_by_urn or {}
+    schema_fields = schema_fields_by_urn or {}
+    schema_partition_fields = schema_partition_fields_by_urn or {}
+    fine_grained_by_target = fine_grained_lineages_by_target or {}
+    field_lineage_scope = {
+        urn
+        for urn in normalized_dataset_urns
+        if fine_grained_by_target.get(urn) or FLAG_FIELD_LINEAGE in data_flags.get(urn, set())
+    }
     issues: List[QualityIssue] = []
     upstream_edge_count = 0
+    fine_grained_edge_count = 0
 
     for target_urn in sorted(normalized_dataset_urns):
         target_table = urn_to_table_name(target_urn, platform_instance).lower()
@@ -361,6 +472,7 @@ def evaluate_lineage_quality(
         target_view_logic = view_logic.get(target_urn, "")
         target_schema_field_count = schema_field_counts.get(target_urn, 0)
         target_etl_script = etl_scripts.get(target_urn, "")
+        target_fine_grained = list(fine_grained_by_target.get(target_urn, []))
 
         if target_table not in normalized_hive:
             issues.append(
@@ -387,6 +499,182 @@ def evaluate_lineage_quality(
                     detail="允许缺失前缀: ods, ai, app；要求存在前缀: dwa, dwd, pdim, dim, pdw, mid, dm, dw",
                 )
             )
+
+        if target_urn in field_lineage_scope:
+            if has_flag_facts and FLAG_FIELD_LINEAGE in target_flags and not target_fine_grained:
+                issues.append(
+                    _field_lineage_issue(
+                        ISSUE_FIELD_LINEAGE_FLAG_BUT_NO_FINE_GRAINED,
+                        target_table,
+                        target_urn,
+                        reason="data_availability_flag 包含「字段血缘」，但 fineGrainedLineages 为空",
+                        detail=f"flags={sorted(target_flags)}",
+                    )
+                )
+            if has_flag_facts and target_fine_grained and FLAG_FIELD_LINEAGE not in target_flags:
+                issues.append(
+                    _field_lineage_issue(
+                        ISSUE_FIELD_LINEAGE_EXISTS_BUT_FLAG_MISSING,
+                        target_table,
+                        target_urn,
+                        reason="存在 fineGrainedLineages，但 data_availability_flag 缺少「字段血缘」",
+                        detail=f"fine_grained_count={len(target_fine_grained)} flags={sorted(target_flags)}",
+                    )
+                )
+
+            covered_target_fields: Set[str] = set()
+            table_upstream_set = set(upstreams)
+            for fine_index, fine_grained in enumerate(target_fine_grained, start=1):
+                fine_grained_edge_count += 1
+                for downstream_value in fine_grained.get("downstreams") or []:
+                    parsed_downstream = _parse_schema_field_urn(downstream_value)
+                    if parsed_downstream is None:
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_INVALID_SCHEMA_FIELD_URN,
+                                target_table,
+                                target_urn,
+                                reason="字段血缘 downstream schemaField URN 格式无效",
+                                detail=f"fine_index={fine_index} downstream={downstream_value}",
+                            )
+                        )
+                        continue
+                    downstream_dataset_urn, downstream_field = parsed_downstream
+                    if downstream_dataset_urn != target_urn:
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_DOWNSTREAM_DATASET_MISMATCH,
+                                target_table,
+                                target_urn,
+                                reason="字段血缘 downstream 不属于当前目标 Dataset",
+                                detail=(
+                                    f"fine_index={fine_index} field={downstream_field} "
+                                    f"downstream_dataset={downstream_dataset_urn}"
+                                ),
+                            )
+                        )
+                        continue
+                    covered_target_fields.add(downstream_field)
+                    if (
+                        schema_fields_by_urn is not None
+                        and downstream_field not in schema_fields.get(target_urn, set())
+                    ):
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_DOWNSTREAM_FIELD_NOT_FOUND,
+                                target_table,
+                                target_urn,
+                                reason="字段血缘目标字段在目标表 schemaMetadata 中不存在",
+                                detail=f"fine_index={fine_index} target_field={downstream_field}",
+                            )
+                        )
+
+                for upstream_value in fine_grained.get("upstreams") or []:
+                    parsed_upstream = _parse_schema_field_urn(upstream_value)
+                    if parsed_upstream is None:
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_INVALID_SCHEMA_FIELD_URN,
+                                target_table,
+                                target_urn,
+                                reason="字段血缘 upstream schemaField URN 格式无效",
+                                detail=f"fine_index={fine_index} upstream={upstream_value}",
+                            )
+                        )
+                        continue
+                    source_dataset_urn, source_field = parsed_upstream
+                    source_table = urn_to_table_name(
+                        source_dataset_urn, platform_instance
+                    ).lower()
+                    source_is_current_hive = _is_hive_dataset_urn(
+                        source_dataset_urn, platform_instance, env
+                    )
+                    if source_dataset_urn == target_urn:
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_SELF_DEPENDENCY,
+                                target_table,
+                                target_urn,
+                                upstream_table=source_table,
+                                upstream_urn=source_dataset_urn,
+                                reason="字段血缘源字段属于目标表自身",
+                                detail=f"fine_index={fine_index} source_field={source_field}",
+                            )
+                        )
+                    if not source_is_current_hive:
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_SOURCE_NOT_HIVE_PLATFORM,
+                                target_table,
+                                target_urn,
+                                upstream_table=source_table,
+                                upstream_urn=source_dataset_urn,
+                                reason="字段血缘源 Dataset 不是当前 Hive platform instance/env",
+                                detail=f"fine_index={fine_index} source_field={source_field}",
+                            )
+                        )
+                    elif (
+                        check_datahub_entity_existence
+                        and source_dataset_urn not in normalized_dataset_urns
+                    ):
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_SOURCE_DATASET_NOT_FOUND,
+                                target_table,
+                                target_urn,
+                                upstream_table=source_table,
+                                upstream_urn=source_dataset_urn,
+                                reason="字段血缘源 Dataset 在 DataHub 中不存在或已软删除",
+                                detail=f"fine_index={fine_index} source_field={source_field}",
+                            )
+                        )
+                    if source_dataset_urn not in table_upstream_set:
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_SOURCE_NOT_TABLE_UPSTREAM,
+                                target_table,
+                                target_urn,
+                                upstream_table=source_table,
+                                upstream_urn=source_dataset_urn,
+                                reason="字段血缘源表不属于目标表当前表级 upstreamLineage",
+                                detail=f"fine_index={fine_index} source_field={source_field}",
+                            )
+                        )
+                    if (
+                        schema_fields_by_urn is not None
+                        and source_dataset_urn in normalized_dataset_urns
+                        and source_field not in schema_fields.get(source_dataset_urn, set())
+                    ):
+                        issues.append(
+                            _field_lineage_issue(
+                                ISSUE_FIELD_LINEAGE_SOURCE_FIELD_NOT_FOUND,
+                                target_table,
+                                target_urn,
+                                upstream_table=source_table,
+                                upstream_urn=source_dataset_urn,
+                                reason="字段血缘源字段在源表 schemaMetadata 中不存在",
+                                detail=f"fine_index={fine_index} source_field={source_field}",
+                            )
+                        )
+
+            if schema_fields_by_urn is not None and target_fine_grained:
+                expected_fields = schema_fields.get(target_urn, set()) - schema_partition_fields.get(
+                    target_urn, set()
+                )
+                missing_fields = sorted(expected_fields - covered_target_fields)
+                if missing_fields:
+                    issues.append(
+                        _field_lineage_issue(
+                            ISSUE_FIELD_LINEAGE_TARGET_COVERAGE_INCOMPLETE,
+                            target_table,
+                            target_urn,
+                            reason="目标表非分区字段未被 fineGrainedLineages 完整覆盖",
+                            detail=(
+                                f"covered={len(covered_target_fields & expected_fields)}/"
+                                f"{len(expected_fields)} missing={missing_fields[:50]}"
+                            ),
+                        )
+                    )
 
         if target_is_view and not upstreams:
             issues.append(
@@ -674,6 +962,8 @@ def evaluate_lineage_quality(
         "scanned_dataset_count": len(normalized_dataset_urns),
         "lineage_target_count": len(upstreams_by_target),
         "upstream_edge_count": upstream_edge_count,
+        "field_lineage_scanned_dataset_count": len(field_lineage_scope),
+        "fine_grained_lineage_count": fine_grained_edge_count,
         "issue_count": len(issues),
         "issue_counts_by_type": dict(sorted(issue_counts.items())),
         "issue_counts_by_severity": dict(sorted(severity_counts.items())),
@@ -683,6 +973,11 @@ def evaluate_lineage_quality(
         "availability_flag_check_complete": data_availability_flags_by_urn is not None,
         "view_definition_check_complete": view_logic_by_urn is not None,
         "schema_metadata_check_complete": schema_field_count_by_urn is not None,
+        "field_lineage_check_complete": (
+            fine_grained_lineages_by_target is not None
+            and schema_fields_by_urn is not None
+            and data_availability_flags_by_urn is not None
+        ),
         "view_dataset_count": len(normalized_views),
         "dataset_with_etl_script_count": len(normalized_etl),
         "dataset_with_documentation_count": len(documentation),
@@ -866,6 +1161,76 @@ def fetch_schema_field_counts_from_mysql(platform_instance: str, env: str) -> Di
     return out
 
 
+def fetch_schema_fields_from_mysql(
+    platform_instance: str,
+    env: str,
+) -> tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    """Read schema and partition field names for field-lineage validation."""
+    sql = (
+        "select urn, metadata "
+        "from metadata_aspect_v2 "
+        "where aspect='schemaMetadata' "
+        "and version=0 "
+        "and urn like 'urn:li:dataset:(urn:li:dataPlatform:hive,"
+        f"{platform_instance}.%,{env})'"
+    )
+    fields_by_urn: Dict[str, Set[str]] = {}
+    partitions_by_urn: Dict[str, Set[str]] = {}
+    for urn, metadata in _parse_tab_rows(_run_mysql_query(sql), 2):
+        try:
+            payload = json.loads(metadata)
+        except json.JSONDecodeError:
+            continue
+        fields_by_urn[urn] = set(extract_schema_field_names(payload))
+        partition_fields = set(extract_schema_partition_field_names(payload))
+        if partition_fields:
+            partitions_by_urn[urn] = partition_fields
+    return fields_by_urn, partitions_by_urn
+
+
+def fetch_lineage_facts_from_mysql(
+    platform_instance: str,
+    env: str,
+) -> tuple[Dict[str, List[str]], Dict[str, List[Dict[str, Any]]]]:
+    """Read table upstreams and fine-grained lineage in one MySQL query."""
+    sql = (
+        "select urn, metadata "
+        "from metadata_aspect_v2 "
+        "where aspect='upstreamLineage' "
+        "and version=0 "
+        "and urn like 'urn:li:dataset:(urn:li:dataPlatform:hive,"
+        f"{platform_instance}.%,{env})'"
+    )
+    upstreams_by_target: Dict[str, List[str]] = {}
+    fine_grained_by_target: Dict[str, List[Dict[str, Any]]] = {}
+    for urn, metadata in _parse_tab_rows(_run_mysql_query(sql), 2):
+        aspect = _metadata_aspect(metadata)
+        upstreams = aspect.get("upstreams")
+        if isinstance(upstreams, list):
+            upstream_urns = [
+                item["dataset"]
+                for item in upstreams
+                if isinstance(item, dict) and isinstance(item.get("dataset"), str)
+            ]
+            if upstream_urns:
+                upstreams_by_target[urn] = upstream_urns
+        fine_grained = aspect.get("fineGrainedLineages")
+        if not isinstance(fine_grained, list):
+            continue
+        valid_entries = [item for item in fine_grained if isinstance(item, dict)]
+        if valid_entries:
+            fine_grained_by_target[urn] = valid_entries
+    return upstreams_by_target, fine_grained_by_target
+
+
+def fetch_fine_grained_lineages_from_mysql(
+    platform_instance: str,
+    env: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Read non-empty fineGrainedLineages from current upstreamLineage aspects."""
+    return fetch_lineage_facts_from_mysql(platform_instance, env)[1]
+
+
 def _make_graph(gms_url: str, token: Optional[str]) -> Any:
     try:
         from datahub.ingestion.graph.client import DataHubGraph, DatahubClientConfig
@@ -1027,7 +1392,29 @@ def run(
     )
     print(f"[INFO] DataHub dataset 数量: {len(dataset_urns)}")
 
-    upstreams_by_target = fetch_upstreams_by_target(graph, dataset_urns)
+    fine_grained_lineages_by_target: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    try:
+        mysql_upstreams, mysql_fine_grained = fetch_lineage_facts_from_mysql(
+            platform_instance,
+            env,
+        )
+        upstreams_by_target = {
+            urn: upstreams
+            for urn, upstreams in mysql_upstreams.items()
+            if urn in dataset_urns
+        }
+        fine_grained_lineages_by_target = {
+            urn: entries
+            for urn, entries in mysql_fine_grained.items()
+            if urn in dataset_urns
+        }
+        print("[INFO] upstreamLineage 读取方式: MySQL 批量读取")
+    except Exception as exc:
+        print(
+            f"[WARN] MySQL 批量读取 upstreamLineage 失败，回退 GMS 逐表读取: {exc}",
+            file=sys.stderr,
+        )
+        upstreams_by_target = fetch_upstreams_by_target(graph, dataset_urns)
     edge_count = sum(len(v) for v in upstreams_by_target.values())
     print(f"[INFO] 有表级上游血缘的目标表: {len(upstreams_by_target)} edge_count={edge_count}")
 
@@ -1043,11 +1430,21 @@ def run(
         documentation_by_urn = fetch_documentation_from_mysql(platform_instance, env)
         view_logic_by_urn = fetch_view_logic_from_mysql(platform_instance, env)
         schema_field_count_by_urn = fetch_schema_field_counts_from_mysql(platform_instance, env)
+        schema_fields_by_urn, schema_partition_fields_by_urn = fetch_schema_fields_from_mysql(
+            platform_instance,
+            env,
+        )
+        if fine_grained_lineages_by_target is None:
+            fine_grained_lineages_by_target = fetch_fine_grained_lineages_from_mysql(
+                platform_instance,
+                env,
+            )
         print(
             f"[INFO] MySQL aspect 检查: views={len(view_dataset_urns)} "
             f"datasets_with_etl_script={len(etl_script_dataset_urns)} "
             f"documentation={len(documentation_by_urn)} flags={len(data_availability_flags_by_urn)} "
-            f"view_logic={len(view_logic_by_urn)} schema={len(schema_field_count_by_urn)}"
+            f"view_logic={len(view_logic_by_urn)} schema={len(schema_field_count_by_urn)} "
+            f"fine_grained_targets={len(fine_grained_lineages_by_target)}"
         )
     except Exception as exc:
         print(f"[WARN] MySQL aspect 检查准备失败，跳过增强检查: {exc}", file=sys.stderr)
@@ -1058,6 +1455,9 @@ def run(
         documentation_by_urn = None
         view_logic_by_urn = None
         schema_field_count_by_urn = None
+        schema_fields_by_urn = None
+        schema_partition_fields_by_urn = None
+        fine_grained_lineages_by_target = None
 
     needed_hive_tables = _collect_needed_hive_tables(
         dataset_urns,
@@ -1086,6 +1486,9 @@ def run(
         view_logic_by_urn=view_logic_by_urn,
         schema_field_count_by_urn=schema_field_count_by_urn,
         etl_script_by_urn=etl_script_by_urn,
+        schema_fields_by_urn=schema_fields_by_urn,
+        schema_partition_fields_by_urn=schema_partition_fields_by_urn,
+        fine_grained_lineages_by_target=fine_grained_lineages_by_target,
     )
     write_jsonl(jsonl_path, result)
     write_xlsx(xlsx_path, result)

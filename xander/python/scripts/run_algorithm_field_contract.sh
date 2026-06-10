@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # run_algorithm_field_contract.sh — Jenkins: export A-side algorithm field contract
 #
+# 只读取 DataHub schemaMetadata / upstreamLineage / structuredProperties，
+# 不解析 ETL、不调用 LLM、不写入 DataHub。
+#
 # Jenkins 参数:
 #   TABLE_NAMES  Multi-line String Parameter, one Hive table per line.
 #
@@ -56,7 +59,7 @@ fi
 GMS_URL="${DATAHUB_GMS_URL:-http://localhost:8080}"
 REPORT_WORKSPACE="${WORKSPACE:-$PWD}"
 OUTPUT_DIR="${FIELD_CONTRACT_OUTPUT_DIR:-$REPORT_WORKSPACE/algorithm_field_contract_$(date +%Y%m%d_%H%M%S)}"
-MAX_DEPTH="${FIELD_CONTRACT_MAX_DEPTH:-3}"
+MAX_DEPTH="${FIELD_CONTRACT_MAX_DEPTH:-20}"
 
 EXTRA_ARGS=()
 if [[ -n "${DATAHUB_GMS_TOKEN:-}" ]]; then
@@ -95,6 +98,6 @@ echo "[INFO] algorithm field contract finished at $(date -Iseconds)"
 echo "[INFO] outputs:"
 echo "  $OUTPUT_DIR/field_contract.xlsx"
 echo "  $OUTPUT_DIR/field_lineage.json"
-echo "  $OUTPUT_DIR/runtime_context.json"
 echo "  $OUTPUT_DIR/lineage_report.md"
 echo "  $OUTPUT_DIR/open_questions.md"
+echo "  $OUTPUT_DIR/raw_aspects/"

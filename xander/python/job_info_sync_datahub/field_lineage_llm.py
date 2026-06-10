@@ -73,6 +73,10 @@ FIELD_LINEAGE_SYSTEM_PROMPT = """你是便利店数据仓库的字段级血缘�
 - 如果目标字段来自 CSV、本地文件、手工维护文件、API 拉取等线下或外部来源，且无法映射到底层 Hive 物理字段，不要放入 unresolved_fields；输出一条普通 mapping，source_table 和 source_field 留空，transform_expression 填文件读取/API 取数字段等表达式，transform_explanation 说明线下来源路径、字段或业务含义。
 - unresolved_fields 只用于完全无法判断目标字段来自 Hive 字段、常量还是线下/外部来源的情况。
 - 如果来源字段来自 CTE、子查询、临时表或 SELECT 别名，必须继续向上递归追溯到真实物理 Hive 表字段；不要把 CTE 名、子查询别名或派生字段当作最终来源。
+- **禁止**把 `tmp_*`、`not_verified_*`、`${变量}` 表名写入 source_table。作业内临时表（含 `tmp_mid_*`）只是 ETL 中间步骤，字段血缘必须折叠到最终 SELECT/FROM/JOIN 链上读到的**持久化物理表**（如 ods_*/pdw_*/mid_*/dm_*）。
+- 多语句作业（先 CREATE/INSERT 临时表、再写目标表）时：目标字段若经临时表传递，source_table 必须写临时表**实际读取的物理上游表**，不要写本脚本创建的临时表本身。
+- 若用户消息给出「目标表直接上游」白名单，有物理来源字段时 source_table **只能**从该列表选择；拿不准宁可放入 unresolved_fields，也不要输出 tmp_/CTE 名。
+- `not_verified_<真实表名>` 是校验落表别名，不是字段来源；写入 not_verified 表时，字段来源仍须追溯到真实物理上游，不得把 not_verified 表当作 source_table。
 - 如果一个目标字段表达式依赖多个物理字段（如 case/if/sum/round/concat/coalesce），必须为每个物理来源字段各输出一条 mapping，source_table 和 source_field 都不能为空；不要只填 source_table 后把 source_field 留空。
 - 如果目标字段是 map/struct/json 等复杂类型（例如 `map(...) as extend_map`），复杂类型本身不是 unresolved 的理由；只有无法追到物理来源字段时才放入 unresolved_fields。目标字段仍然是 `extend_map`，对 map value/struct value 中实际参与计算的每个物理来源字段各输出一条 mapping，map key 字符串常量不算来源字段。
 - map/struct/json 的 transform_expression 填完整构造表达式或能覆盖该字段的核心表达式；transform_explanation 说明该字段由哪些来源指标组装成复杂类型。
@@ -187,7 +191,23 @@ def build_field_lineage_user_message(source_input: FieldLineageInput) -> str:
         alias_section = (
             "目标表运行时别名/中间校验表:\n"
             f"{alias_lines}\n\n"
-            "重要：这些别名表的写入要折叠成目标表字段血缘，不要判定为未写入目标表。\n\n"
+            "重要：这些别名表的写入要折叠成目标表字段血缘，不要判定为未写入目标表；"
+            "它们也不能作为 source_table。\n\n"
+        )
+    upstream_section = ""
+    if source_input.allowed_upstream_tables:
+        listed = source_input.allowed_upstream_tables[:120]
+        upstream_lines = "\n".join(f"- {table}" for table in listed)
+        overflow = ""
+        if len(source_input.allowed_upstream_tables) > len(listed):
+            overflow = (
+                f"\n... 另有 {len(source_input.allowed_upstream_tables) - len(listed)} "
+                "张直接上游未列出，但仍须遵守禁止 tmp_/not_verified_ 规则。"
+            )
+        upstream_section = (
+            "目标表直接上游（有物理来源字段时 source_table 优先从此列表选择；"
+            "禁止 tmp_*、not_verified_*、CTE 名、${变量} 表名）:\n"
+            f"{upstream_lines}{overflow}\n\n"
         )
     requested_section = ""
     if source_input.requested_target_fields:
@@ -205,6 +225,7 @@ def build_field_lineage_user_message(source_input: FieldLineageInput) -> str:
         f"{schema_section}"
         f"{partition_section}"
         f"{alias_section}"
+        f"{upstream_section}"
         f"{requested_section}"
         f"执行命令:\n{source_input.execute_shell}\n\n"
         f"ETL 脚本:\n{source_input.etl_script}"
@@ -229,6 +250,7 @@ def build_field_lineage_request_debug_info(
         "execute_shell_chars": len(source_input.execute_shell),
         "target_schema_field_count": len(source_input.target_schema_fields),
         "target_table_alias_count": len(source_input.target_table_aliases),
+        "allowed_upstream_table_count": len(source_input.allowed_upstream_tables),
     }
 
 

@@ -41,6 +41,7 @@ class FieldLineageInput:
     target_partition_fields: List[str] = field(default_factory=list)
     target_table_aliases: List[str] = field(default_factory=list)
     requested_target_fields: List[str] = field(default_factory=list)
+    allowed_upstream_tables: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,15 @@ class FieldLineageCandidate:
     reviewer_notes: str = ""
     import_error: str = ""
     review_status: FieldLineageReviewStatus = FieldLineageReviewStatus.PENDING
+
+
+@dataclass(frozen=True)
+class SourceTableValidation:
+    """Validation result for one candidate source table."""
+
+    source_table: str
+    dataset_exists: bool
+    in_target_upstreams: bool
 
 
 @dataclass(frozen=True)

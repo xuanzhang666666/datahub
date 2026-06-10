@@ -22,10 +22,12 @@ from .field_lineage_datahub_reader import (
     fetch_deprecation,
     fetch_schema_fields_with_partitions,
     fetch_structured_properties,
+    fetch_upstream_table_names,
     has_confirmed_field_lineage,
     is_deprecated_dataset_payload,
     make_hive_dataset_urn,
     missing_field_lineage_source_reason,
+    validate_source_tables,
     write_field_lineage_debug_artifacts,
 )
 from .field_lineage_batch_summary import summarize_review_workbook
@@ -38,9 +40,17 @@ EXIT_NO_APPROVED_ROWS = 4
 EXIT_CONFIRMED_FIELD_LINEAGE = 5
 # 自动导入模式下，Excel 未达到 100% AUTO_APPROVED 且 unresolved_field_count=0
 EXIT_REQUIRES_REVIEW = 6
-from .field_lineage_excel import load_approved_review_rows, write_candidate_workbook
+# --write 时导入行未通过 source_table 二次校验
+EXIT_IMPORT_VALIDATION_FAILED = 7
+from .field_lineage_excel import (
+    fold_ephemeral_source_candidates,
+    load_approved_review_rows,
+    validate_import_candidates,
+    write_candidate_workbook,
+)
 from .field_lineage_llm import call_llm_extract_field_lineage
-from .field_lineage_models import FieldLineageReviewStatus
+from .field_lineage_models import FieldLineageCandidate, FieldLineageReviewStatus
+from .field_lineage_policy import normalize_source_table_name
 from .field_lineage_writer import write_approved_field_lineages
 
 
@@ -114,11 +124,15 @@ def _cmd_export(args: argparse.Namespace) -> int:
         dataset_urn,
         token=args.gms_token,
     )
-    if has_confirmed_field_lineage(payload):
+    if has_confirmed_field_lineage(payload) and not args.force_refresh_field_lineage:
         skip_reason = "Data Availability Flag 已包含「字段血缘」，字段血缘已确认，跳过导出"
         _log(f"SKIP: {skip_reason}")
         print(f"FIELD_LINEAGE_SKIP_REASON={skip_reason}", flush=True)
         return EXIT_SKIP_NO_SOURCE
+    if has_confirmed_field_lineage(payload) and args.force_refresh_field_lineage:
+        _log(
+            "WARN: Data Availability Flag 已包含「字段血缘」，但 --force-refresh-field-lineage 已开启，继续重导出"
+        )
     skip_reason = missing_field_lineage_source_reason(payload)
     if skip_reason:
         _log(f"SKIP: {skip_reason}")
@@ -148,10 +162,20 @@ def _cmd_export(args: argparse.Namespace) -> int:
     target_partition_fields = list(
         dict.fromkeys([*target_partition_fields, *script_partition_fields])
     )
+    upstream_tables = sorted(
+        fetch_upstream_table_names(
+            args.gms_url,
+            dataset_urn,
+            token=args.gms_token,
+            platform_instance=args.platform_instance,
+        )
+    )
+    _log(f"target_direct_upstream_table_count={len(upstream_tables)}")
     source_input = replace(
         source_input,
         target_schema_fields=target_schema_fields,
         target_partition_fields=target_partition_fields,
+        allowed_upstream_tables=upstream_tables,
     )
     debug_dir = args.debug_dir or args.output.with_suffix("").with_name(
         f"{args.output.stem}_debug"
@@ -180,8 +204,55 @@ def _cmd_export(args: argparse.Namespace) -> int:
     )
     _log("LLM returned")
     _log(f"llm_model={model}")
+    folded_mappings = fold_ephemeral_source_candidates(
+        parsed.mappings,
+        set(upstream_tables),
+    )
+    folded_count = sum(
+        1
+        for before, after in zip(parsed.mappings, folded_mappings, strict=True)
+        if before.source_table != after.source_table
+    )
+    ephemeral_blocked = sum(
+        1 for candidate in folded_mappings if "EPHEMERAL_SOURCE_MUST_FOLD" in candidate.import_error
+    )
+    parsed = replace(parsed, mappings=folded_mappings)
     _log(f"candidate_count={len(parsed.mappings)}")
+    _log(f"folded_source_table_count={folded_count}")
+    _log(f"ephemeral_source_blocked_count={ephemeral_blocked}")
     _log(f"unresolved_field_count={len(parsed.unresolved_fields)}")
+    source_tables = {
+        normalize_source_table_name(candidate.source_table)
+        for candidate in parsed.mappings
+        if candidate.source_table.strip()
+    }
+    _log(
+        "validating candidate source tables against DataHub datasets and target upstreamLineage ..."
+    )
+    source_table_validations = validate_source_tables(
+        args.gms_url,
+        dataset_urn,
+        source_tables,
+        token=args.gms_token,
+        platform_instance=args.platform_instance,
+        env=args.env,
+    )
+    invalid_source_tables = [
+        validation
+        for validation in source_table_validations.values()
+        if not validation.dataset_exists or not validation.in_target_upstreams
+    ]
+    _log(
+        f"source_table_validation_count={len(source_table_validations)} "
+        f"invalid_count={len(invalid_source_tables)}"
+    )
+    for validation in invalid_source_tables:
+        _log(
+            "source table validation failed: "
+            f"source={validation.source_table} "
+            f"dataset_exists={validation.dataset_exists} "
+            f"in_target_upstreams={validation.in_target_upstreams}"
+        )
     _log("writing review Excel ...")
     write_candidate_workbook(
         args.output,
@@ -190,6 +261,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         unresolved_fields=parsed.unresolved_fields,
         llm_model=model,
         debug_dir=debug_dir,
+        source_table_validations=source_table_validations,
     )
     _log(f"export finished: {len(parsed.mappings)} candidates -> {args.output}")
     return 0
@@ -250,6 +322,51 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
         )
 
     if args.write:
+        validated_rows: list[FieldLineageCandidate] = []
+        validation_errors: list[str] = []
+        for target_table in sorted({row.target_table for row in approved if row.target_table}):
+            rows = [row for row in approved if row.target_table == target_table]
+            source_tables = {
+                normalize_source_table_name(row.source_table)
+                for row in rows
+                if row.source_table.strip()
+            }
+            dataset_urn = make_hive_dataset_urn(
+                target_table,
+                args.platform_instance,
+                args.env,
+            )
+            source_table_validations = (
+                validate_source_tables(
+                    args.gms_url,
+                    dataset_urn,
+                    source_tables,
+                    token=args.gms_token,
+                    platform_instance=args.platform_instance,
+                    env=args.env,
+                )
+                if source_tables
+                else {}
+            )
+            accepted, errors = validate_import_candidates(rows, source_table_validations)
+            validated_rows.extend(accepted)
+            validation_errors.extend(errors)
+        if validation_errors:
+            _log(
+                "ERROR: import-reviewed 二次校验失败，已阻止写入 DataHub；"
+                f"invalid_rows={len(validation_errors)}"
+            )
+            for error in validation_errors[:50]:
+                _log(error)
+            if len(validation_errors) > 50:
+                _log(f"... 另有 {len(validation_errors) - 50} 条校验错误未展示")
+            return EXIT_IMPORT_VALIDATION_FAILED
+        approved = validated_rows
+        if not approved:
+            _log("ERROR: 二次校验后无可导入行")
+            return EXIT_IMPORT_VALIDATION_FAILED
+
+    if args.write:
         protected_tables = []
         target_tables = sorted({row.target_table for row in approved if row.target_table})
         for target_table in target_tables:
@@ -263,7 +380,7 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
                 dataset_urn,
                 token=args.gms_token,
             )
-            if has_confirmed_field_lineage(payload):
+            if has_confirmed_field_lineage(payload) and not args.force_refresh_field_lineage:
                 protected_tables.append(target_table)
         if protected_tables:
             _log(
@@ -361,6 +478,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=int(os.getenv("FIELD_LINEAGE_PREVIEW_CHARS", "4000")),
         help="兼容旧 Jenkins 参数；ETL 脚本正文不再打印到 console，只保存到 debug artifacts",
     )
+    export.add_argument(
+        "--force-refresh-field-lineage",
+        action="store_true",
+        default=os.getenv("FIELD_LINEAGE_FORCE_REFRESH", "").lower() in {"1", "true", "yes"},
+        help="忽略 Data Availability Flag「字段血缘」保护，强制重导出（用于修复脏数据）",
+    )
     export.set_defaults(func=_cmd_export)
 
     import_reviewed = sub.add_parser(
@@ -398,6 +521,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=os.getenv("FIELD_LINEAGE_REQUIRE_FULL_AUTO_APPROVED", "0").lower()
         in {"1", "true", "yes"},
         help="要求 auto_approved_percent=100%% 且 unresolved_field_count=0，否则跳过等待人工审核",
+    )
+    import_reviewed.add_argument(
+        "--force-refresh-field-lineage",
+        action="store_true",
+        default=os.getenv("FIELD_LINEAGE_FORCE_REFRESH", "").lower() in {"1", "true", "yes"},
+        help="忽略 Data Availability Flag「字段血缘」保护，允许覆盖已有字段血缘",
     )
     import_reviewed.set_defaults(func=_cmd_import_reviewed)
 

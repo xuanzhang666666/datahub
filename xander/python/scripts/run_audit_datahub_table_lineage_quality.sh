@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_audit_datahub_table_lineage_quality.sh — 扫描 DataHub 当前 Hive 表级血缘质量
+# run_audit_datahub_table_lineage_quality.sh — 扫描 DataHub 当前 Hive 表级与字段级血缘质量
 #
 # 部署路径：/data/datahub/scripts/run_audit_datahub_table_lineage_quality.sh
 #
@@ -21,6 +21,8 @@
 # - blf.data.warehouse.etl_script 有有效内容的表，如果表名前缀属于
 #   dwa/dwd/pdim/dim/pdw/mid/dm/dw，则必须有至少一个表级上游血缘
 # - ods/ai/app 前缀表不要求必须有上游血缘
+# - 字段级检查只扫描 fineGrainedLineages 非空，或 data_availability_flag 已标记“字段血缘”的 Dataset
+# - 检查字段源 Dataset、表级上游一致性、schemaField URN、源/目标字段存在性、字段覆盖率和 flag 一致性
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

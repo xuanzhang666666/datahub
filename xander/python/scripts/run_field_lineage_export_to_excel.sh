@@ -19,6 +19,10 @@ fi
 #   $WORKSPACE/field_lineage_debug/{批次号}/{库.表}/
 # 未设置 WORKSPACE 时使用 CLI 默认值：Excel 同目录的 *_debug/
 #   批次号每次运行自动生成 YYYYMMDDHHmm，仅打印在日志中
+# 每条候选字段血缘导出前会校验：
+#   1. source_table 在 DataHub 中存在 schemaMetadata
+#   2. source_table 属于目标表当前 upstreamLineage
+# 校验失败的行写入 import_error、降级为 NEEDS_REVIEW，并记录到 source_validation 工作表。
 #
 # ── 并发与重试 ───────────────────────────────────────────────────────────────
 # FIELD_LINEAGE_CONCURRENCY  并发请求 LLM 数，默认 10
@@ -32,6 +36,7 @@ fi
 #                            自动导入时是否清空已有 fineGrainedLineages，默认 0（合并更新）
 # FIELD_LINEAGE_AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED
 #                            自动导入前是否要求整表 100% AUTO_APPROVED 且无 unresolved，默认 0
+# FIELD_LINEAGE_FORCE_REFRESH  1 时忽略「字段血缘」已确认保护，强制重导出并允许覆盖写入
 #
 # ── 可选 ─────────────────────────────────────────────────────────────────────
 # DATAHUB_GMS_URL / DATAHUB_GMS_TOKEN / LINEAGE_PYTHON / FIELD_LINEAGE_PREVIEW_CHARS / FIELD_LINEAGE_LLM_TIMEOUT_SEC
@@ -73,6 +78,7 @@ RETRY_COUNT="${FIELD_LINEAGE_RETRY_COUNT:-1}"
 AUTO_IMPORT="${FIELD_LINEAGE_AUTO_IMPORT:-1}"
 AUTO_IMPORT_CLEAR_EXISTING="${FIELD_LINEAGE_AUTO_IMPORT_CLEAR_EXISTING:-0}"
 AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED="${FIELD_LINEAGE_AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED:-0}"
+FORCE_REFRESH="${FIELD_LINEAGE_FORCE_REFRESH:-0}"
 
 if ! [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: FIELD_LINEAGE_CONCURRENCY 必须为正整数: $CONCURRENCY" >&2
@@ -111,6 +117,14 @@ case "$AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED" in
   0 | false | FALSE | no | NO) AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED=0 ;;
   *)
     echo "ERROR: FIELD_LINEAGE_AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED 必须为 1/0/true/false: $AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED" >&2
+    exit 2
+    ;;
+esac
+case "$FORCE_REFRESH" in
+  1 | true | TRUE | yes | YES) FORCE_REFRESH=1 ;;
+  0 | false | FALSE | no | NO) FORCE_REFRESH=0 ;;
+  *)
+    echo "ERROR: FIELD_LINEAGE_FORCE_REFRESH 必须为 1/0/true/false: $FORCE_REFRESH" >&2
     exit 2
     ;;
 esac
@@ -296,6 +310,7 @@ echo "[INFO] retry on failure: $RETRY_COUNT"
 echo "[INFO] auto import AUTO_APPROVED: $([[ "$AUTO_IMPORT" -eq 1 ]] && echo yes || echo no)"
 echo "[INFO] auto import mode: $([[ "$AUTO_IMPORT_CLEAR_EXISTING" -eq 1 ]] && echo clear_import || echo merge_update)"
 echo "[INFO] auto import require full auto approved: $([[ "$AUTO_IMPORT_REQUIRE_FULL_AUTO_APPROVED" -eq 1 ]] && echo yes || echo no)"
+echo "[INFO] force refresh field lineage: $([[ "$FORCE_REFRESH" -eq 1 ]] && echo yes || echo no)"
 echo "[INFO] table count: ${#TABLE_LIST[@]}"
 echo "[INFO] tables: ${TABLE_LIST[*]}"
 echo "[INFO] gms url: $DATAHUB_GMS_URL"
@@ -431,6 +446,10 @@ _auto_import_one_table() {
   fi
 
   set +e
+  _import_force_args=()
+  if [[ "$FORCE_REFRESH" -eq 1 ]]; then
+    _import_force_args+=(--force-refresh-field-lineage)
+  fi
   _run_cli \
     import-reviewed \
     --input "$OUTPUT_FILE" \
@@ -440,6 +459,7 @@ _auto_import_one_table() {
     --import-statuses AUTO_APPROVED \
     "$_clear_arg" \
     "$_require_full_arg" \
+    "${_import_force_args[@]}" \
     2>&1 7>&- | tee "$_cli_out"
   _cli_rc=${PIPESTATUS[0]}
   set -e
@@ -516,6 +536,9 @@ _export_one_table() {
       DEBUG_DIR="$DEBUG_ROOT/$BATCH_ID/$TABLE_NAME"
       mkdir -p "$DEBUG_DIR"
       _export_args+=(--debug-dir "$DEBUG_DIR")
+    fi
+    if [[ "$FORCE_REFRESH" -eq 1 ]]; then
+      _export_args+=(--force-refresh-field-lineage)
     fi
     _run_cli "${_export_args[@]}" 2>&1 7>&- | tee "$_cli_out"
     _cli_rc=${PIPESTATUS[0]}
