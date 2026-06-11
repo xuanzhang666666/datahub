@@ -37,6 +37,7 @@ from job_info_sync_datahub.field_lineage_excel import (
     write_candidate_workbook,
 )
 from job_info_sync_datahub.field_lineage_policy import (
+    field_name_in_schema,
     is_ephemeral_source_table,
     normalize_source_field_name,
     normalize_source_table_name,
@@ -104,6 +105,35 @@ def _structured_properties_payload(
             }
         }
     }
+
+
+def _mock_import_schema_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target_fields: set[str] | None = None,
+    source_fields: dict[str, set[str]] | None = None,
+) -> None:
+    resolved_target_fields = target_fields or {
+        "store_id",
+        "store_code",
+        "bad_field",
+        "auto_approved_field",
+    }
+    resolved_source_fields = source_fields or {
+        "default.ods_store_info": {"store_code", "user_id"},
+        "ods.store_info": {"id"},
+    }
+
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.fetch_non_partition_schema_field_set",
+        lambda *args, **kwargs: set(resolved_target_fields),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.build_source_schema_field_sets",
+        lambda *args, **kwargs: {
+            table: set(fields) for table, fields in resolved_source_fields.items()
+        },
+    )
 
 
 def test_make_hive_dataset_urn_uses_blf_defaults() -> None:
@@ -658,6 +688,66 @@ def test_field_lineage_llm_batches_target_fields_with_full_etl(
     assert all("- [TARGET] dt" not in message for message in messages)
 
 
+def test_write_candidate_workbook_auto_approves_when_target_schema_not_loaded(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        output,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_id",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+    )
+
+    wb = load_workbook(output)
+    status = wb["candidate_lineage"].cell(row=2, column=1).value
+    assert status == "AUTO_APPROVED"
+
+
+def test_validate_import_candidates_rejects_target_field_not_in_schema() -> None:
+    accepted, errors = validate_import_candidates(
+        [
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="phantom_field",
+                source_table="ods.store_info",
+                source_field="id",
+                transform_expression="cast(id as bigint)",
+                confidence="HIGH",
+            ),
+        ],
+        {
+            "ods.store_info": SourceTableValidation(
+                source_table="ods.store_info",
+                dataset_exists=True,
+                in_target_upstreams=True,
+            )
+        },
+        target_schema_fields={"store_id"},
+    )
+
+    assert accepted == []
+    assert errors == [
+        "default.dim_store_info.phantom_field: TARGET_FIELD_NOT_IN_SCHEMA: phantom_field"
+    ]
+
+
 def test_write_candidate_workbook_creates_review_sheets(tmp_path: Path) -> None:
     output = tmp_path / "default_dim_store_info_field_lineage.xlsx"
     source = FieldLineageInput(
@@ -719,6 +809,21 @@ def test_field_lineage_system_prompt_documents_tmp_fold_rules() -> None:
         assert fragment in FIELD_LINEAGE_SYSTEM_PROMPT
 
 
+def test_field_name_in_schema_skips_when_schema_unknown() -> None:
+    assert field_name_in_schema("store_id", None) is True
+
+
+def test_field_name_in_schema_rejects_when_schema_empty() -> None:
+    assert field_name_in_schema("store_id", set()) is False
+
+
+def test_field_name_in_schema_accepts_when_field_present() -> None:
+    schema = {"store_id", "store_name"}
+    assert field_name_in_schema("store_id", schema) is True
+    assert field_name_in_schema("STORE_ID", schema) is True
+    assert field_name_in_schema("missing_field", schema) is False
+
+
 def test_is_ephemeral_source_table_detects_tmp_and_not_verified() -> None:
     assert is_ephemeral_source_table("data_md.tmp_czx_exp_stores_order_batch")
     assert is_ephemeral_source_table("default.not_verified_dim_store_info")
@@ -754,6 +859,17 @@ def test_resolve_ephemeral_source_table_folds_five_level_tmp_chain() -> None:
     )
     assert resolved == "default.mid_store_sku_info_bach_v2"
     assert reason == "folded_tmp_chain:5"
+
+
+def test_resolve_ephemeral_source_table_strips_cross_db_tmp_without_upstream_match() -> None:
+    upstreams = {"default.mid_store_sku_info_bach_v2"}
+    resolved, reason = resolve_ephemeral_source_table(
+        "data_md.tmp_czx_exp_stores_order_batch",
+        upstreams,
+    )
+    assert resolved == "data_md.czx_exp_stores_order_batch"
+    assert reason == "folded_tmp_chain:1"
+    assert not is_ephemeral_source_table(resolved)
 
 
 def test_resolve_ephemeral_source_table_unresolved_when_nested_tmp_exceeds_max_hops() -> None:
@@ -813,8 +929,10 @@ def test_fold_ephemeral_source_candidates_rewrites_or_blocks_tmp_sources() -> No
     )
     assert folded[0].source_table == "default.mid_store_sku_info_bach_v2"
     assert "folded_source:" in folded[0].llm_notes
-    assert "EPHEMERAL_SOURCE_MUST_FOLD" in folded[1].import_error
-    assert folded[1].review_status == FieldLineageReviewStatus.NEEDS_REVIEW
+    assert folded[1].source_table == "data_md.czx_exp_stores_order_batch"
+    assert "folded_source:" in folded[1].llm_notes
+    assert "EPHEMERAL_SOURCE_MUST_FOLD" not in folded[1].import_error
+    assert folded[1].review_status == FieldLineageReviewStatus.PENDING
 
 
 def test_build_field_lineage_user_message_includes_allowed_upstreams() -> None:
@@ -2704,6 +2822,13 @@ def test_verify_field_lineage_completeness_marks_data_availability_flag(
         "job_info_sync_datahub.field_lineage_writer._patch_data_availability_flags",
         fake_patch,
     )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.query_upstream_lineage.read_direct_lineage_anomalies",
+        lambda *args, **kwargs: {
+            "table_lineage_anomalies": [],
+            "field_lineage_anomalies": [],
+        },
+    )
 
     dataset_urn = make_hive_dataset_urn("default.dim_store_info")
     result = verify_field_lineage_completeness(
@@ -2730,6 +2855,53 @@ def test_verify_field_lineage_completeness_marks_data_availability_flag(
     assert result["marked_data_availability_flag"] is True
     assert patched["dataset_urn"] == dataset_urn
     assert patched["flags"] == ["DDL", "表血缘", "字段血缘"]
+
+
+def test_verify_field_lineage_completeness_skips_mark_when_lineage_anomalies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer.fetch_schema_fields_with_partitions",
+        lambda *args, **kwargs: (["store_id", "store_name", "dt"], []),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer.fetch_structured_properties",
+        lambda *args, **kwargs: pytest.fail("anomalies should block flag patch"),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_writer._patch_data_availability_flags",
+        lambda *args, **kwargs: pytest.fail("anomalies should block flag patch"),
+    )
+    monkeypatch.setattr(
+        "job_info_sync_datahub.query_upstream_lineage.read_direct_lineage_anomalies",
+        lambda *args, **kwargs: {
+            "table_lineage_anomalies": [],
+            "field_lineage_anomalies": ["字段源Dataset不存在: ods.store_info.id"],
+        },
+    )
+
+    dataset_urn = make_hive_dataset_urn("default.dim_store_info")
+    result = verify_field_lineage_completeness(
+        "http://localhost:8080",
+        "default.dim_store_info",
+        [
+            _FakeFineGrainedLineage(
+                upstreams=["urn:li:schemaField:(source,id)"],
+                downstreams=[f"urn:li:schemaField:({dataset_urn},store_id)"],
+            ),
+            _FakeFineGrainedLineage(
+                upstreams=["urn:li:schemaField:(source,name)"],
+                downstreams=[f"urn:li:schemaField:({dataset_urn},store_name)"],
+            ),
+        ],
+        token="token",
+    )
+
+    assert result["is_complete"] is True
+    assert result["marked_data_availability_flag"] is False
+    assert result["field_lineage_anomalies"] == [
+        "字段源Dataset不存在: ods.store_info.id"
+    ]
 
 
 def test_verify_field_lineage_completeness_does_not_mark_when_missing_field(
@@ -3259,6 +3431,7 @@ def test_import_reviewed_write_skips_invalid_source_on_validation(
             )
         },
     )
+    _mock_import_schema_validation(monkeypatch)
 
     exit_code = field_lineage_cli_main(
         [
@@ -3324,12 +3497,23 @@ def test_import_reviewed_write_skips_invalid_but_keeps_valid_rows(
             )
         },
     )
+    _mock_import_schema_validation(monkeypatch)
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.fetch_structured_properties",
+        lambda *args, **kwargs: _structured_properties_payload(
+            etl_script="select 1",
+            execute_shell="sh run.sh",
+            availability_flags=["DDL", "表血缘"],
+        ),
+    )
     written: list[str] = []
+    def fake_write(gms_url: str, approved: list[FieldLineageCandidate], **kwargs: object) -> dict[str, object]:
+        written.extend(sorted({row.target_table for row in approved if row.target_table}))
+        return {"tables": {}}
+
     monkeypatch.setattr(
         "job_info_sync_datahub.field_lineage_cli.write_approved_field_lineages",
-        lambda approved, **kwargs: written.extend(
-            sorted({row.target_table for row in approved if row.target_table})
-        ),
+        fake_write,
     )
 
     exit_code = field_lineage_cli_main(
@@ -3392,6 +3576,7 @@ def test_import_reviewed_write_blocks_confirmed_field_lineage(
             availability_flags=["DDL", "表血缘", "字段血缘"],
         ),
     )
+    _mock_import_schema_validation(monkeypatch)
 
     exit_code = field_lineage_cli_main(
         [
@@ -3456,6 +3641,7 @@ def test_import_reviewed_write_allows_force_refresh_over_confirmed_flag(
         "job_info_sync_datahub.field_lineage_cli.write_approved_field_lineages",
         lambda *args, **kwargs: {"tables": {"default.dim_store_info": {"written": True, "field_count": 1}}},
     )
+    _mock_import_schema_validation(monkeypatch)
 
     exit_code = field_lineage_cli_main(
         [

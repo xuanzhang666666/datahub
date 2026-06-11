@@ -79,6 +79,16 @@ class DataHubClient:
             f"/openapi/v3/entity/dataset/{encoded}/structuredProperties"
         )
 
+    def get_schema_metadata(self, dataset_urn: str) -> dict[str, Any]:
+        """Fetch schemaMetadata for a dataset."""
+        encoded = urllib.parse.quote(dataset_urn, safe="")
+        return self.get_openapi(f"/openapi/v3/entity/dataset/{encoded}/schemaMetadata")
+
+    def get_upstream_lineage(self, dataset_urn: str) -> dict[str, Any]:
+        """Fetch upstreamLineage for a dataset."""
+        encoded = urllib.parse.quote(dataset_urn, safe="")
+        return self.get_openapi(f"/openapi/v3/entity/dataset/{encoded}/upstreamLineage")
+
     def _open_json(self, req: urllib.request.Request) -> dict[str, Any]:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:

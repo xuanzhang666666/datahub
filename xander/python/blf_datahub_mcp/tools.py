@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from .datahub_client import DataHubClient, DataHubClientError
+from .field_lineage import trace_hive_field_lineage
 from .hive import make_datahub_dataset_url, make_hive_dataset_urn, normalize_hive_table
 from .summarizers import (
     STRUCTURED_PROPERTY_DEFINITIONS,
@@ -514,6 +515,66 @@ def get_hive_lineage(
             "evidence": {
                 "interface": "GraphQL searchAcrossLineage",
                 "note": "这是表级血缘，不代表字段级影响面",
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _base(table, public_base_url)
+        except Exception:
+            base = {"table": table}
+        return _error_response(exc, **base)
+
+
+def explain_hive_field_lineage(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    fields: list[str] | None = None,
+    max_depth: int = 30,
+    max_paths: int = 1000,
+    max_transform_chars: int = 1200,
+) -> dict[str, Any]:
+    """Return recursive field-lineage evidence for one Hive table."""
+    try:
+        base = _base(table, public_base_url)
+        summary = trace_hive_field_lineage(
+            client,
+            table=table,
+            fields=fields,
+            max_depth=max_depth,
+            max_paths=max_paths,
+            max_transform_chars=max_transform_chars,
+        )
+        risks = []
+        stop_reasons = summary.get("stop_reasons") or {}
+        if stop_reasons.get("MISSING_FIELD_LINEAGE"):
+            risks.append("部分字段在到达 ods/pdw 前缺少字段级血缘")
+        if stop_reasons.get("DATASET_NOT_FOUND"):
+            risks.append("部分上游表缺少 schemaMetadata 或无法读取")
+        if stop_reasons.get("INVALID_SCHEMA_FIELD_URN"):
+            risks.append("部分字段血缘包含无效 schemaField URN")
+        if stop_reasons.get("CYCLE_DETECTED"):
+            risks.append("字段血缘中检测到循环")
+        if stop_reasons.get("MAX_DEPTH_REACHED"):
+            risks.append("部分字段血缘达到 max_depth 后停止")
+        if summary.get("truncated"):
+            risks.append("字段血缘路径数量超过 max_paths，结果已截断")
+        if summary.get("unconfirmed_tables"):
+            risks.append("部分表缺少 Data Availability Flag: 字段血缘")
+        return {
+            "success": True,
+            **base,
+            "summary": summary,
+            "risks": risks,
+            "evidence": {
+                "interface": "OpenAPI dataset aspects",
+                "aspects": [
+                    "schemaMetadata",
+                    "upstreamLineage",
+                    "structuredProperties",
+                ],
+                "note": "这是字段级血缘递归追溯结果；MCP 仅返回结构化证据，不生成自然语言解释。",
             },
         }
     except Exception as exc:

@@ -15,6 +15,7 @@ from .datahub_client import DataHubClient
 from .hive import DEFAULT_PUBLIC_BASE_URL
 from .tools import (
     audit_hive_table,
+    explain_hive_field_lineage,
     explain_hive_table_context,
     get_hive_data_availability_flag,
     get_hive_etl_script,
@@ -243,6 +244,39 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["table"],
         },
     },
+    "blf_explain_hive_field_lineage": {
+        "description": "递归读取 Hive 表字段级血缘，追溯到表名以 ods_ 或 pdw_ 开头的来源层后停止，并返回结构化证据。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选字段名列表；不传时追踪所有非分区字段。",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "单条字段血缘路径最多向上追溯多少跳，默认 30。",
+                },
+                "max_paths": {
+                    "type": "integer",
+                    "default": 1000,
+                    "description": "最多返回多少条字段血缘路径，默认 1000；超过后结果会截断。",
+                },
+                "max_transform_chars": {
+                    "type": "integer",
+                    "default": 1200,
+                    "description": "每段 transformOperation 最多返回多少字符，超出会截断。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
     "blf_search_hive_assets": {
         "description": "在 DataHub 中搜索 BLF Hive 表，并返回候选表、说明和可用性标记。",
         "inputSchema": {
@@ -336,6 +370,7 @@ class BlfMcpApplication:
             "blf_get_hive_data_availability_flag": get_hive_data_availability_flag,
             "blf_get_hive_other_remark": get_hive_other_remark,
             "blf_get_hive_lineage": get_hive_lineage,
+            "blf_explain_hive_field_lineage": explain_hive_field_lineage,
             "blf_search_hive_assets": search_hive_assets,
             "blf_audit_hive_table": audit_hive_table,
             "blf_explain_hive_table_context": explain_hive_table_context,

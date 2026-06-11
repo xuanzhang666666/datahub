@@ -358,6 +358,19 @@ def _target_schema_field_set(source_input: FieldLineageInput) -> Set[str]:
     }
 
 
+def _target_schema_fields_for_validation(
+    source_input: FieldLineageInput,
+) -> Optional[Set[str]]:
+    """Return schema fields for auto-approval checks, or None when DDL was not loaded.
+
+    ``field_name_in_schema`` treats ``None`` as "schema unknown, skip validation" and an
+    empty ``set`` as "schema loaded but no matching non-partition columns".
+    """
+    if not source_input.target_schema_fields:
+        return None
+    return _target_schema_field_set(source_input)
+
+
 def _is_known_target_field(target_field: str, schema_fields: Set[str]) -> bool:
     if not schema_fields:
         return True
@@ -442,7 +455,7 @@ def write_candidate_workbook(
     ws.append(CANDIDATE_HEADERS)
     schema_fields = _target_schema_field_set(source_input)
     row_schema_kwargs = {
-        "target_schema_fields": schema_fields,
+        "target_schema_fields": _target_schema_fields_for_validation(source_input),
         "source_schema_fields": source_schema_fields,
     }
     emitted_target_fields: Set[str] = set()

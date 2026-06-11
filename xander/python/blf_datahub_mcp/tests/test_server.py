@@ -39,3 +39,4 @@ def test_tools_list_contains_blf_tools() -> None:
     assert "blf_search_hive_assets" in names
     assert "blf_audit_hive_table" in names
     assert "blf_explain_hive_table_context" in names
+    assert "blf_explain_hive_field_lineage" in names
