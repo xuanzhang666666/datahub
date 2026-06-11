@@ -14,6 +14,7 @@ for f in \
   field_lineage_batch_summary.py \
   field_lineage_cli.py \
   field_lineage_llm.py \
+  field_lineage_datahub_reader.py \
   field_lineage_urn_repair.py \
   repair_field_lineage_urns.py
 do

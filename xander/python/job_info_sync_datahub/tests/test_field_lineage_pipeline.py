@@ -925,6 +925,54 @@ def test_write_candidate_workbook_sanitizes_sql_alias_in_source_cells(tmp_path: 
     assert grouped[0].sources == (("default.dim_user_hr", "user_no"),)
 
 
+def test_has_unsafe_source_field_pattern_blocks_struct_and_map_paths() -> None:
+    from job_info_sync_datahub.field_lineage_policy import has_unsafe_source_field_pattern
+
+    assert has_unsafe_source_field_pattern("ordering_spec.qty")
+    assert has_unsafe_source_field_pattern("activity_detail['activity_coupon_id']")
+    assert has_unsafe_source_field_pattern("get_json_object(x, '$.id')")
+    assert not has_unsafe_source_field_pattern("store_code")
+
+
+def test_validate_import_candidates_rejects_missing_source_and_target_fields() -> None:
+    rows = [
+        FieldLineageCandidate(
+            target_table="default.dim_store_info",
+            target_field="store_code",
+            source_table="default.ods_store_info",
+            source_field="missing_column",
+            transform_expression="missing_column",
+            confidence="HIGH",
+        ),
+        FieldLineageCandidate(
+            target_table="default.dim_store_info",
+            target_field="ghost_field",
+            source_table="default.ods_store_info",
+            source_field="store_code",
+            transform_expression="store_code",
+            confidence="HIGH",
+        ),
+    ]
+    validations = {
+        "default.ods_store_info": SourceTableValidation(
+            source_table="default.ods_store_info",
+            dataset_exists=True,
+            in_target_upstreams=True,
+        )
+    }
+    accepted, errors = validate_import_candidates(
+        rows,
+        validations,
+        target_schema_fields={"store_code", "store_name"},
+        source_schema_fields={"default.ods_store_info": {"store_code", "store_name"}},
+    )
+
+    assert accepted == []
+    assert len(errors) == 2
+    assert "SOURCE_FIELD_NOT_IN_SCHEMA" in errors[0]
+    assert "TARGET_FIELD_NOT_IN_SCHEMA" in errors[1]
+
+
 def test_validate_import_candidates_rejects_unsafe_multi_source_field() -> None:
     rows = [
         FieldLineageCandidate(
@@ -3169,7 +3217,7 @@ def test_import_reviewed_write_without_approved_exits_4(tmp_path: Path) -> None:
     assert exit_code == EXIT_NO_APPROVED_ROWS
 
 
-def test_import_reviewed_write_blocks_invalid_source_on_validation(
+def test_import_reviewed_write_skips_invalid_source_on_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3224,6 +3272,79 @@ def test_import_reviewed_write_blocks_invalid_source_on_validation(
     )
 
     assert exit_code == EXIT_IMPORT_VALIDATION_FAILED
+
+
+def test_import_reviewed_write_skips_invalid_but_keeps_valid_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workbook = tmp_path / "review.xlsx"
+    source = FieldLineageInput(
+        dataset_urn=make_hive_dataset_urn("default.dim_store_info"),
+        table_name="default.dim_store_info",
+        etl_script="select 1",
+        execute_shell="sh run.sh",
+    )
+    write_candidate_workbook(
+        workbook,
+        source_input=source,
+        candidates=[
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="store_code",
+                source_table="default.ods_store_info",
+                source_field="store_code",
+                transform_expression="store_code",
+                confidence="HIGH",
+            ),
+            FieldLineageCandidate(
+                target_table="default.dim_store_info",
+                target_field="bad_field",
+                source_table="default.ods_store_info",
+                source_field="t3.user_id, t4.user_id",
+                transform_expression="coalesce(t3.user_id, t4.user_id)",
+                confidence="HIGH",
+            ),
+        ],
+        unresolved_fields=[],
+        llm_model="deepseek-test",
+        source_schema_fields={"default.ods_store_info": {"store_code"}},
+    )
+    wb = load_workbook(workbook)
+    wb["candidate_lineage"]["A2"] = "APPROVED"
+    wb["candidate_lineage"]["A3"] = "APPROVED"
+    wb.save(workbook)
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.validate_source_tables",
+        lambda *args, **kwargs: {
+            "default.ods_store_info": SourceTableValidation(
+                source_table="default.ods_store_info",
+                dataset_exists=True,
+                in_target_upstreams=True,
+            )
+        },
+    )
+    written: list[str] = []
+    monkeypatch.setattr(
+        "job_info_sync_datahub.field_lineage_cli.write_approved_field_lineages",
+        lambda approved, **kwargs: written.extend(
+            sorted({row.target_table for row in approved if row.target_table})
+        ),
+    )
+
+    exit_code = field_lineage_cli_main(
+        [
+            "import-reviewed",
+            "--input",
+            str(workbook),
+            "--write",
+            "--gms-url",
+            "http://localhost:8080",
+        ]
+    )
+
+    assert exit_code == 0
+    assert written == ["default.dim_store_info"]
 
 
 def test_import_reviewed_write_blocks_confirmed_field_lineage(

@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .field_lineage_models import FieldLineageInput, SourceTableValidation
 from .field_lineage_policy import normalize_source_table_name
@@ -376,6 +376,60 @@ def validate_source_tables(
             in_target_upstreams=source_table in target_upstreams,
         )
     return results
+
+
+def fetch_non_partition_schema_field_set(
+    gms_url: str,
+    table_name: str,
+    token: Optional[str] = None,
+    platform_instance: str = "blf-prod-hive",
+    env: str = "PROD",
+) -> Set[str]:
+    """Return lowercase non-partition field names for a Hive table dataset."""
+    from .field_lineage_policy import is_partition_field
+
+    dataset_urn = make_hive_dataset_urn(table_name, platform_instance, env)
+    all_fields, partition_fields = fetch_schema_fields_with_partitions(
+        gms_url,
+        dataset_urn,
+        token=token,
+    )
+    partition_field_set = {
+        field.strip().lower() for field in partition_fields if field.strip()
+    }
+    return {
+        field.strip().lower()
+        for field in all_fields
+        if field.strip()
+        and not is_partition_field(field)
+        and field.strip().lower() not in partition_field_set
+    }
+
+
+def build_source_schema_field_sets(
+    gms_url: str,
+    source_tables: Iterable[str],
+    token: Optional[str] = None,
+    platform_instance: str = "blf-prod-hive",
+    env: str = "PROD",
+) -> Dict[str, Set[str]]:
+    """Fetch non-partition schema columns for each candidate source table."""
+    result: Dict[str, Set[str]] = {}
+    for source_table in sorted(
+        {
+            normalize_source_table_name(table)
+            for table in source_tables
+            if table and table.strip()
+        }
+    ):
+        result[source_table] = fetch_non_partition_schema_field_set(
+            gms_url,
+            source_table,
+            token=token,
+            platform_instance=platform_instance,
+            env=env,
+        )
+    return result
 
 
 def extract_schema_field_names(payload: Dict[str, Any]) -> List[str]:

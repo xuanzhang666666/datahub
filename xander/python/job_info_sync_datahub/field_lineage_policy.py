@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Set, Tuple
+from typing import Optional, Set, Tuple
 
 PARTITION_FIELDS = {"dt", "hr"}
 
@@ -55,8 +55,22 @@ def has_unsafe_source_field_pattern(field_name: str) -> bool:
         return False
     if "," in stripped:
         return True
-    normalized = stripped.lower().strip("`")
+    if "[" in stripped or "]" in stripped or "(" in stripped or ")" in stripped:
+        return True
+    normalized = normalize_source_field_name(stripped)
+    if "." in normalized:
+        return True
     return bool(_FIELD_ALIAS_PREFIX_RE.match(normalized))
+
+
+def field_name_in_schema(field_name: str, schema_fields: Optional[Set[str]]) -> bool:
+    """Return True when *field_name* matches a non-partition column in *schema_fields*."""
+    if schema_fields is None:
+        return True
+    normalized = field_name.strip().lower().strip("`")
+    if not normalized:
+        return False
+    return normalized in schema_fields
 
 
 def normalize_source_table_name(table_name: str) -> str:

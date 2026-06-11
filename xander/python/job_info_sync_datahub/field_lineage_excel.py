@@ -6,7 +6,7 @@ import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -27,6 +27,7 @@ from .field_lineage_constants import (
 )
 from .field_lineage_policy import (
     ephemeral_source_fold_note,
+    field_name_in_schema,
     has_residual_sql_alias_in_source_table,
     has_unsafe_source_field_pattern,
     is_ephemeral_source_table,
@@ -88,7 +89,12 @@ def _style_sheet(ws) -> None:
     ws.freeze_panes = "A2"
 
 
-def _effective_review_status(candidate: FieldLineageCandidate) -> FieldLineageReviewStatus:
+def _effective_review_status(
+    candidate: FieldLineageCandidate,
+    *,
+    target_schema_fields: Optional[Set[str]] = None,
+    source_schema_fields: Optional[Mapping[str, Set[str]]] = None,
+) -> FieldLineageReviewStatus:
     if candidate.import_error.strip():
         return FieldLineageReviewStatus.NEEDS_REVIEW
     if candidate.review_status in {
@@ -102,13 +108,22 @@ def _effective_review_status(candidate: FieldLineageCandidate) -> FieldLineageRe
         FieldLineageReviewStatus.PENDING,
         FieldLineageReviewStatus.AUTO_APPROVED,
     }:
-        if _is_safe_for_auto_approval(candidate):
+        if _is_safe_for_auto_approval(
+            candidate,
+            target_schema_fields=target_schema_fields,
+            source_schema_fields=source_schema_fields,
+        ):
             return FieldLineageReviewStatus.AUTO_APPROVED
         return FieldLineageReviewStatus.NEEDS_REVIEW
     return candidate.review_status
 
 
-def _is_safe_for_auto_approval(candidate: FieldLineageCandidate) -> bool:
+def _is_safe_for_auto_approval(
+    candidate: FieldLineageCandidate,
+    *,
+    target_schema_fields: Optional[Set[str]] = None,
+    source_schema_fields: Optional[Mapping[str, Set[str]]] = None,
+) -> bool:
     required_values = [
         candidate.target_table,
         candidate.target_field,
@@ -138,6 +153,15 @@ def _is_safe_for_auto_approval(candidate: FieldLineageCandidate) -> bool:
         return False
     if has_source_table and is_ephemeral_source_table(candidate.source_table):
         return False
+    if not field_name_in_schema(candidate.target_field, target_schema_fields):
+        return False
+    if has_source_field and source_schema_fields is not None:
+        source_table = normalize_source_table_name(candidate.source_table)
+        if not field_name_in_schema(
+            candidate.source_field,
+            source_schema_fields.get(source_table),
+        ):
+            return False
     if has_source or is_constant:
         return True
     return has_explained_transform(
@@ -146,9 +170,18 @@ def _is_safe_for_auto_approval(candidate: FieldLineageCandidate) -> bool:
     )
 
 
-def _candidate_to_row(candidate: FieldLineageCandidate) -> List[str]:
+def _candidate_to_row(
+    candidate: FieldLineageCandidate,
+    *,
+    target_schema_fields: Optional[Set[str]] = None,
+    source_schema_fields: Optional[Mapping[str, Set[str]]] = None,
+) -> List[str]:
     return [
-        _effective_review_status(candidate).value,
+        _effective_review_status(
+            candidate,
+            target_schema_fields=target_schema_fields,
+            source_schema_fields=source_schema_fields,
+        ).value,
         candidate.target_table,
         candidate.target_field,
         candidate.source_table,
@@ -400,6 +433,7 @@ def write_candidate_workbook(
     llm_model: str,
     debug_dir: Optional[Path] = None,
     source_table_validations: Optional[Dict[str, SourceTableValidation]] = None,
+    source_schema_fields: Optional[Mapping[str, Set[str]]] = None,
 ) -> None:
     """Write reviewable field-lineage candidates to an Excel workbook."""
     wb = Workbook()
@@ -407,6 +441,10 @@ def write_candidate_workbook(
     ws.title = "candidate_lineage"
     ws.append(CANDIDATE_HEADERS)
     schema_fields = _target_schema_field_set(source_input)
+    row_schema_kwargs = {
+        "target_schema_fields": schema_fields,
+        "source_schema_fields": source_schema_fields,
+    }
     emitted_target_fields: Set[str] = set()
     previous_by_target: Dict[Tuple[str, str], FieldLineageCandidate] = {}
     create_like_source_table = _create_like_source_table(source_input)
@@ -421,7 +459,7 @@ def write_candidate_workbook(
             continue
         candidate = _expand_placeholder_transform_text(candidate, previous_by_target)
         emitted_target_fields.add(candidate.target_field.strip().lower())
-        ws.append(_candidate_to_row(candidate))
+        ws.append(_candidate_to_row(candidate, **row_schema_kwargs))
     remaining_unresolved_fields: List[UnresolvedField] = []
     for unresolved in unresolved_fields:
         if _is_target_partition_field(source_input, unresolved.target_field):
@@ -431,7 +469,7 @@ def write_candidate_workbook(
         constant_candidate = _unresolved_constant_candidate(source_input, unresolved)
         if constant_candidate is not None:
             emitted_target_fields.add(unresolved.target_field.strip().lower())
-            ws.append(_candidate_to_row(constant_candidate))
+            ws.append(_candidate_to_row(constant_candidate, **row_schema_kwargs))
             continue
         remaining_unresolved_fields.append(unresolved)
         emitted_target_fields.add(unresolved.target_field.strip().lower())
@@ -451,7 +489,8 @@ def write_candidate_workbook(
                         source_input,
                         create_like_source_table,
                         normalized,
-                    )
+                    ),
+                    **row_schema_kwargs,
                 )
             )
         else:
@@ -577,6 +616,9 @@ def fold_ephemeral_source_candidates(
 def validate_import_candidates(
     candidates: List[FieldLineageCandidate],
     source_table_validations: Dict[str, SourceTableValidation],
+    *,
+    target_schema_fields: Optional[Set[str]] = None,
+    source_schema_fields: Optional[Mapping[str, Set[str]]] = None,
 ) -> Tuple[List[FieldLineageCandidate], List[str]]:
     """Sanitize and reject import rows that are still unsafe or fail source validation."""
     accepted: List[FieldLineageCandidate] = []
@@ -586,6 +628,10 @@ def validate_import_candidates(
         issues: List[str] = []
         has_source_table = bool(sanitized.source_table.strip())
         has_source_field = bool(sanitized.source_field.strip())
+        if is_partition_field(sanitized.target_field):
+            issues.append(f"TARGET_PARTITION_FIELD: {sanitized.target_field}")
+        if not field_name_in_schema(sanitized.target_field, target_schema_fields):
+            issues.append(f"TARGET_FIELD_NOT_IN_SCHEMA: {sanitized.target_field}")
         if has_source_table != has_source_field:
             issues.append("SOURCE_TABLE_FIELD_MISMATCH")
         if has_unsafe_source_field_pattern(sanitized.source_field):
@@ -603,6 +649,15 @@ def validate_import_candidates(
             )
             if validation_error:
                 issues.append(validation_error)
+        if has_source_field and source_schema_fields is not None:
+            source_table = normalize_source_table_name(sanitized.source_table)
+            if not field_name_in_schema(
+                sanitized.source_field,
+                source_schema_fields.get(source_table),
+            ):
+                issues.append(
+                    f"SOURCE_FIELD_NOT_IN_SCHEMA: {source_table}.{sanitized.source_field}"
+                )
         if issues:
             errors.append(
                 f"{sanitized.target_table}.{sanitized.target_field}: {'; '.join(issues)}"

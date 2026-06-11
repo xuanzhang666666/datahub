@@ -17,9 +17,11 @@ if __name__ == "__main__" and __package__ is None:
     __package__ = "job_info_sync_datahub"
 
 from .field_lineage_datahub_reader import (
+    build_source_schema_field_sets,
     extract_field_lineage_input_with_debug,
     extract_target_partition_fields_from_script,
     fetch_deprecation,
+    fetch_non_partition_schema_field_set,
     fetch_schema_fields_with_partitions,
     fetch_structured_properties,
     fetch_upstream_table_names,
@@ -237,6 +239,13 @@ def _cmd_export(args: argparse.Namespace) -> int:
         platform_instance=args.platform_instance,
         env=args.env,
     )
+    source_schema_fields = build_source_schema_field_sets(
+        args.gms_url,
+        source_tables,
+        token=args.gms_token,
+        platform_instance=args.platform_instance,
+        env=args.env,
+    )
     invalid_source_tables = [
         validation
         for validation in source_table_validations.values()
@@ -262,6 +271,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         llm_model=model,
         debug_dir=debug_dir,
         source_table_validations=source_table_validations,
+        source_schema_fields=source_schema_fields,
     )
     _log(f"export finished: {len(parsed.mappings)} candidates -> {args.output}")
     return 0
@@ -348,19 +358,38 @@ def _cmd_import_reviewed(args: argparse.Namespace) -> int:
                 if source_tables
                 else {}
             )
-            accepted, errors = validate_import_candidates(rows, source_table_validations)
+            target_schema_fields = fetch_non_partition_schema_field_set(
+                args.gms_url,
+                target_table,
+                token=args.gms_token,
+                platform_instance=args.platform_instance,
+                env=args.env,
+            )
+            source_schema_fields = build_source_schema_field_sets(
+                args.gms_url,
+                source_tables,
+                token=args.gms_token,
+                platform_instance=args.platform_instance,
+                env=args.env,
+            )
+            accepted, errors = validate_import_candidates(
+                rows,
+                source_table_validations,
+                target_schema_fields=target_schema_fields,
+                source_schema_fields=source_schema_fields,
+            )
             validated_rows.extend(accepted)
             validation_errors.extend(errors)
         if validation_errors:
             _log(
-                "ERROR: import-reviewed 二次校验失败，已阻止写入 DataHub；"
-                f"invalid_rows={len(validation_errors)}"
+                "import-reviewed 二次校验跳过无效行: "
+                f"invalid_rows={len(validation_errors)} "
+                f"accepted_rows={len(validated_rows)}"
             )
             for error in validation_errors[:50]:
                 _log(error)
             if len(validation_errors) > 50:
                 _log(f"... 另有 {len(validation_errors) - 50} 条校验错误未展示")
-            return EXIT_IMPORT_VALIDATION_FAILED
         approved = validated_rows
         if not approved:
             _log("ERROR: 二次校验后无可导入行")

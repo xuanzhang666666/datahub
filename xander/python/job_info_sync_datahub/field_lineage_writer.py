@@ -338,6 +338,17 @@ def verify_field_lineage_completeness(
         result["reason"] = "存在 DDL 非分区字段没有字段血缘"
         return result
 
+    from .query_upstream_lineage import read_direct_lineage_anomalies
+
+    lineage_anomalies = read_direct_lineage_anomalies(gms_url, token, dataset_urn)
+    field_anomalies = lineage_anomalies.get("field_lineage_anomalies") or []
+    if field_anomalies:
+        result["field_lineage_anomalies"] = field_anomalies
+        result["reason"] = (
+            f"存在 {len(field_anomalies)} 条无效上游字段引用，无法确认字段血缘"
+        )
+        return result
+
     payload = fetch_structured_properties(gms_url, dataset_urn, token=token)
     final_flags = sort_data_availability_flags(
         [*extract_data_availability_flags(payload), "字段血缘"]
