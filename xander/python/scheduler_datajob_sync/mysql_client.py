@@ -1,0 +1,117 @@
+"""MySQL reader for scheduler DataJob sync."""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime
+from typing import Callable, Protocol
+
+from .models import SchedulerJobMetadata
+
+
+class CursorLike(Protocol):
+    def execute(self, sql: str, params: tuple[object, ...]) -> None:
+        ...
+
+    def fetchall(self) -> list[dict[str, object]]:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+class ConnectionLike(Protocol):
+    def cursor(self) -> CursorLike:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+ConnectionFactory = Callable[[], ConnectionLike]
+
+_TABLE = "dmp_schedule_job_basic_info"
+DEFAULT_MIN_BATCH_EXEC_TIME = "2026-06-11 20:14:42"
+_COLUMNS = (
+    "id, job_name, job_display_name, job_owner_name, job_proxy_user, "
+    "line_business_code, last_build_start_time, created_time, updated_time, "
+    "content, contacts_name, assigned_node, job_disable, job_priority, "
+    "build_keep_days, build_keep_num, shell_commond, upstream_jobs, "
+    "upstream_jobs_conditions, delay_config, ivr_notify, sms_notify, im_notify, "
+    "job_size, job_count, build_update_time, batch_exec_time"
+)
+_ACTIVE_BATCH_CLAUSE = "batch_exec_time >= %s"
+
+
+def default_connection_factory() -> ConnectionLike:
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖：请先安装 pymysql") from exc
+    return pymysql.connect(
+        host=os.getenv("SCHEDULER_MYSQL_HOST", "127.0.0.1"),
+        port=int(os.getenv("SCHEDULER_MYSQL_PORT", "3306")),
+        user=os.getenv("SCHEDULER_MYSQL_USER", ""),
+        password=os.getenv("SCHEDULER_MYSQL_PASSWORD", ""),
+        database=os.getenv("SCHEDULER_MYSQL_DATABASE", ""),
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+class SchedulerMysqlClient:
+    def __init__(
+        self,
+        connection_factory: ConnectionFactory = default_connection_factory,
+        min_batch_exec_time: str | None = None,
+    ) -> None:
+        self._connection_factory = connection_factory
+        self._min_batch_exec_time = (
+            min_batch_exec_time
+            if min_batch_exec_time is not None
+            else os.getenv("SCHEDULER_MIN_BATCH_EXEC_TIME", DEFAULT_MIN_BATCH_EXEC_TIME)
+        )
+
+    def fetch_job(self, job_display_name: str) -> SchedulerJobMetadata:
+        jobs = self._query(
+            f"SELECT {_COLUMNS} FROM {_TABLE} "
+            f"WHERE {_ACTIVE_BATCH_CLAUSE} AND job_display_name = %s",
+            (self._min_batch_exec_time, job_display_name),
+        )
+        if not jobs:
+            raise RuntimeError(f"未找到调度作业: {job_display_name}")
+        return jobs[0]
+
+    def fetch_jobs_by_prefix(self, prefix: str) -> list[SchedulerJobMetadata]:
+        return self._query(
+            f"SELECT {_COLUMNS} FROM {_TABLE} "
+            f"WHERE {_ACTIVE_BATCH_CLAUSE} AND job_display_name LIKE %s "
+            "ORDER BY job_display_name",
+            (self._min_batch_exec_time, f"{prefix}%"),
+        )
+
+    def fetch_jobs_updated_since(self, since: datetime) -> list[SchedulerJobMetadata]:
+        return self._query(
+            f"SELECT {_COLUMNS} FROM {_TABLE} "
+            f"WHERE {_ACTIVE_BATCH_CLAUSE} "
+            "AND (updated_time >= %s OR batch_exec_time >= %s) "
+            "ORDER BY updated_time, job_display_name",
+            (self._min_batch_exec_time, since, since),
+        )
+
+    def _query(
+        self,
+        sql: str,
+        params: tuple[object, ...],
+    ) -> list[SchedulerJobMetadata]:
+        conn = self._connection_factory()
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, params)
+            return [
+                SchedulerJobMetadata.from_mysql_row(row)
+                for row in cur.fetchall()
+            ]
+        finally:
+            cur.close()
+            conn.close()
