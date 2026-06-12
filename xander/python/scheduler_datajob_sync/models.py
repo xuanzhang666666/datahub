@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Mapping
 
+from .job_dependency_parser import parse_job_dependencies_from_content
 from .trigger_parser import TRIGGER_JOB_DEPENDENCY, TRIGGER_TIMER, parse_job_triggers
 
 
@@ -163,13 +164,35 @@ class SchedulerJobMetadata:
     @classmethod
     def from_mysql_row(cls, row: Mapping[str, object]) -> "SchedulerJobMetadata":
         content = decode_maybe_base64(_string_value(row, "content"))
-        upstream_jobs = parse_upstream_jobs(row.get("upstream_jobs"))
-        upstream_jobs_conditions = _string_value(row, "upstream_jobs_conditions")
+        mysql_upstream_jobs = parse_upstream_jobs(row.get("upstream_jobs"))
+        mysql_upstream_jobs_conditions = _string_value(row, "upstream_jobs_conditions")
         parsed_trigger = parse_job_triggers(content)
-        job_dependencies, mismatch_count = pair_job_dependencies(
-            upstream_jobs,
-            upstream_jobs_conditions,
-        )
+
+        xml_dependencies = parse_job_dependencies_from_content(content)
+        if xml_dependencies is not None:
+            job_dependencies = [
+                SchedulerJobDependency(
+                    upstream_job_display_name=dependency.upstream_job_display_name,
+                    condition=dependency.condition,
+                    status=dependency.status,
+                )
+                for dependency in xml_dependencies
+            ]
+            upstream_jobs = [
+                dependency.upstream_job_display_name for dependency in xml_dependencies
+            ]
+            upstream_jobs_conditions = ",".join(
+                dependency.condition for dependency in xml_dependencies
+            )
+            mismatch_count = 0
+        else:
+            upstream_jobs = mysql_upstream_jobs
+            upstream_jobs_conditions = mysql_upstream_jobs_conditions
+            job_dependencies, mismatch_count = pair_job_dependencies(
+                upstream_jobs,
+                upstream_jobs_conditions,
+            )
+
         trigger_types = _resolve_trigger_types(
             parsed_trigger.trigger_types,
             upstream_jobs,
