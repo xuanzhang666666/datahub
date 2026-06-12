@@ -13,6 +13,23 @@ URN_DATA_AVAILABILITY_FLAG = (
 )
 URN_OTHER_REMARK = "urn:li:structuredProperty:blf.data.warehouse.other_remark"
 
+# DataJob (scheduler) structured property URNs
+URN_JOB_EXECUTE_SHELL = "urn:li:structuredProperty:blf.data.schedule.job_execute_shell"
+URN_JOB_CONTENT_XML = "urn:li:structuredProperty:blf.data.schedule.job_content_xml"
+
+JOB_STRUCTURED_PROPERTY_DEFINITIONS: dict[str, dict[str, Any]] = {
+    "job_execute_shell": {
+        "urn": URN_JOB_EXECUTE_SHELL,
+        "display_name": "Job Execute Shell",
+        "strip_code_fence": True,
+    },
+    "job_content_xml": {
+        "urn": URN_JOB_CONTENT_XML,
+        "display_name": "Job Content XML",
+        "strip_code_fence": False,
+    },
+}
+
 DATA_AVAILABILITY_FLAG_ORDER = ("DDL", "表血缘", "字段血缘")
 STRUCTURED_PROPERTY_DEFINITIONS: dict[str, dict[str, Any]] = {
     "etl_script": {
@@ -213,6 +230,84 @@ def _structured_properties_by_urn(payload: dict[str, Any]) -> dict[str, list[str
                     values.append(value)
         by_urn[property_urn] = values
     return by_urn
+
+
+def extract_datajob_info(datajob_info_aspect: dict[str, Any]) -> dict[str, Any]:
+    """Extract key fields from a dataJobInfo aspect value."""
+    custom_props: dict[str, str] = {}
+    for kv in datajob_info_aspect.get("customProperties", []):
+        if isinstance(kv, dict):
+            key = kv.get("key") or ""
+            value = kv.get("value") or ""
+            if key:
+                custom_props[key] = value
+    return {
+        "name": datajob_info_aspect.get("name") or "",
+        "type": datajob_info_aspect.get("type") or "",
+        "description": datajob_info_aspect.get("description") or "",
+        "customProperties": custom_props,
+    }
+
+
+def extract_datajob_dependencies(datajob_io_aspect: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract upstream DataJob edges from a dataJobInputOutput aspect value."""
+    edges = datajob_io_aspect.get("inputDatajobEdges") or []
+    result = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        dest_urn = edge.get("destinationUrn") or ""
+        # Extract job_display_name from DataJob URN (last segment before closing paren)
+        upstream_job = ""
+        if dest_urn.startswith("urn:li:dataJob:"):
+            try:
+                # URN format: urn:li:dataJob:(urn:li:dataFlow:(...),job_display_name)
+                inner = dest_urn[len("urn:li:dataJob:("):-1]
+                # Find last comma after the flow URN's closing paren
+                flow_end = inner.index(")") + 1
+                upstream_job = inner[flow_end + 1:]
+            except (ValueError, IndexError):
+                upstream_job = dest_urn
+        props: dict[str, str] = {}
+        for kv in edge.get("properties", []) or []:
+            if isinstance(kv, dict):
+                k = kv.get("key") or ""
+                v = kv.get("value") or ""
+                if k:
+                    props[k] = v
+        result.append(
+            {
+                "upstream_job": upstream_job,
+                "urn": dest_urn,
+                "condition": props.get("blf_schedule_dependency_condition", ""),
+                "status": props.get("blf_schedule_dependency_status", ""),
+            }
+        )
+    return result
+
+
+def extract_datajob_structured_properties(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extract known BLF DataJob structured properties into a compact dict."""
+    by_urn = _structured_properties_by_urn(payload)
+    result: dict[str, dict[str, Any]] = {}
+    for name, definition in JOB_STRUCTURED_PROPERTY_DEFINITIONS.items():
+        urn = str(definition["urn"])
+        raw_values = by_urn.get(urn, [])
+        values = [
+            strip_markdown_code_fence(value)
+            if definition.get("strip_code_fence")
+            else value.strip()
+            for value in raw_values
+        ]
+        result[name] = {
+            "property_name": name,
+            "property_urn": urn,
+            "display_name": definition["display_name"],
+            "values": values,
+            "first_value": values[0] if values else "",
+            "exists": bool(values),
+        }
+    return result
 
 
 def extract_table_refs(text: str, limit: int = 30) -> list[str]:

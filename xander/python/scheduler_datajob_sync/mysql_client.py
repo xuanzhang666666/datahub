@@ -41,6 +41,9 @@ _COLUMNS = (
     "job_size, job_count, build_update_time, batch_exec_time"
 )
 _ACTIVE_BATCH_CLAUSE = "batch_exec_time >= %s"
+_ACTIVITY_TIME_CLAUSE = (
+    "(last_build_start_time >= %s OR build_update_time >= %s)"
+)
 
 
 def default_connection_factory() -> ConnectionLike:
@@ -96,6 +99,14 @@ class SchedulerMysqlClient:
             f"WHERE {_ACTIVE_BATCH_CLAUSE} "
             "AND (updated_time >= %s OR batch_exec_time >= %s) "
             "ORDER BY updated_time, job_display_name",
+            (self._min_batch_exec_time, since, since),
+        )
+
+    def fetch_jobs_activity_since(self, since: datetime) -> list[SchedulerJobMetadata]:
+        return self._query(
+            f"SELECT {_COLUMNS} FROM {_TABLE} "
+            f"WHERE {_ACTIVE_BATCH_CLAUSE} AND {_ACTIVITY_TIME_CLAUSE} "
+            "ORDER BY batch_exec_time DESC, job_display_name",
             (self._min_batch_exec_time, since, since),
         )
 

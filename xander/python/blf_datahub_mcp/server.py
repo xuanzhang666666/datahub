@@ -17,6 +17,7 @@ from .tools import (
     audit_hive_table,
     explain_hive_field_lineage,
     explain_hive_table_context,
+    explain_schedule_job_context,
     get_hive_data_availability_flag,
     get_hive_etl_script,
     get_hive_etl_context,
@@ -27,7 +28,12 @@ from .tools import (
     get_hive_structured_properties,
     get_hive_structured_property,
     get_hive_table_profile,
+    get_schedule_job_content_xml,
+    get_schedule_job_execute_shell,
+    get_schedule_job_lineage,
+    get_schedule_job_profile,
     search_hive_assets,
+    search_schedule_jobs,
 )
 
 logger = logging.getLogger("blf_datahub_mcp")
@@ -326,6 +332,120 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["table"],
         },
     },
+    "blf_get_schedule_job_profile": {
+        "description": "从 DataHub 读取 BLF 调度作业元数据，包括负责人、业务线、触发方式、Cron 计划、上游依赖列表等。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {
+                    "type": "string",
+                    "description": "调度作业名称（job_display_name），即调度系统中显示的作业名。",
+                },
+                "include_shell": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "是否在 profile 中附带 execute_shell 内容（截断至 3000 字符）。",
+                },
+            },
+            "required": ["job_display_name"],
+        },
+    },
+    "blf_get_schedule_job_execute_shell": {
+        "description": "读取 BLF 调度作业的 Execute Shell 命令全文（存储在 DataHub 结构化属性 job_execute_shell 中）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {
+                    "type": "string",
+                    "description": "调度作业名称（job_display_name）。",
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "Shell 内容最多返回的字符数，超出会截断并标记 omitted_chars。",
+                },
+            },
+            "required": ["job_display_name"],
+        },
+    },
+    "blf_get_schedule_job_content_xml": {
+        "description": "读取 BLF 调度作业的 Jenkins Job XML 配置全文（存储在 DataHub 结构化属性 job_content_xml 中）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {
+                    "type": "string",
+                    "description": "调度作业名称（job_display_name）。",
+                },
+                "max_value_chars": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "XML 内容最多返回的字符数，超出会截断并标记 omitted_chars。",
+                },
+            },
+            "required": ["job_display_name"],
+        },
+    },
+    "blf_get_schedule_job_lineage": {
+        "description": "查询 BLF 调度作业在 DataHub 中的上下游 DataJob 依赖关系（调度 DAG）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {
+                    "type": "string",
+                    "description": "调度作业名称（job_display_name）。",
+                },
+                "direction": {
+                    "type": "string",
+                    "description": "依赖方向：upstream 查上游，downstream 查下游，both 同时查上下游。",
+                    "enum": ["upstream", "downstream", "both"],
+                    "default": "both",
+                },
+                "max_hops": {
+                    "type": "integer",
+                    "default": 1,
+                    "description": "最大血缘跳数。",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "default": 500,
+                    "description": "每个方向最多返回的实体数量。",
+                },
+            },
+            "required": ["job_display_name"],
+        },
+    },
+    "blf_search_schedule_jobs": {
+        "description": "在 DataHub 中按关键词搜索 BLF 调度作业，返回作业名称、负责人、触发方式等摘要。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键词，可以是作业名称片段或业务关键词。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "最多返回多少个候选作业，上限 200。",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    "blf_explain_schedule_job_context": {
+        "description": "综合读取 BLF 调度作业的画像、执行 Shell 和调度 DAG 依赖，供 AI Agent 解释作业逻辑。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {
+                    "type": "string",
+                    "description": "调度作业名称（job_display_name）。",
+                }
+            },
+            "required": ["job_display_name"],
+        },
+    },
 }
 
 
@@ -374,6 +494,12 @@ class BlfMcpApplication:
             "blf_search_hive_assets": search_hive_assets,
             "blf_audit_hive_table": audit_hive_table,
             "blf_explain_hive_table_context": explain_hive_table_context,
+            "blf_get_schedule_job_profile": get_schedule_job_profile,
+            "blf_get_schedule_job_execute_shell": get_schedule_job_execute_shell,
+            "blf_get_schedule_job_content_xml": get_schedule_job_content_xml,
+            "blf_get_schedule_job_lineage": get_schedule_job_lineage,
+            "blf_search_schedule_jobs": search_schedule_jobs,
+            "blf_explain_schedule_job_context": explain_schedule_job_context,
         }
 
     def authorized(self, header_value: str | None) -> bool:

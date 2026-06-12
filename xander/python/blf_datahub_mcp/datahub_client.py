@@ -89,6 +89,23 @@ class DataHubClient:
         encoded = urllib.parse.quote(dataset_urn, safe="")
         return self.get_openapi(f"/openapi/v3/entity/dataset/{encoded}/upstreamLineage")
 
+    def get_datajob_aspects(
+        self,
+        datajob_urn: str,
+        aspects: list[str],
+    ) -> dict[str, Any]:
+        """Fetch selected DataJob aspects using OpenAPI."""
+        encoded = urllib.parse.quote(datajob_urn, safe="")
+        aspect_query = urllib.parse.urlencode({"aspects": ",".join(aspects)})
+        return self.get_openapi(f"/openapi/v3/entity/dataJob/{encoded}?{aspect_query}")
+
+    def get_datajob_structured_properties(self, datajob_urn: str) -> dict[str, Any]:
+        """Fetch structuredProperties for a DataJob."""
+        encoded = urllib.parse.quote(datajob_urn, safe="")
+        return self.get_openapi(
+            f"/openapi/v3/entity/dataJob/{encoded}/structuredProperties"
+        )
+
     def _open_json(self, req: urllib.request.Request) -> dict[str, Any]:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:

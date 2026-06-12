@@ -23,6 +23,10 @@ class FakeReader:
         self.calls.append(("updated_since", since))
         return [SchedulerJobMetadata(job_display_name="updated_job")]
 
+    def fetch_jobs_activity_since(self, since: datetime) -> list[SchedulerJobMetadata]:
+        self.calls.append(("activity_since", since))
+        return [SchedulerJobMetadata(job_display_name="active_job")]
+
 
 class FakeWriter:
     def __init__(self) -> None:
@@ -59,6 +63,21 @@ def test_run_sync_fetches_prefix_jobs_and_writes_each() -> None:
     assert writer.written == ["PDW_A", "PDW_B"]
     assert result.total == 2
     assert result.succeeded == 2
+
+
+def test_run_sync_fetches_incremental_jobs_by_activity_since() -> None:
+    reader = FakeReader()
+    writer = FakeWriter()
+
+    result = run_sync(
+        ["--activity-since", "2026-06-12T08:00:00"],
+        reader=reader,
+        writer=writer,
+    )
+
+    assert reader.calls == [("activity_since", datetime(2026, 6, 12, 8, 0, 0))]
+    assert writer.written == ["active_job"]
+    assert result.total == 1
 
 
 def test_run_sync_fetches_incremental_jobs_by_updated_since() -> None:

@@ -7,10 +7,14 @@ from typing import Any, Literal
 from .datahub_client import DataHubClient, DataHubClientError
 from .field_lineage import trace_hive_field_lineage
 from .hive import make_datahub_dataset_url, make_hive_dataset_urn, normalize_hive_table
+from .schedule import job_base, make_datahub_datajob_url
 from .summarizers import (
     STRUCTURED_PROPERTY_DEFINITIONS,
     aspect_value,
     extract_all_structured_properties,
+    extract_datajob_dependencies,
+    extract_datajob_info,
+    extract_datajob_structured_properties,
     extract_structured_properties,
     extract_table_refs,
     governance_gaps,
@@ -98,6 +102,29 @@ query SearchHiveDatasets($input: SearchAcrossEntitiesInput!) {
   }
 }
 """
+
+SCHEDULE_JOB_SEARCH_QUERY = """
+query SearchScheduleJobs($input: SearchAcrossEntitiesInput!) {
+  searchAcrossEntities(input: $input) {
+    total
+    searchResults {
+      entity {
+        urn
+        type
+        ... on DataJob {
+          properties {
+            name
+            description
+            customProperties { key value }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+DATAJOB_PROFILE_ASPECTS = ["dataJobInfo", "dataJobInputOutput"]
 
 
 def _base(table: str, public_base_url: str) -> dict[str, str]:
@@ -766,6 +793,326 @@ def explain_hive_table_context(
                 "blf_get_hive_table_profile",
                 "blf_get_hive_etl_context",
                 "blf_get_hive_lineage",
+            ]
+        },
+    }
+
+
+def get_schedule_job_profile(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    job_display_name: str,
+    include_shell: bool = False,
+) -> dict[str, Any]:
+    """Return a compact DataHub profile for one BLF scheduler DataJob."""
+    try:
+        base = job_base(job_display_name, public_base_url)
+        aspects = client.get_datajob_aspects(
+            base["datajob_urn"], DATAJOB_PROFILE_ASPECTS
+        )
+        sp_payload = client.get_datajob_structured_properties(base["datajob_urn"])
+        job_info = extract_datajob_info(aspect_value(aspects, "dataJobInfo"))
+        dependencies = extract_datajob_dependencies(
+            aspect_value(aspects, "dataJobInputOutput")
+        )
+        sp = extract_datajob_structured_properties(sp_payload)
+        custom = job_info["customProperties"]
+        risks = []
+        if not custom.get("job_owner_name"):
+            risks.append("缺少 job_owner_name")
+        if custom.get("job_disable") == "true":
+            risks.append("调度作业已禁用 (job_disable=true)")
+        summary: dict[str, Any] = {
+            "name": job_info["name"],
+            "description": job_info["description"],
+            "trigger_type": custom.get("trigger_type", ""),
+            "cron_schedule": custom.get("cron_schedule", ""),
+            "time_hour_param": custom.get("time_hour_param", ""),
+            "job_owner_name": custom.get("job_owner_name", ""),
+            "job_proxy_user": custom.get("job_proxy_user", ""),
+            "line_business_code": custom.get("line_business_code", ""),
+            "contacts_name": custom.get("contacts_name", ""),
+            "assigned_node": custom.get("assigned_node", ""),
+            "job_disable": custom.get("job_disable", ""),
+            "job_priority": custom.get("job_priority", ""),
+            "last_build_start_time": custom.get("last_build_start_time", ""),
+            "dependency_count": len(dependencies),
+            "dependencies": dependencies,
+            "has_execute_shell": sp["job_execute_shell"]["exists"],
+            "has_content_xml": sp["job_content_xml"]["exists"],
+        }
+        if include_shell:
+            summary["execute_shell"] = truncate_text(
+                sp["job_execute_shell"]["first_value"], 3000
+            )
+        return {
+            "success": True,
+            **base,
+            "summary": summary,
+            "risks": risks,
+            "evidence": {
+                "interface": "OpenAPI dataJob aspects",
+                "aspects": DATAJOB_PROFILE_ASPECTS,
+            },
+        }
+    except Exception as exc:
+        try:
+            base = job_base(job_display_name, public_base_url)
+        except Exception:
+            base = {"job_display_name": job_display_name}
+        return _error_response(exc, **base)
+
+
+def get_schedule_job_execute_shell(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    job_display_name: str,
+    max_value_chars: int = 8000,
+) -> dict[str, Any]:
+    """Return the job_execute_shell structured property for a scheduler job."""
+    try:
+        base = job_base(job_display_name, public_base_url)
+        sp_payload = client.get_datajob_structured_properties(base["datajob_urn"])
+        sp = extract_datajob_structured_properties(sp_payload)
+        prop = sp["job_execute_shell"]
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "property_name": "job_execute_shell",
+                "property_urn": prop["property_urn"],
+                "exists": prop["exists"],
+                "first_value": truncate_text(prop["first_value"], max_value_chars),
+            },
+            "risks": []
+            if prop["exists"]
+            else ["缺少 Job Execute Shell structured property"],
+            "evidence": {
+                "interface": "OpenAPI dataJob structuredProperties",
+                "property_urn": prop["property_urn"],
+            },
+        }
+    except Exception as exc:
+        try:
+            base = job_base(job_display_name, public_base_url)
+        except Exception:
+            base = {"job_display_name": job_display_name}
+        return _error_response(exc, **base)
+
+
+def get_schedule_job_content_xml(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    job_display_name: str,
+    max_value_chars: int = 8000,
+) -> dict[str, Any]:
+    """Return the job_content_xml structured property for a scheduler job."""
+    try:
+        base = job_base(job_display_name, public_base_url)
+        sp_payload = client.get_datajob_structured_properties(base["datajob_urn"])
+        sp = extract_datajob_structured_properties(sp_payload)
+        prop = sp["job_content_xml"]
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "property_name": "job_content_xml",
+                "property_urn": prop["property_urn"],
+                "exists": prop["exists"],
+                "first_value": truncate_text(prop["first_value"], max_value_chars),
+            },
+            "risks": []
+            if prop["exists"]
+            else ["缺少 Job Content XML structured property"],
+            "evidence": {
+                "interface": "OpenAPI dataJob structuredProperties",
+                "property_urn": prop["property_urn"],
+            },
+        }
+    except Exception as exc:
+        try:
+            base = job_base(job_display_name, public_base_url)
+        except Exception:
+            base = {"job_display_name": job_display_name}
+        return _error_response(exc, **base)
+
+
+def get_schedule_job_lineage(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    job_display_name: str,
+    direction: Literal["upstream", "downstream", "both"] = "both",
+    max_hops: int = 1,
+    max_results: int = 500,
+) -> dict[str, Any]:
+    """Return DataHub lineage (scheduling DAG) for one BLF scheduler DataJob."""
+    try:
+        base = job_base(job_display_name, public_base_url)
+        if direction not in {"upstream", "downstream", "both"}:
+            raise ValueError("direction must be upstream, downstream, or both")
+        max_hops = max(int(max_hops), 1)
+        max_results = max(int(max_results), 1)
+        result: dict[str, Any] = {}
+        totals: dict[str, int] = {}
+        for label, gql_direction in _lineage_directions(direction):
+            payload = _fetch_lineage(
+                client,
+                base["datajob_urn"],
+                gql_direction,
+                max_hops,
+                max_results,
+            )
+            entries = _summarize_lineage_results(payload, public_base_url)
+            result[label] = entries
+            totals[label] = int(payload.get("total") or 0)
+        has_any = any(totals.values())
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "direction": direction,
+                "max_hops": max_hops,
+                "max_results": max_results,
+                "totals": totals,
+                "lineage": result,
+            },
+            "risks": [] if has_any else ["DataHub 调度 DAG 血缘为空或未摄入"],
+            "evidence": {
+                "interface": "GraphQL searchAcrossLineage",
+                "note": "展示调度 DAG 中的 DataJob 上下游连接",
+            },
+        }
+    except Exception as exc:
+        try:
+            base = job_base(job_display_name, public_base_url)
+        except Exception:
+            base = {"job_display_name": job_display_name}
+        return _error_response(exc, **base)
+
+
+def search_schedule_jobs(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    query: str,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Search BLF scheduler jobs in DataHub by keyword."""
+    try:
+        limit = min(max(int(limit), 1), 200)
+        variables = {
+            "input": {
+                "query": query,
+                "start": 0,
+                "count": limit,
+                "types": ["DATA_JOB"],
+                "orFilters": [
+                    {
+                        "and": [
+                            {
+                                "field": "orchestrator",
+                                "condition": "EQUAL",
+                                "values": ["blf-schedule"],
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+        data = client.graphql(SCHEDULE_JOB_SEARCH_QUERY, variables)
+        response = data.get("searchAcrossEntities") or {}
+        candidates = []
+        for item in response.get("searchResults") or []:
+            entity = item.get("entity") or {}
+            urn = entity.get("urn") or ""
+            props = entity.get("properties") or {}
+            name = props.get("name") or entity.get("name") or ""
+            custom_props: dict[str, str] = {}
+            for kv in props.get("customProperties") or []:
+                if isinstance(kv, dict) and kv.get("key"):
+                    custom_props[kv["key"]] = kv.get("value") or ""
+            job_display_name = custom_props.get("job_display_name") or name
+            candidates.append(
+                {
+                    "urn": urn,
+                    "job_display_name": job_display_name,
+                    "name": name,
+                    "description": truncate_text(props.get("description") or "", 300),
+                    "trigger_type": custom_props.get("trigger_type", ""),
+                    "job_owner_name": custom_props.get("job_owner_name", ""),
+                    "datahub_url": make_datahub_datajob_url(urn, public_base_url)
+                    if urn
+                    else "",
+                }
+            )
+        return {
+            "success": True,
+            "query": query,
+            "summary": {
+                "total": response.get("total"),
+                "returned": len(candidates),
+                "candidates": candidates,
+            },
+            "risks": []
+            if candidates
+            else ["未找到匹配的调度作业，请检查 job_display_name 是否正确"],
+            "evidence": {"interface": "GraphQL searchAcrossEntities"},
+        }
+    except Exception as exc:
+        return _error_response(exc, query=query)
+
+
+def explain_schedule_job_context(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    job_display_name: str,
+) -> dict[str, Any]:
+    """Return one compact context bundle for a scheduler job (profile + lineage + shell)."""
+    profile = get_schedule_job_profile(
+        client,
+        public_base_url=public_base_url,
+        job_display_name=job_display_name,
+        include_shell=False,
+    )
+    shell = get_schedule_job_execute_shell(
+        client,
+        public_base_url=public_base_url,
+        job_display_name=job_display_name,
+        max_value_chars=4000,
+    )
+    lineage = get_schedule_job_lineage(
+        client,
+        public_base_url=public_base_url,
+        job_display_name=job_display_name,
+        direction="both",
+        max_hops=1,
+        max_results=100,
+    )
+    if not profile.get("success"):
+        return profile
+    risks = []
+    for payload in (profile, shell, lineage):
+        risks.extend(payload.get("risks") or [])
+    base = job_base(job_display_name, public_base_url)
+    return {
+        "success": True,
+        **base,
+        "summary": {
+            "profile": profile.get("summary"),
+            "execute_shell": shell.get("summary") if shell.get("success") else None,
+            "lineage": lineage.get("summary") if lineage.get("success") else None,
+        },
+        "risks": sorted(set(risks)),
+        "evidence": {
+            "tools": [
+                "blf_get_schedule_job_profile",
+                "blf_get_schedule_job_execute_shell",
+                "blf_get_schedule_job_lineage",
             ]
         },
     }

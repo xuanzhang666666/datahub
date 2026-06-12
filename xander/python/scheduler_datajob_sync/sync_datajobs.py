@@ -26,6 +26,13 @@ def _parser() -> argparse.ArgumentParser:
     source.add_argument("--job", help="Single scheduler job_display_name to sync.")
     source.add_argument("--prefix", help="Sync scheduler jobs whose display name starts with prefix.")
     source.add_argument("--updated-since", help="Sync jobs updated since ISO timestamp.")
+    source.add_argument(
+        "--activity-since",
+        help=(
+            "Sync jobs with recent activity since ISO timestamp "
+            "(last_build_start_time, build_update_time)."
+        ),
+    )
     parser.add_argument(
         "--lineage-only",
         action="store_true",
@@ -39,6 +46,9 @@ def _load_jobs(args: argparse.Namespace, reader: SchedulerMysqlClient) -> list[S
         return [reader.fetch_job(args.job)]
     if args.prefix:
         return reader.fetch_jobs_by_prefix(args.prefix)
+    if args.activity_since:
+        since = datetime.fromisoformat(args.activity_since)
+        return reader.fetch_jobs_activity_since(since)
     since = datetime.fromisoformat(args.updated_since)
     return reader.fetch_jobs_updated_since(since)
 
