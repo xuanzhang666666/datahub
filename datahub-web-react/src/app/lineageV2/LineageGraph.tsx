@@ -31,7 +31,7 @@ export default function LineageGraph({ isFullscreen }: Props) {
     const lineageUrn = (!onIndividualSiblingPage && entityData?.lineageUrn) || urn;
     const props = { urn: lineageUrn, type: entityType };
     const explorer =
-        lineageGraphV3 || entityType === EntityType.DataFlow ? (
+        lineageGraphV3 || entityType === EntityType.DataFlow || entityType === EntityType.DataJob ? (
             <LineageExplorerV3 {...props} />
         ) : (
             <LineageExplorerV2 {...props} />

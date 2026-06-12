@@ -32,6 +32,8 @@ import {
     parseEdgeId,
     setDefault,
 } from '@app/lineageV3/common';
+import { getSchedulerJobDependencyCondition } from '@app/lineageV3/utils/schedulerJobDependencyEdge';
+import { FetchedEntityV2 } from '@app/lineageV3/types';
 import { LINEAGE_ARROW_MARKER } from '@app/lineageV3/lineageSVGs';
 
 import { EntityType, LineageDirection } from '@types';
@@ -135,6 +137,8 @@ export default class NodeBuilder {
 
     nodeInformation: Record<string, NodeInformation> = {};
 
+    entityByUrn = new Map<string, FetchedEntityV2 | undefined>();
+
     // Note: Relies on the fact that transformation node id == urn
     transformationChildren = new Map<string, Set<string>>();
 
@@ -166,11 +170,15 @@ export default class NodeBuilder {
                 direction: node.direction,
                 inCycle: node.inCycle,
             };
+            if (node.urn) {
+                this.entityByUrn.set(node.urn, node.entity);
+            }
             this.#getNodeList(node).push(node);
             this.topologicalNodes.push(node);
         });
         roots.forEach((node) => {
             this.nodeInformation[node.urn] = { urn: node.urn, type: node.type, y: 0 };
+            this.entityByUrn.set(node.urn, node.entity);
         });
     }
 
@@ -278,7 +286,11 @@ export default class NodeBuilder {
                 }
 
                 const originalId = createEdgeId(upstream, downstream);
-                const edgeData = { ...edge, originalId };
+                const dependencyCondition = getSchedulerJobDependencyCondition(
+                    this.entityByUrn.get(downstream),
+                    upstream,
+                );
+                const edgeData = { ...edge, originalId, dependencyCondition };
                 if (edge.via) {
                     this.#addEdge(baseEdges, upstream, edge.via, edgeData);
                     this.#addEdge(baseEdges, edge.via, downstream, edgeData);

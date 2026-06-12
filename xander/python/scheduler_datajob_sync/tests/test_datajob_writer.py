@@ -4,6 +4,8 @@ from datetime import datetime
 from datahub.metadata.schema_classes import DataJobInfoClass, DataJobInputOutputClass
 
 from scheduler_datajob_sync.datajob_writer import (
+    EDGE_PROP_CONDITION,
+    EDGE_PROP_STATUS,
     URN_JOB_CONTENT_XML,
     URN_JOB_EXECUTE_SHELL,
     SchedulerDataJobWriter,
@@ -84,10 +86,17 @@ def test_build_datajob_input_output_maps_upstream_jobs_to_input_edges() -> None:
     aspect = build_datajob_input_output(_metadata())
 
     assert isinstance(aspect, DataJobInputOutputClass)
-    assert aspect.inputDatajobs == [
-        make_scheduler_datajob_urn("Upstream_A"),
-        make_scheduler_datajob_urn("Upstream_B"),
-    ]
+    assert aspect.inputDatajobs == []
+    assert len(aspect.inputDatajobEdges) == 2
+    assert aspect.inputDatajobEdges[0].destinationUrn == make_scheduler_datajob_urn(
+        "Upstream_A"
+    )
+    assert aspect.inputDatajobEdges[0].properties[EDGE_PROP_CONDITION] == "d=@$"
+    assert aspect.inputDatajobEdges[0].properties[EDGE_PROP_STATUS] == "SUCCESS"
+    assert aspect.inputDatajobEdges[1].destinationUrn == make_scheduler_datajob_urn(
+        "Upstream_B"
+    )
+    assert aspect.inputDatajobEdges[1].properties[EDGE_PROP_CONDITION] == "h=1"
 
 
 def test_build_datajob_input_output_skips_edges_for_timer_jobs() -> None:
@@ -102,6 +111,7 @@ def test_build_datajob_input_output_skips_edges_for_timer_jobs() -> None:
     aspect = build_datajob_input_output(metadata)
 
     assert aspect.inputDatajobs == []
+    assert aspect.inputDatajobEdges == []
 
 
 def test_serialize_job_dependencies_preserves_case_sensitive_names() -> None:

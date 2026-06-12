@@ -3,6 +3,7 @@ import { useDebounce } from 'react-use';
 import { EdgeLabelRenderer, EdgeProps, getSmoothStepPath } from 'reactflow';
 import styled from 'styled-components';
 
+import LineageEdgeConditionLabel from '@app/lineageV3/LineageEdge/LineageEdgeConditionLabel';
 import { DataJobInputOutputEdgeData, LINEAGE_NODE_HEIGHT, LineageDisplayContext } from '@app/lineageV3/common';
 
 import { LineageDirection } from '@types';
@@ -42,11 +43,12 @@ export function DataJobInputOutputEdge({
     markerStart,
     markerEnd,
 }: EdgeProps<DataJobInputOutputEdgeData>) {
-    const { isInInterior, isToDataFlow, direction, isManual, originalId } = data || {
+    const { isInInterior, isToDataFlow, direction, isManual, originalId, dependencyCondition } = data || {
         isInInterior: false,
         isToDataFlow: false,
         isManual: false,
         originalId: '',
+        dependencyCondition: undefined,
     };
 
     const { selectedColumn, highlightedEdges } = useContext(LineageDisplayContext);
@@ -111,8 +113,9 @@ export function DataJobInputOutputEdge({
             />
             <InteractionPath d={edgePathB} fill="none" className="react-flow__edge-interaction" />
             <EdgeLabelRenderer>
-                {/* TODO: Add edge details to show edge information (on hover) */}
-                <EdgeDetails labelX={debouncedLabelPosition.labelX} labelY={debouncedLabelPosition.labelY} />
+                <EdgeDetails labelX={debouncedLabelPosition.labelX} labelY={debouncedLabelPosition.labelY}>
+                    <LineageEdgeConditionLabel label={dependencyCondition} />
+                </EdgeDetails>
             </EdgeLabelRenderer>
         </>
     );

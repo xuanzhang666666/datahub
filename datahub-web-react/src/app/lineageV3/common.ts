@@ -211,6 +211,7 @@ export interface LineageEdge {
 export interface LineageTableEdgeData extends LineageEdge {
     originalId: string; // For edges to via nodes, stores table->table edge id. Otherwise, identical to edge id.
     hide?: boolean;
+    dependencyCondition?: string;
 }
 
 export interface DataJobInputOutputEdgeData extends LineageTableEdgeData {

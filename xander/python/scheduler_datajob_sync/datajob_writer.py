@@ -14,7 +14,11 @@ from typing import Callable, Protocol
 from datahub.emitter.mce_builder import make_data_job_urn
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.emitter.rest_emitter import DatahubRestEmitter
-from datahub.metadata.schema_classes import DataJobInfoClass, DataJobInputOutputClass
+from datahub.metadata.schema_classes import (
+    DataJobInfoClass,
+    DataJobInputOutputClass,
+    EdgeClass,
+)
 
 from .models import SchedulerJobDependency, SchedulerJobMetadata
 from .trigger_parser import TRIGGER_TIMER
@@ -26,6 +30,8 @@ JOB_TYPE = "BLF_SCHEDULE_JOB"
 SCHEDULE_URL_TEMPLATE = "https://schedule.corp.bianlifeng.com/job/{job}"
 URN_JOB_CONTENT_XML = "urn:li:structuredProperty:blf.data.schedule.job_content_xml"
 URN_JOB_EXECUTE_SHELL = "urn:li:structuredProperty:blf.data.schedule.job_execute_shell"
+EDGE_PROP_CONDITION = "blf_schedule_dependency_condition"
+EDGE_PROP_STATUS = "blf_schedule_dependency_status"
 
 
 @dataclass(frozen=True)
@@ -229,17 +235,29 @@ StructuredPropertiesPatcher = Callable[
 ]
 
 
+def build_input_datajob_edge(dep: SchedulerJobDependency) -> EdgeClass:
+    properties: dict[str, str] = {}
+    if dep.condition:
+        properties[EDGE_PROP_CONDITION] = dep.condition
+    if dep.status:
+        properties[EDGE_PROP_STATUS] = dep.status
+    return EdgeClass(
+        destinationUrn=make_scheduler_datajob_urn(dep.upstream_job_display_name),
+        properties=properties or None,
+    )
+
+
 def build_datajob_input_output(
     metadata: SchedulerJobMetadata,
 ) -> DataJobInputOutputClass:
-    input_datajobs: list[str] = []
+    input_datajob_edges: list[EdgeClass] = []
     if metadata.writes_job_lineage_edges():
-        input_datajobs = [
-            make_scheduler_datajob_urn(dep.upstream_job_display_name)
-            for dep in metadata.job_dependencies
+        input_datajob_edges = [
+            build_input_datajob_edge(dep) for dep in metadata.job_dependencies
         ]
     return DataJobInputOutputClass(
-        inputDatajobs=input_datajobs,
+        inputDatajobs=[],
+        inputDatajobEdges=input_datajob_edges,
         inputDatasets=[],
         outputDatasets=[],
     )

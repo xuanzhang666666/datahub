@@ -19,10 +19,12 @@ def test_verify_jobs_reports_resolved_and_missing_edges() -> None:
     def _fetch(urn: str) -> dict[str, object]:
         assert urn == downstream_urn
         return {
-            "aspects": {
-                "dataJobInputOutput": {
-                    "value": {"inputDatajobs": [upstream_ok_urn]},
-                }
+            "dataJobInputOutput": {
+                "value": {
+                    "inputDatajobEdges": [
+                        {"destinationUrn": upstream_ok_urn},
+                    ],
+                },
             }
         }
 

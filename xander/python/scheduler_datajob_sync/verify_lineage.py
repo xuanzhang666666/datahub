@@ -60,16 +60,30 @@ def fetch_datajob_aspects(
     return payload
 
 
-def _input_datajobs(payload: dict[str, object]) -> list[str]:
-    aspects = payload.get("aspects")
-    if not isinstance(aspects, dict):
-        return []
-    aspect = aspects.get("dataJobInputOutput")
+def _aspect_value(payload: dict[str, object], aspect_name: str) -> dict[str, object]:
+    aspect = payload.get(aspect_name)
     if not isinstance(aspect, dict):
-        return []
+        nested = payload.get("aspects")
+        if isinstance(nested, dict):
+            aspect = nested.get(aspect_name)
+    if not isinstance(aspect, dict):
+        return {}
     value = aspect.get("value")
-    if not isinstance(value, dict):
-        return []
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _input_datajob_urns(payload: dict[str, object]) -> list[str]:
+    value = _aspect_value(payload, "dataJobInputOutput")
+    edges = value.get("inputDatajobEdges")
+    if isinstance(edges, list) and edges:
+        urns: list[str] = []
+        for edge in edges:
+            if isinstance(edge, dict) and edge.get("destinationUrn"):
+                urns.append(str(edge["destinationUrn"]))
+        if urns:
+            return urns
     raw = value.get("inputDatajobs")
     if not isinstance(raw, list):
         return []
@@ -98,7 +112,7 @@ def verify_jobs(
             continue
         report.jobs_with_expected_edges += 1
         payload = fetcher(make_scheduler_datajob_urn(job.job_display_name))
-        actual = set(_input_datajobs(payload))
+        actual = set(_input_datajob_urns(payload))
         resolved = [urn for urn in expected if urn in actual]
         missing = [urn for urn in expected if urn not in actual]
         report.resolved_edges += len(resolved)

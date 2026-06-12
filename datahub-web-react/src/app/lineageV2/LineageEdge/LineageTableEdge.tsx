@@ -3,6 +3,7 @@ import { useDebounce } from 'react-use';
 import { EdgeLabelRenderer, EdgeProps, getBezierPath } from 'reactflow';
 import styled from 'styled-components';
 
+import LineageEdgeConditionLabel from '@app/lineageV3/LineageEdge/LineageEdgeConditionLabel';
 import { LineageDisplayContext, LineageTableEdgeData } from '@app/lineageV2/common';
 
 export const LINEAGE_TABLE_EDGE_NAME = 'table-table';
@@ -36,7 +37,11 @@ export function LineageTableEdge({
     markerStart,
     markerEnd,
 }: EdgeProps<LineageTableEdgeData>) {
-    const { isManual, originalId } = data || { isManual: false, originalId: '' };
+    const { isManual, originalId, dependencyCondition } = data || {
+        isManual: false,
+        originalId: '',
+        dependencyCondition: undefined,
+    };
 
     const { selectedColumn, highlightedEdges } = useContext(LineageDisplayContext);
 
@@ -72,8 +77,9 @@ export function LineageTableEdge({
             />
             <InteractionPath d={edgePath} fill="none" className="react-flow__edge-interaction" />
             <EdgeLabelRenderer>
-                {/* TODO: Add edge details to show edge information (on hover) */}
-                <EdgeDetails labelX={debouncedLabelPosition.labelX} labelY={debouncedLabelPosition.labelY} />
+                <EdgeDetails labelX={debouncedLabelPosition.labelX} labelY={debouncedLabelPosition.labelY}>
+                    <LineageEdgeConditionLabel label={dependencyCondition} />
+                </EdgeDetails>
             </EdgeLabelRenderer>
         </>
     );

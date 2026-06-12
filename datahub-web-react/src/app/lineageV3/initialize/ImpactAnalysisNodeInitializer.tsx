@@ -1,6 +1,7 @@
 import React, { useContext, useEffect } from 'react';
 import { ReactFlowProvider } from 'reactflow';
 
+import { useEntityData } from '@app/entity/shared/EntityContext';
 import { useGetLineageTimeParams } from '@app/lineage/utils/useGetLineageTimeParams';
 import LineageDisplay from '@app/lineageV3/LineageDisplay';
 import {
@@ -11,6 +12,8 @@ import {
     useIgnoreSchemaFieldStatus,
 } from '@app/lineageV3/common';
 import useSearchAcrossLineage from '@app/lineageV3/queries/useSearchAcrossLineage';
+import { useAppConfig } from '@app/useAppConfig';
+import { useEntityRegistryV2 } from '@app/useEntityRegistry';
 
 import { EntityType, LineageDirection } from '@types';
 
@@ -35,6 +38,9 @@ export default function ImpactAnalysisNodeInitializer(props: Props) {
  */
 function useInitializeNodes(urn: string, type: EntityType): boolean {
     const context = useContext(LineageNodesContext);
+    const { entityType, entityData, urn: profileUrn } = useEntityData();
+    const entityRegistry = useEntityRegistryV2();
+    const flags = useAppConfig().config.featureFlags;
 
     const { startTimeMillis, endTimeMillis } = useGetLineageTimeParams();
     const { nodes, adjacencyList, edges, setNodeVersion, setDisplayVersion, showGhostEntities } = context;
@@ -49,7 +55,36 @@ function useInitializeNodes(urn: string, type: EntityType): boolean {
         nodes.set(urn, makeInitialNode(urn, type));
         setNodeVersion(0);
         setDisplayVersion([0, []]);
-    }, [urn, type, startTimeMillis, endTimeMillis, nodes, adjacencyList, edges, setNodeVersion, setDisplayVersion]);
+    }, [
+        urn,
+        type,
+        startTimeMillis,
+        endTimeMillis,
+        nodes,
+        adjacencyList,
+        edges,
+        setNodeVersion,
+        setDisplayVersion,
+    ]);
+
+    useEffect(() => {
+        if (profileUrn !== urn || !entityData || entityType !== type) {
+            return;
+        }
+        const node = nodes.get(urn);
+        if (!node || node.entity) {
+            return;
+        }
+        const config = entityRegistry.getLineageVizConfigV2(entityType, entityData, flags);
+        if (!config) {
+            return;
+        }
+        node.entity = {
+            ...config,
+            lineageAssets: entityRegistry.getLineageAssets(entityType, entityData),
+        };
+        setNodeVersion((version) => version + 1);
+    }, [profileUrn, urn, entityData, entityType, entityRegistry, flags, nodes, setNodeVersion]);
 
     useEffect(() => {
         // Reset edges if showGhostEntities changes. Not necessary if on schema field page and ignoring status
