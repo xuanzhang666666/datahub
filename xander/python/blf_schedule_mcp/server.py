@@ -1,0 +1,261 @@
+"""HTTP MCP server for BLF Jenkins schedule tools."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import secrets
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable
+
+from .jenkins_client import JenkinsClient
+from .tools import (
+    diagnose_schedule_job_failure,
+    get_schedule_job_build_history,
+    get_schedule_job_build_log,
+    get_schedule_job_build_status,
+    get_schedule_job_last_failure,
+)
+
+logger = logging.getLogger("blf_schedule_mcp")
+
+JSON = dict[str, Any]
+ToolHandler = Callable[..., JSON]
+
+TOOL_SPECS: dict[str, dict[str, Any]] = {
+    "blf_get_schedule_job_build_status": {
+        "description": "查询 BLF 调度作业最近或指定构建的执行状态（成功/失败/运行中）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "调度作业名称（Jenkins job 名称）。"},
+                "build_ref": {
+                    "type": ["string", "integer"],
+                    "default": "lastBuild",
+                    "description": "构建引用：lastBuild、lastFailedBuild、lastSuccessfulBuild 或构建号。",
+                },
+            },
+            "required": ["job_display_name"],
+        },
+    },
+    "blf_get_schedule_job_build_history": {
+        "description": "查询 BLF 调度作业最近 N 次构建历史，含成功率统计；最多返回 50 条以避免 Jenkins 压力过大。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "调度作业名称（Jenkins job 名称）。"},
+                "limit": {"type": "integer", "default": 10, "description": "最近构建数量，最大 50。"},
+            },
+            "required": ["job_display_name"],
+        },
+    },
+    "blf_get_schedule_job_build_log": {
+        "description": "读取 BLF 调度作业某次构建的 console 日志；服务端强制限流截断，最多读取 64KB、返回 12000 字符。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "调度作业名称（Jenkins job 名称）。"},
+                "build_ref": {"type": ["string", "integer"], "default": "lastBuild", "description": "构建引用或构建号。"},
+                "max_chars": {"type": "integer", "default": 8000, "description": "返回日志字符数，上限 12000。"},
+            },
+            "required": ["job_display_name"],
+        },
+    },
+    "blf_get_schedule_job_last_failure": {
+        "description": "读取 BLF 调度作业上次失败构建的日志并自动提取错误行；服务端强制限制日志大小。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "调度作业名称（Jenkins job 名称）。"},
+                "error_lines_limit": {"type": "integer", "default": 50, "description": "最多返回多少条错误行，上限 100。"},
+                "log_max_chars": {"type": "integer", "default": 6000, "description": "返回日志字符数，上限 12000。"},
+            },
+            "required": ["job_display_name"],
+        },
+    },
+    "blf_diagnose_schedule_job_failure": {
+        "description": "综合诊断调度作业失败原因（最近构建历史 + 上次失败日志 + 错误摘要），限制请求次数和日志大小以保护 Jenkins。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "调度作业名称（Jenkins job 名称）。"},
+                "history_limit": {"type": "integer", "default": 5, "description": "最近构建数量，上限 20。"},
+                "log_max_chars": {"type": "integer", "default": 8000, "description": "返回日志字符数，上限 12000。"},
+            },
+            "required": ["job_display_name"],
+        },
+    },
+}
+
+
+def load_env_file(path: str) -> None:
+    if not path or not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as env_file:
+        for line in env_file:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[len("export ") :]
+            key, value = stripped.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'").strip('"'))
+
+
+class BlfScheduleMcpApplication:
+    def __init__(self, *, jenkins_client: JenkinsClient, mcp_token: str | None) -> None:
+        self.jenkins_client = jenkins_client
+        self.mcp_token = mcp_token
+        self.handlers: dict[str, ToolHandler] = {
+            "blf_get_schedule_job_build_status": get_schedule_job_build_status,
+            "blf_get_schedule_job_build_history": get_schedule_job_build_history,
+            "blf_get_schedule_job_build_log": get_schedule_job_build_log,
+            "blf_get_schedule_job_last_failure": get_schedule_job_last_failure,
+            "blf_diagnose_schedule_job_failure": diagnose_schedule_job_failure,
+        }
+
+    def authorized(self, header_value: str | None) -> bool:
+        if not self.mcp_token:
+            return True
+        return secrets.compare_digest(header_value or "", f"Bearer {self.mcp_token}")
+
+    def handle_rpc(self, payload: JSON) -> JSON | None:
+        method = payload.get("method")
+        rpc_id = payload.get("id")
+        if method == "notifications/initialized":
+            return None
+        try:
+            if method == "initialize":
+                result = {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "blf-schedule-mcp", "version": "0.1.0"},
+                }
+            elif method == "tools/list":
+                result = {"tools": [{"name": name, **spec} for name, spec in TOOL_SPECS.items()]}
+            elif method == "tools/call":
+                result = self._call_tool(payload.get("params") or {})
+            else:
+                return self._rpc_error(rpc_id, -32601, f"Unknown method: {method}")
+            return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
+        except Exception as exc:
+            logger.exception("MCP request failed for method %s", method)
+            return self._rpc_error(rpc_id, -32000, str(exc))
+
+    def _call_tool(self, params: JSON) -> JSON:
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if not isinstance(name, str) or name not in self.handlers:
+            raise ValueError(f"Unknown tool: {name}")
+        if not isinstance(arguments, dict):
+            raise ValueError("tool arguments must be an object")
+        result = self.handlers[name](self.jenkins_client, **arguments)
+        return {
+            "content": [{"type": "text", "text": _format_tool_text(result)}],
+            "isError": not bool(result.get("success", True)),
+        }
+
+    @staticmethod
+    def _rpc_error(rpc_id: Any, code: int, message: str) -> JSON:
+        return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
+
+
+def _format_tool_text(result: JSON) -> str:
+    return (
+        "BLF Schedule MCP 工具返回如下。请按其中 JSON 证据回答用户，不要编造未返回的信息。\n\n"
+        "```json\n"
+        f"{json.dumps(result, ensure_ascii=False, indent=2)}\n"
+        "```"
+    )
+
+
+def make_handler(app: BlfScheduleMcpApplication) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "BlfScheduleMcp/0.1"
+
+        def do_GET(self) -> None:
+            if self.path.rstrip("/") == "/health":
+                self._write_json({"ok": True})
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+
+        def do_POST(self) -> None:
+            if self.path.rstrip("/") != "/mcp":
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if not app.authorized(self.headers.get("Authorization")):
+                self._write_json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception:
+                self._write_json(
+                    BlfScheduleMcpApplication._rpc_error(None, -32700, "Invalid JSON"),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if isinstance(payload, list):
+                responses = [app.handle_rpc(item) for item in payload]
+                self._write_json([item for item in responses if item is not None])
+                return
+            response = app.handle_rpc(payload)
+            if response is None:
+                self.send_response(HTTPStatus.ACCEPTED)
+                self.end_headers()
+                return
+            self._write_json(response)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            logger.info("%s - %s", self.address_string(), format % args)
+
+        def _write_json(self, payload: Any, *, status: HTTPStatus = HTTPStatus.OK) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def build_app() -> BlfScheduleMcpApplication:
+    env_file = os.getenv("BLF_SCHEDULE_MCP_ENV_FILE", "/data/datahub/scripts/lineage.env")
+    load_env_file(env_file)
+    username = os.getenv("BLF_JENKINS_USER")
+    token = os.getenv("BLF_JENKINS_TOKEN") or os.getenv("BLF_JENKINS_PASSWORD")
+    if not username or not token:
+        raise ValueError("BLF_JENKINS_USER and BLF_JENKINS_TOKEN or BLF_JENKINS_PASSWORD are required")
+    return BlfScheduleMcpApplication(
+        jenkins_client=JenkinsClient(
+            base_url=os.getenv("BLF_JENKINS_URL", "http://schedule.corp.bianlifeng.com"),
+            username=username,
+            token=token,
+            timeout_sec=int(os.getenv("BLF_JENKINS_TIMEOUT_SEC", "30")),
+        ),
+        mcp_token=os.getenv("BLF_SCHEDULE_MCP_TOKEN"),
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run BLF schedule Jenkins MCP server")
+    parser.add_argument("--host", default=os.getenv("BLF_SCHEDULE_MCP_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("BLF_SCHEDULE_MCP_PORT", "9012")))
+    parser.add_argument("--log-level", default=os.getenv("BLF_SCHEDULE_MCP_LOG_LEVEL", "INFO"))
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    app = build_app()
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
+    logger.info("Starting BLF Schedule MCP server on %s:%s", args.host, args.port)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
