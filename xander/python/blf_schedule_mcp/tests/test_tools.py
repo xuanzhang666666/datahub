@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from blf_schedule_mcp.datahub_client import DataHubClientError
 from blf_schedule_mcp.tools import (
     diagnose_schedule_job_failure,
     get_schedule_job_build_history,
     get_schedule_job_build_status,
     get_schedule_job_last_failure,
+    search_schedule_jobs,
 )
 
 
@@ -83,3 +85,61 @@ def test_diagnose_schedule_job_failure_contains_history_and_last_failure() -> No
     assert "history" in result["summary"]
     assert "last_failure" in result["summary"]
     assert result["summary"]["history"]["success_rate"] == "2/3"
+
+
+class FakeDataHubClient:
+    def __init__(self, *, jobs: list[dict[str, Any]] | None = None, total: int | None = None, error: Exception | None = None) -> None:
+        self.jobs = jobs or []
+        self.total = total if total is not None else len(self.jobs)
+        self.error = error
+        self.calls: list[tuple[str, int]] = []
+
+    def search_data_jobs(self, name_substring: str, limit: int) -> dict[str, Any]:
+        self.calls.append((name_substring, limit))
+        if self.error:
+            raise self.error
+        return {"total": self.total, "jobs": self.jobs[:limit]}
+
+
+def test_search_schedule_jobs_success() -> None:
+    client = FakeDataHubClient(
+        jobs=[{"urn": "urn:li:dataJob:1", "name": "order_daily_job", "job_id": "order_daily_job"}],
+        total=1,
+    )
+    result = search_schedule_jobs(client, keyword="order")
+    assert result["success"] is True
+    assert result["summary"]["total"] == 1
+    assert result["summary"]["returned"] == 1
+    job = result["summary"]["jobs"][0]
+    assert job["job_display_name"] == "order_daily_job"
+    assert job["urn"] == "urn:li:dataJob:1"
+    assert job["jenkins_url"].endswith("/job/order_daily_job")
+    assert result["risks"] == []
+    assert client.calls == [("order", 20)]
+
+
+def test_search_schedule_jobs_empty_result_has_risk_hint() -> None:
+    result = search_schedule_jobs(FakeDataHubClient(), keyword="nope")
+    assert result["success"] is True
+    assert result["summary"]["jobs"] == []
+    assert any("更短的子串" in risk for risk in result["risks"])
+
+
+def test_search_schedule_jobs_bounds_limit() -> None:
+    client = FakeDataHubClient()
+    search_schedule_jobs(client, keyword="x", limit=9999)
+    assert client.calls == [("x", 5000)]
+
+
+def test_search_schedule_jobs_empty_keyword_is_invalid_input() -> None:
+    result = search_schedule_jobs(FakeDataHubClient(), keyword="  ")
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_input"
+
+
+def test_search_schedule_jobs_datahub_error_envelope() -> None:
+    client = FakeDataHubClient(error=DataHubClientError("GMS down"))
+    result = search_schedule_jobs(client, keyword="order")
+    assert result["success"] is False
+    assert result["error_type"] == "datahub_error"
+    assert "GMS down" in result["message"]

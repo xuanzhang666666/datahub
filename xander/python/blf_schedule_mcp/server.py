@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
+from .datahub_client import DataHubClient
 from .jenkins_client import JenkinsClient
 from .tools import (
     diagnose_schedule_job_failure,
@@ -18,6 +20,7 @@ from .tools import (
     get_schedule_job_build_log,
     get_schedule_job_build_status,
     get_schedule_job_last_failure,
+    search_schedule_jobs,
 )
 
 logger = logging.getLogger("blf_schedule_mcp")
@@ -88,6 +91,17 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["job_display_name"],
         },
     },
+    "blf_search_schedule_job": {
+        "description": "按名称子串模糊搜索 BLF 调度作业（like '%keyword%' 语义，基于 DataHub）。当不知道精确的 job_display_name 时先用此工具找到作业名。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "作业名称中的任意子串（不区分大小写）。"},
+                "limit": {"type": "integer", "default": 20, "description": "最多返回条数，上限 5000。"},
+            },
+            "required": ["keyword"],
+        },
+    },
 }
 
 
@@ -106,15 +120,23 @@ def load_env_file(path: str) -> None:
 
 
 class BlfScheduleMcpApplication:
-    def __init__(self, *, jenkins_client: JenkinsClient, mcp_token: str | None) -> None:
+    def __init__(
+        self,
+        *,
+        jenkins_client: JenkinsClient,
+        datahub_client: DataHubClient,
+        mcp_token: str | None,
+    ) -> None:
         self.jenkins_client = jenkins_client
+        self.datahub_client = datahub_client
         self.mcp_token = mcp_token
         self.handlers: dict[str, ToolHandler] = {
-            "blf_get_schedule_job_build_status": get_schedule_job_build_status,
-            "blf_get_schedule_job_build_history": get_schedule_job_build_history,
-            "blf_get_schedule_job_build_log": get_schedule_job_build_log,
-            "blf_get_schedule_job_last_failure": get_schedule_job_last_failure,
-            "blf_diagnose_schedule_job_failure": diagnose_schedule_job_failure,
+            "blf_get_schedule_job_build_status": functools.partial(get_schedule_job_build_status, jenkins_client),
+            "blf_get_schedule_job_build_history": functools.partial(get_schedule_job_build_history, jenkins_client),
+            "blf_get_schedule_job_build_log": functools.partial(get_schedule_job_build_log, jenkins_client),
+            "blf_get_schedule_job_last_failure": functools.partial(get_schedule_job_last_failure, jenkins_client),
+            "blf_diagnose_schedule_job_failure": functools.partial(diagnose_schedule_job_failure, jenkins_client),
+            "blf_search_schedule_job": functools.partial(search_schedule_jobs, datahub_client),
         }
 
     def authorized(self, header_value: str | None) -> bool:
@@ -152,7 +174,7 @@ class BlfScheduleMcpApplication:
             raise ValueError(f"Unknown tool: {name}")
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be an object")
-        result = self.handlers[name](self.jenkins_client, **arguments)
+        result = self.handlers[name](**arguments)
         return {
             "content": [{"type": "text", "text": _format_tool_text(result)}],
             "isError": not bool(result.get("success", True)),
@@ -236,6 +258,11 @@ def build_app() -> BlfScheduleMcpApplication:
             username=username,
             token=token,
             timeout_sec=int(os.getenv("BLF_JENKINS_TIMEOUT_SEC", "30")),
+        ),
+        datahub_client=DataHubClient(
+            gms_url=os.getenv("DATAHUB_GMS_URL", "http://localhost:8080"),
+            token=os.getenv("DATAHUB_GMS_TOKEN") or None,
+            timeout_sec=int(os.getenv("DATAHUB_GMS_TIMEOUT_SEC", "30")),
         ),
         mcp_token=os.getenv("BLF_SCHEDULE_MCP_TOKEN"),
     )

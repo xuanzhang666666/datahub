@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from .datahub_client import DataHubClient, DataHubClientError
 from .jenkins_client import JenkinsClient, JenkinsClientError
 
 JENKINS_PUBLIC_BASE_URL = "http://schedule.corp.bianlifeng.com"
@@ -50,6 +51,12 @@ def _error_response(error: Exception, **extra: Any) -> dict[str, Any]:
             error_type = "forbidden"
         elif error.status_code == 404:
             error_type = "not_found"
+    elif isinstance(error, DataHubClientError):
+        error_type = "datahub_error"
+        if error.status_code == 401:
+            error_type = "unauthorized"
+        elif error.status_code == 403:
+            error_type = "forbidden"
     elif isinstance(error, ValueError):
         error_type = "invalid_input"
     return {
@@ -135,6 +142,47 @@ def _extract_error_lines(log_text: str, limit: int = 50) -> list[str]:
         if len(results) >= limit:
             break
     return results
+
+
+def search_schedule_jobs(
+    client: DataHubClient,
+    *,
+    keyword: str,
+    limit: int = 20,
+) -> dict[str, Any]:
+    try:
+        if not isinstance(keyword, str) or not keyword.strip():
+            raise ValueError("keyword is required")
+        keyword = keyword.strip()
+        limit = _bounded_int(limit, default=20, minimum=1, maximum=5000)
+        result = client.search_data_jobs(keyword, limit)
+        jobs = [
+            {
+                "job_display_name": job.get("name") or job.get("job_id") or "",
+                "urn": job.get("urn") or "",
+                "jenkins_url": f"{JENKINS_PUBLIC_BASE_URL}/job/{job.get('name') or job.get('job_id') or ''}",
+            }
+            for job in result.get("jobs") or []
+        ]
+        risks = []
+        if not jobs:
+            risks.append("未命中任何调度作业，建议尝试更短的子串或换一个关键词")
+        return {
+            "success": True,
+            "summary": {
+                "keyword": keyword,
+                "total": result.get("total", 0),
+                "returned": len(jobs),
+                "jobs": jobs,
+            },
+            "risks": risks,
+            "evidence": {
+                "interface": "DataHub GraphQL searchAcrossEntities",
+                "query_semantics": "name like '%keyword%' OR jobId like '%keyword%'（结构化 wildcard 查询）",
+            },
+        }
+    except Exception as exc:
+        return _error_response(exc, keyword=keyword if isinstance(keyword, str) else "")
 
 
 def get_schedule_job_build_status(

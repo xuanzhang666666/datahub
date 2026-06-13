@@ -1,0 +1,24 @@
+{
+  "name": "@wnpm/btalk-cli",
+  "version": "0.3.1",
+  "description": "蜂利器 IM headless SDK + CLI（mac/Linux/WSL，无 Electron）",
+  "main": "src/index.js",
+  "bin": {
+    "btalk": "bin/btalk.js",
+    "btalk-mcp": "bin/btalk-mcp.js",
+    "btalkd": "bin/btalkd.js"
+  },
+  "engines": { "node": ">=22 <23" },
+  "repository": { "type": "git", "url": "git@git.corp.bianlifeng.com:fe/btalk-headless.git" },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3",
+    "zod-to-json-schema": "^3.25.2",
+    "nedb": "^1.8.0",
+    "axios": "^0.27.2",
+    "node-fetch": "^2.7.0",
+    "uuid": "^14.0.0",
+    "log4js": "^6.9.1"
+  }
+}
