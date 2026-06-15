@@ -44,7 +44,7 @@ const schemas = {
   search_contact: z.object({ q: z.string().describe('联系人姓名/uid 子串') }),
   fetch_history: z.object({
     conversation_id: z.string().describe('会话 id 或 uid(会话不存在则按 uid 拉)'),
-    count: z.number().int().min(1).max(200).default(20),
+    count: z.number().int().min(1).max(200).optional().describe('拉取条数，默认 20，最多 200'),
     is_group: z.boolean().optional().describe('是否群聊，默认 false'),
   }),
   send_message: z.object({
@@ -63,15 +63,15 @@ const schemas = {
   }),
 
   btalk_status: z.object({}),
-  wsso_cookie: z.object({ reset: z.boolean().default(false).describe('是否强制刷新 SSO Cookie') }),
+  wsso_cookie: z.object({ reset: z.boolean().optional().describe('是否强制刷新 SSO Cookie，默认 false') }),
   ripple_list: z.object({
-    tab: z.number().int().min(1).max(4).default(1).describe('1待处理,2已发起,3我关注,4已处理'),
-    page: z.number().int().min(1).default(1),
+    tab: z.number().int().min(1).max(4).optional().describe('1待处理,2已发起,3我关注,4已处理，默认 1'),
+    page: z.number().int().min(1).optional().describe('页码，默认 1'),
     category: z.string().optional().describe('flowCode 流程类别代码，可选'),
     keywords: z.string().optional().describe('关键词搜索任务名/编码，可选'),
   }),
   ripple_show: z.object({
-    flow_order_id: z.union([z.string(), z.number()]).describe('流程工单号 flowOrderId'),
+    flow_order_id: z.string().describe('流程工单号 flowOrderId'),
   }),
   ripple_action: z.object({
     flow_order_id: z.string().describe('流程工单号 flowOrderId'),
@@ -82,7 +82,7 @@ const schemas = {
   }),
   fetch_internal: z.object({
     url: z.string().url().describe('内部 http(s) URL，会自动带 wsso cookie 和身份 header'),
-    method: z.enum(['GET', 'POST']).default('GET'),
+    method: z.enum(['GET', 'POST']).optional().describe('HTTP 方法，默认 GET'),
     data: z.string().optional().describe('POST 数据，JSON 字符串或普通文本'),
   }),
 };
@@ -119,7 +119,7 @@ const rawHandlers = {
   async fetch_history({ conversation_id, count, is_group }) {
     const b = await btalk();
     const raw = await b.fetchHistoryMessages({
-      conversationId: conversation_id.toLowerCase(), pageSize: count, isGroupChat: !!is_group, forceFetchRemote: true,
+      conversationId: conversation_id.toLowerCase(), pageSize: count ?? 20, isGroupChat: !!is_group, forceFetchRemote: true,
     });
     const data = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
     return (data.message || []).map((m) => ({
@@ -157,7 +157,7 @@ const rawHandlers = {
     return runBtalk(args);
   },
   async ripple_list({ tab, page, category, keywords }) {
-    const args = ['ripple', 'list', '--tab', String(tab), '--page', String(page)];
+    const args = ['ripple', 'list', '--tab', String(tab ?? 1), '--page', String(page ?? 1)];
     if (category) args.push('--category', category);
     if (keywords) args.push('--keywords', keywords);
     return runBtalk(args);
