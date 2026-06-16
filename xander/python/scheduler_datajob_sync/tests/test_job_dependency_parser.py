@@ -62,6 +62,37 @@ def test_parse_job_dependencies_from_content_reads_job_dependency_properties() -
     ]
 
 
+SELF_CLOSING_CONDITION_XML = """<?xml version='1.0' encoding='UTF-8'?>
+<project>
+  <triggers>
+    <com.wormpex.dp.trigger.JobDependencyBuildTrigger plugin="job-dependency-plugin@1.1">
+      <jobProperties>
+        <com.wormpex.dp.pojo.JobDependencyProperty>
+          <upstreamJobName>real_upstream</upstreamJobName>
+          <triggerCondition>d = @$</triggerCondition>
+          <threshold>SUCCESS</threshold>
+        </com.wormpex.dp.pojo.JobDependencyProperty>
+        <com.wormpex.dp.pojo.JobDependencyProperty>
+          <upstreamJobName>never_execute_job</upstreamJobName>
+          <triggerCondition/>
+          <threshold>SUCCESS</threshold>
+        </com.wormpex.dp.pojo.JobDependencyProperty>
+      </jobProperties>
+    </com.wormpex.dp.trigger.JobDependencyBuildTrigger>
+  </triggers>
+</project>
+"""
+
+
+def test_parse_job_dependencies_handles_self_closing_trigger_condition() -> None:
+    deps = parse_job_dependencies_from_content(SELF_CLOSING_CONDITION_XML)
+
+    assert deps == [
+        ParsedJobDependency("real_upstream", "d = @$", "SUCCESS"),
+        ParsedJobDependency("never_execute_job", "", "SUCCESS"),
+    ]
+
+
 def test_parse_job_dependencies_from_content_reads_jobs_and_conditions_format() -> None:
     deps = parse_job_dependencies_from_content(JOB_DEPENDENCY_XML)
 

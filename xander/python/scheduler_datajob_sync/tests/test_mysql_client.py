@@ -60,8 +60,8 @@ def test_fetch_job_queries_by_display_name_and_maps_metadata() -> None:
     sql, params = connection.cursor_obj.executed[0]
     assert "FROM dmp_schedule_job_basic_info" in sql
     assert "job_display_name = %s" in sql
-    assert "batch_exec_time >= %s" in sql
-    assert params == ("2026-06-11 20:14:42", "PDW_Example_Job")
+    assert "batch_exec_time >= %s" not in sql
+    assert params == ("PDW_Example_Job",)
     assert connection.cursor_obj.closed
     assert connection.closed
 
@@ -75,8 +75,8 @@ def test_fetch_jobs_by_prefix_uses_like_parameter() -> None:
     assert [job.job_display_name for job in jobs] == ["PDW_A", "PDW_B"]
     sql, params = connection.cursor_obj.executed[0]
     assert "job_display_name LIKE %s" in sql
-    assert "batch_exec_time >= %s" in sql
-    assert params == ("2026-06-11 20:14:42", "PDW_%")
+    assert "batch_exec_time > %s" in sql
+    assert params[0] == "PDW_%"
 
 
 def test_fetch_jobs_activity_since_filters_build_and_batch_times() -> None:
@@ -90,7 +90,8 @@ def test_fetch_jobs_activity_since_filters_build_and_batch_times() -> None:
     sql, params = connection.cursor_obj.executed[0]
     assert "last_build_start_time >= %s" in sql
     assert "build_update_time >= %s" in sql
-    assert params == ("2026-06-11 20:14:42", since, since)
+    assert "batch_exec_time >= %s" not in sql
+    assert params == (since, since)
 
 
 def test_fetch_jobs_updated_since_filters_updated_or_batch_exec_time() -> None:
@@ -104,17 +105,6 @@ def test_fetch_jobs_updated_since_filters_updated_or_batch_exec_time() -> None:
     sql, params = connection.cursor_obj.executed[0]
     assert "updated_time >= %s" in sql
     assert "batch_exec_time >= %s" in sql
-    assert params == ("2026-06-11 20:14:42", since, since)
-
-
-def test_client_allows_overriding_min_batch_exec_time() -> None:
-    connection = FakeConnection([_row()])
-    client = SchedulerMysqlClient(
-        connection_factory=lambda: connection,
-        min_batch_exec_time="2026-06-12 00:00:00",
-    )
-
-    client.fetch_job("PDW_Example_Job")
-
-    _sql, params = connection.cursor_obj.executed[0]
-    assert params == ("2026-06-12 00:00:00", "PDW_Example_Job")
+    assert "batch_exec_time > %s" in sql
+    assert params[0] == since
+    assert params[1] == since

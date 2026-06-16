@@ -55,6 +55,21 @@ echo "===================================================================" | tee
 "$PYTHON" -u -m scheduler_datajob_sync.sync_datajobs \
   --updated-since 1970-01-01T00:00:00 \
   2>&1 | tee -a "$LOG_FILE"
-status=${PIPESTATUS[0]}
+sync_status=${PIPESTATUS[0]}
+
+echo "-------------------------------------------------------------------" | tee -a "$LOG_FILE"
+echo "[cleanup] $(date -Is) removing stale DataHub dataJobs …" | tee -a "$LOG_FILE"
+"$PYTHON" -u -m scheduler_datajob_sync.cleanup_stale_datajobs --apply \
+  2>&1 | tee -a "$LOG_FILE"
+cleanup_status=${PIPESTATUS[0]}
+
+# Report overall exit status: non-zero if either step failed
+if [[ "$sync_status" -ne 0 ]]; then
+  status="$sync_status"
+elif [[ "$cleanup_status" -ne 0 ]]; then
+  status="$cleanup_status"
+else
+  status=0
+fi
 echo "[exit] $(date -Is) status=$status log=$LOG_FILE" | tee -a "$LOG_FILE"
 exit "$status"

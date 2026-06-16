@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html as _html
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,9 +17,14 @@ from datahub.emitter.mce_builder import make_data_job_urn
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.emitter.rest_emitter import DatahubRestEmitter
 from datahub.metadata.schema_classes import (
+    CorpUserInfoClass,
     DataJobInfoClass,
     DataJobInputOutputClass,
     EdgeClass,
+    EditableDataJobPropertiesClass,
+    OwnerClass,
+    OwnershipClass,
+    OwnershipTypeClass,
 )
 
 from .models import SchedulerJobDependency, SchedulerJobMetadata
@@ -32,6 +39,21 @@ URN_JOB_CONTENT_XML = "urn:li:structuredProperty:blf.data.schedule.job_content_x
 URN_JOB_EXECUTE_SHELL = "urn:li:structuredProperty:blf.data.schedule.job_execute_shell"
 EDGE_PROP_CONDITION = "blf_schedule_dependency_condition"
 EDGE_PROP_STATUS = "blf_schedule_dependency_status"
+
+_XML_DESCRIPTION_RE = re.compile(r"<description>(.*?)</description>", re.DOTALL | re.IGNORECASE)
+
+
+def parse_job_xml_description(content: str) -> str:
+    """Extract and clean the <description> text from a Jenkins job XML."""
+    if not content:
+        return ""
+    m = _XML_DESCRIPTION_RE.search(content)
+    if not m:
+        return ""
+    raw = _html.unescape(m.group(1))
+    # Normalise \r\n and bare \r to \n
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    return raw.strip()
 
 
 @dataclass(frozen=True)
@@ -146,6 +168,39 @@ def _wrap_shell_command(content: str) -> str:
 
 def _wrap_job_xml(content: str) -> str:
     return f"```xml\n{content}\n```"
+
+
+def _owner_urn(owner_name: str) -> str:
+    # DataHub uses all-lowercase "corpuser" in URNs (urn:li:corpuser:username)
+    return f"urn:li:corpuser:{owner_name}"
+
+
+def build_datajob_ownership(metadata: SchedulerJobMetadata) -> OwnershipClass | None:
+    owner_name = (metadata.job_owner_name or "").strip()
+    if not owner_name:
+        return None
+    return OwnershipClass(
+        owners=[
+            OwnerClass(
+                owner=_owner_urn(owner_name),
+                type=OwnershipTypeClass.TECHNICAL_OWNER,
+            )
+        ]
+    )
+
+
+def build_datajob_documentation(
+    metadata: SchedulerJobMetadata,
+) -> EditableDataJobPropertiesClass | None:
+    description = parse_job_xml_description(metadata.content)
+    if not description:
+        return None
+    return EditableDataJobPropertiesClass(description=description)
+
+
+def build_corpuser_info(owner_name: str) -> CorpUserInfoClass:
+    """Minimal CorpUser aspect — upserted before ownership to ensure the user exists."""
+    return CorpUserInfoClass(active=True, displayName=owner_name, email="")
 
 
 def build_datajob_structured_properties(
@@ -281,10 +336,23 @@ class SchedulerDataJobWriter:
     def write_job(self, metadata: SchedulerJobMetadata) -> None:
         emitter = self._emitter_factory(self.gms_url, self.token)
         urn = make_scheduler_datajob_urn(metadata.job_display_name)
-        for aspect in (
-            build_datajob_info(metadata),
-            build_datajob_input_output(metadata),
-        ):
+
+        owner_name = (metadata.job_owner_name or "").strip()
+        if owner_name:
+            # Upsert the corpUser entity first so the ownership reference is valid
+            emitter.emit_mcp(MetadataChangeProposalWrapper(
+                entityUrn=_owner_urn(owner_name),
+                aspect=build_corpuser_info(owner_name),
+            ))
+
+        aspects = [build_datajob_info(metadata), build_datajob_input_output(metadata)]
+        ownership = build_datajob_ownership(metadata)
+        if ownership is not None:
+            aspects.append(ownership)
+        doc = build_datajob_documentation(metadata)
+        if doc is not None:
+            aspects.append(doc)
+        for aspect in aspects:
             emitter.emit_mcp(MetadataChangeProposalWrapper(entityUrn=urn, aspect=aspect))
         structured_props = build_datajob_structured_properties(metadata)
         if structured_props:

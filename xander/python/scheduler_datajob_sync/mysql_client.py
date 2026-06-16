@@ -31,7 +31,6 @@ class ConnectionLike(Protocol):
 ConnectionFactory = Callable[[], ConnectionLike]
 
 _TABLE = "dmp_schedule_job_basic_info"
-DEFAULT_MIN_BATCH_EXEC_TIME = "2026-06-11 20:14:42"
 _COLUMNS = (
     "id, job_name, job_display_name, job_owner_name, job_proxy_user, "
     "line_business_code, last_build_start_time, created_time, updated_time, "
@@ -40,9 +39,14 @@ _COLUMNS = (
     "upstream_jobs_conditions, delay_config, ivr_notify, sms_notify, im_notify, "
     "job_size, job_count, build_update_time, batch_exec_time"
 )
-_ACTIVE_BATCH_CLAUSE = "batch_exec_time >= %s"
 _ACTIVITY_TIME_CLAUSE = (
     "(last_build_start_time >= %s OR build_update_time >= %s)"
+)
+# Jobs with batch_exec_time at or before this timestamp are historical/deleted entries
+# that should not appear in DataHub. Default matches the hourly-sync epoch in prod.
+# Override via env var SCHEDULER_MIN_BATCH_EXEC_TIME.
+_MIN_BATCH_EXEC_TIME: str = os.getenv(
+    "SCHEDULER_MIN_BATCH_EXEC_TIME", "2026-06-11 07:17:06"
 )
 
 
@@ -66,20 +70,13 @@ class SchedulerMysqlClient:
     def __init__(
         self,
         connection_factory: ConnectionFactory = default_connection_factory,
-        min_batch_exec_time: str | None = None,
     ) -> None:
         self._connection_factory = connection_factory
-        self._min_batch_exec_time = (
-            min_batch_exec_time
-            if min_batch_exec_time is not None
-            else os.getenv("SCHEDULER_MIN_BATCH_EXEC_TIME", DEFAULT_MIN_BATCH_EXEC_TIME)
-        )
 
     def fetch_job(self, job_display_name: str) -> SchedulerJobMetadata:
         jobs = self._query(
-            f"SELECT {_COLUMNS} FROM {_TABLE} "
-            f"WHERE {_ACTIVE_BATCH_CLAUSE} AND job_display_name = %s",
-            (self._min_batch_exec_time, job_display_name),
+            f"SELECT {_COLUMNS} FROM {_TABLE} WHERE job_display_name = %s",
+            (job_display_name,),
         )
         if not jobs:
             raise RuntimeError(f"未找到调度作业: {job_display_name}")
@@ -88,26 +85,27 @@ class SchedulerMysqlClient:
     def fetch_jobs_by_prefix(self, prefix: str) -> list[SchedulerJobMetadata]:
         return self._query(
             f"SELECT {_COLUMNS} FROM {_TABLE} "
-            f"WHERE {_ACTIVE_BATCH_CLAUSE} AND job_display_name LIKE %s "
+            "WHERE job_display_name LIKE %s "
+            "AND batch_exec_time > %s "
             "ORDER BY job_display_name",
-            (self._min_batch_exec_time, f"{prefix}%"),
+            (f"{prefix}%", _MIN_BATCH_EXEC_TIME),
         )
 
     def fetch_jobs_updated_since(self, since: datetime) -> list[SchedulerJobMetadata]:
         return self._query(
             f"SELECT {_COLUMNS} FROM {_TABLE} "
-            f"WHERE {_ACTIVE_BATCH_CLAUSE} "
-            "AND (updated_time >= %s OR batch_exec_time >= %s) "
+            "WHERE (updated_time >= %s OR batch_exec_time >= %s) "
+            "AND batch_exec_time > %s "
             "ORDER BY updated_time, job_display_name",
-            (self._min_batch_exec_time, since, since),
+            (since, since, _MIN_BATCH_EXEC_TIME),
         )
 
     def fetch_jobs_activity_since(self, since: datetime) -> list[SchedulerJobMetadata]:
         return self._query(
             f"SELECT {_COLUMNS} FROM {_TABLE} "
-            f"WHERE {_ACTIVE_BATCH_CLAUSE} AND {_ACTIVITY_TIME_CLAUSE} "
+            f"WHERE {_ACTIVITY_TIME_CLAUSE} "
             "ORDER BY batch_exec_time DESC, job_display_name",
-            (self._min_batch_exec_time, since, since),
+            (since, since),
         )
 
     def _query(

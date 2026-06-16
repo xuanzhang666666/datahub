@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from datahub.metadata.schema_classes import DataJobInfoClass, DataJobInputOutputClass
+from datahub.metadata.schema_classes import CorpUserInfoClass, DataJobInfoClass, DataJobInputOutputClass, EditableDataJobPropertiesClass, OwnershipClass
 
 from scheduler_datajob_sync.datajob_writer import (
     EDGE_PROP_CONDITION,
@@ -9,10 +9,13 @@ from scheduler_datajob_sync.datajob_writer import (
     URN_JOB_CONTENT_XML,
     URN_JOB_EXECUTE_SHELL,
     SchedulerDataJobWriter,
+    build_datajob_documentation,
     build_datajob_info,
     build_datajob_input_output,
+    build_datajob_ownership,
     build_datajob_structured_properties,
     make_scheduler_datajob_urn,
+    parse_job_xml_description,
     serialize_job_dependencies,
 )
 from scheduler_datajob_sync.models import SchedulerJobDependency, SchedulerJobMetadata
@@ -122,6 +125,54 @@ def test_serialize_job_dependencies_preserves_case_sensitive_names() -> None:
     assert '"PDW_Example_Job"' in payload
 
 
+def test_build_datajob_ownership_maps_owner_name_to_corp_user() -> None:
+    ownership = build_datajob_ownership(_metadata())
+
+    assert isinstance(ownership, OwnershipClass)
+    assert len(ownership.owners) == 1
+    # DataHub uses all-lowercase "corpuser" in URNs
+    assert ownership.owners[0].owner == "urn:li:corpuser:alice"
+
+
+def test_build_datajob_ownership_returns_none_when_owner_empty() -> None:
+    metadata = SchedulerJobMetadata(job_display_name="no_owner")
+    assert build_datajob_ownership(metadata) is None
+
+
+def test_parse_job_xml_description_extracts_and_decodes() -> None:
+    xml = (
+        "<project><description>下游依赖是 pdw_xxx&#xd;\n"
+        "为了配置降级</description></project>"
+    )
+    result = parse_job_xml_description(xml)
+    assert result == "下游依赖是 pdw_xxx\n为了配置降级"
+
+
+def test_parse_job_xml_description_returns_empty_when_missing() -> None:
+    assert parse_job_xml_description("<project></project>") == ""
+    assert parse_job_xml_description("") == ""
+
+
+def test_parse_job_xml_description_strips_whitespace() -> None:
+    xml = "<project><description>  hello  </description></project>"
+    assert parse_job_xml_description(xml) == "hello"
+
+
+def test_build_datajob_documentation_returns_none_without_description() -> None:
+    # _metadata() content has no <description> tag
+    assert build_datajob_documentation(_metadata()) is None
+
+
+def test_build_datajob_documentation_maps_xml_description() -> None:
+    metadata = SchedulerJobMetadata(
+        job_display_name="Test_Job",
+        content="<project><description>配置说明&#xd;\n第二行</description></project>",
+    )
+    doc = build_datajob_documentation(metadata)
+    assert isinstance(doc, EditableDataJobPropertiesClass)
+    assert doc.description == "配置说明\n第二行"
+
+
 def test_build_datajob_structured_properties_maps_shell_and_xml() -> None:
     props = build_datajob_structured_properties(_metadata())
     by_urn = {prop.property_urn: prop.string_value for prop in props}
@@ -148,16 +199,18 @@ def test_writer_emits_info_and_input_output_aspects() -> None:
 
     writer.write_job(_metadata())
 
-    assert len(emitter.mcps) == 2
+    # mcps: corpUser upsert, DataJobInfo, DataJobInputOutput, Ownership
+    # (no Documentation mcp — _metadata() content has no <description> tag)
+    assert len(emitter.mcps) == 4
     assert len(patched) == 1
     assert patched[0][0] == make_scheduler_datajob_urn("PDW_Example_Job")
     assert len(patched[0][1]) == 2
-    assert [mcp.entityUrn for mcp in emitter.mcps] == [
-        make_scheduler_datajob_urn("PDW_Example_Job"),
-        make_scheduler_datajob_urn("PDW_Example_Job"),
-    ]
-    assert isinstance(emitter.mcps[0].aspect, DataJobInfoClass)
-    assert isinstance(emitter.mcps[1].aspect, DataJobInputOutputClass)
+    assert isinstance(emitter.mcps[0].aspect, CorpUserInfoClass)
+    assert emitter.mcps[0].entityUrn == "urn:li:corpuser:alice"
+    assert isinstance(emitter.mcps[1].aspect, DataJobInfoClass)
+    assert isinstance(emitter.mcps[2].aspect, DataJobInputOutputClass)
+    assert isinstance(emitter.mcps[3].aspect, OwnershipClass)
+    assert emitter.mcps[3].entityUrn == make_scheduler_datajob_urn("PDW_Example_Job")
 
 
 def test_writer_lineage_only_emits_info_and_input_output_without_structured_props() -> None:

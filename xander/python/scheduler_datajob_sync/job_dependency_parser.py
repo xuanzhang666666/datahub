@@ -11,11 +11,15 @@ _UPSTREAM_PROJECTS_RE = re.compile(
     r"<upstreamProjects>\s*([^<]+?)\s*</upstreamProjects>",
     re.IGNORECASE,
 )
+# triggerCondition / threshold may be serialized as a self-closing empty tag
+# (e.g. `<triggerCondition/>` when the value is blank, as with never_execute_job
+# blocker dependencies). Accept both paired and self-closing forms; the capture
+# group is None on the self-closing branch.
 _JOB_DEPENDENCY_PROPERTY_RE = re.compile(
     r"<com\.wormpex\.dp\.pojo\.JobDependencyProperty>\s*"
     r"<upstreamJobName>\s*([^<]+?)\s*</upstreamJobName>\s*"
-    r"<triggerCondition>\s*([^<]*?)\s*</triggerCondition>\s*"
-    r"<threshold>\s*([^<]*?)\s*</threshold>\s*"
+    r"(?:<triggerCondition>\s*([^<]*?)\s*</triggerCondition>|<triggerCondition\s*/>)\s*"
+    r"(?:<threshold>\s*([^<]*?)\s*</threshold>|<threshold\s*/>)\s*"
     r"</com\.wormpex\.dp\.pojo\.JobDependencyProperty>",
     re.IGNORECASE | re.DOTALL,
 )
@@ -48,8 +52,8 @@ def _parse_job_dependency_properties(content: str) -> list[ParsedJobDependency]:
         name = match.group(1).strip()
         if not name:
             continue
-        condition = match.group(2).strip()
-        status = match.group(3).strip() or "SUCCESS"
+        condition = (match.group(2) or "").strip()
+        status = (match.group(3) or "").strip() or "SUCCESS"
         dependencies.append(
             ParsedJobDependency(
                 upstream_job_display_name=name,
