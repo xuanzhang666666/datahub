@@ -37,10 +37,20 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
+# Jenkins string parameters are already in the environment; save them before
+# sourcing lineage.env so that lineage.env cannot accidentally overwrite them.
+_SAVED_MIN_BATCH_EXEC_TIME="${SCHEDULER_MIN_BATCH_EXEC_TIME:-}"
+
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+
+# Restore Jenkins parameter if it was provided (takes precedence over lineage.env).
+if [[ -n "$_SAVED_MIN_BATCH_EXEC_TIME" ]]; then
+  export SCHEDULER_MIN_BATCH_EXEC_TIME="$_SAVED_MIN_BATCH_EXEC_TIME"
+fi
+unset _SAVED_MIN_BATCH_EXEC_TIME
 
 cd "$SYNC_ROOT"
 export PYTHONPATH="$SYNC_ROOT"
@@ -50,6 +60,7 @@ echo "[start] $(date -Is) scheduler DataJob full sync" | tee -a "$LOG_FILE"
 echo " sync_root=$SYNC_ROOT" | tee -a "$LOG_FILE"
 echo " python=$PYTHON" | tee -a "$LOG_FILE"
 echo " log=$LOG_FILE" | tee -a "$LOG_FILE"
+echo " SCHEDULER_MIN_BATCH_EXEC_TIME=${SCHEDULER_MIN_BATCH_EXEC_TIME:-(not set, using default in mysql_client.py)}" | tee -a "$LOG_FILE"
 echo "===================================================================" | tee -a "$LOG_FILE"
 
 "$PYTHON" -u -m scheduler_datajob_sync.sync_datajobs \
