@@ -1,6 +1,6 @@
 {
   "name": "@wnpm/btalk-cli",
-  "version": "0.3.1",
+  "version": "0.3.9",
   "description": "蜂利器 IM headless SDK + CLI（mac/Linux/WSL，无 Electron）",
   "main": "src/index.js",
   "bin": {

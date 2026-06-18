@@ -14,7 +14,7 @@
 | MCP 端点 | `http://neo4j2:9013/mcp` |
 | 传输 | supergateway（stdio → streamable HTTP，stateful 模式） |
 | 登录态 | `/root/.btalk/`（挂载到宿主机） |
-| npm 包 | `@wnpm/btalk-cli@0.3.1`（内网 registry） |
+| npm 包 | `@wnpm/btalk-cli@0.3.9`（内网 registry） |
 
 ## 架构
 
@@ -32,7 +32,7 @@ MCP 客户端 (HTTP POST /mcp)
 **stateful 说明**：supergateway `--stateful` 模式下，每个 MCP session 结束后子进程正常回收重启，
 日志里的 `Child exited: SIGTERM` 是正常行为，不是崩溃。
 
-## 工具列表（12 个）
+## 工具列表（24 个）
 
 | 工具名 | 功能 |
 |--------|------|
@@ -43,11 +43,23 @@ MCP 客户端 (HTTP POST /mcp)
 | `send_file` | 上传并发送文件/图片（蜂盘，100MB 上限） |
 | `get_image_path` | 取图片/文件消息的本地缓存路径 |
 | `btalk_status` | 查看 btalk daemon 登录与运行状态 |
+| `btalk_version` | 查看 btalk CLI 与 Node 版本 |
+| `user_lookup` | 当前用户 / uid 查询 / 关键词搜索用户 |
+| `message_search` | 离线全文搜索历史消息 |
+| `group_manage` | 建群、拉人、踢人、群列表、详情、退群 |
+| `otp` | 获取 6 位动态口令 |
 | `wsso_cookie` | 获取或强制刷新公司内部系统 SSO Cookie |
 | `ripple_list` | 查询 Ripple/蜂利器流程工单列表 |
+| `ripple_category` | 查询 Ripple 流程类别统计 |
 | `ripple_show` | 查看 Ripple 工单详情 |
-| `ripple_action` | 执行工单操作（领取/处理/反馈/转交） |
+| `ripple_short_url` | 生成 Ripple 工单短链 |
+| `ripple_resolve` | 解析 Ripple 短链或 token |
+| `ripple_group_chat` | 发起或进入 Ripple 工单群聊 |
+| `ripple_flow_search` | 搜索流程模板，获取 flowCode |
+| `ripple_create_order` | 按 flowCode 发起工单；默认保存草稿，submit 才提交 |
+| `ripple_action` | 执行工单操作（领取/处理/反馈/转交），支持草稿 |
 | `fetch_internal` | 用 wsso cookie 访问内部 HTTP 接口 |
+| `pc_helper` | 个人电脑助手：给自己发消息、查状态、停止监听 |
 
 ## 关键文件
 
@@ -71,10 +83,22 @@ MCP 客户端 (HTTP POST /mcp)
 1. ripple_list(tab=1)                    # 查待处理工单，获得 flow_order_id
 2. ripple_show(flow_order_id)            # 看详情 + operations（可用操作）
 3. ripple_action(id, op, show_form=true) # 看表单字段填写规则（不提交）
-4. ripple_action(id, op, fields={...})   # 实际提交
+4. ripple_action(id, op, draft=true, fields={...}) # 只存动作草稿，人工在桌面端审核
+5. ripple_action(id, op, fields={...})   # 实际提交
 ```
 
 操作类型别名：`ACCEPT`/领取、`APPROVE`/处理、`FEEDBACK`/反馈、`ASSIGN`/转交
+
+## Ripple 发起工单流程
+
+```
+1. ripple_flow_search(keyword)                         # 查流程模板 flowCode
+2. ripple_create_order(flow_code, show_form=true)      # 看发起表单字段/选项/级联
+3. ripple_create_order(flow_code, fields={...})        # 默认只保存草稿
+4. ripple_create_order(flow_code, fields={...}, submit=true) # 确认后真正提交
+```
+
+`ripple_create_order` 默认**保存草稿不提交**，适合 agent 先填表、人再在桌面端审核。
 
 ## 登录态
 
