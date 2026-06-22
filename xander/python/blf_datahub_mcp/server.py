@@ -142,8 +142,8 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 },
                 "max_value_chars": {
                     "type": "integer",
-                    "default": 8000,
-                    "description": "脚本最多返回的字符数，超出会截断并标记 omitted_chars。",
+                    "default": 50000,
+                    "description": "脚本最多返回的字符数，默认 50000，超出会截断并标记 omitted_chars。",
                 },
             },
             "required": ["table"],

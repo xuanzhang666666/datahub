@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT="$SCRIPT_DIR"
 
 ENV_FILE="${BLF_DATAHUB_MCP_ENV_FILE:-/data/datahub/scripts/lineage.env}"
 if [[ -f "$ENV_FILE" ]]; then
@@ -41,4 +41,3 @@ fi
 exec "$PYTHON" -m blf_datahub_mcp.server \
   --host "$BLF_DATAHUB_MCP_HOST" \
   --port "$BLF_DATAHUB_MCP_PORT"
-

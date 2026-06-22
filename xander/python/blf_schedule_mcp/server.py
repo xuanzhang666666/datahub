@@ -16,10 +16,12 @@ from .datahub_client import DataHubClient
 from .jenkins_client import JenkinsClient
 from .tools import (
     diagnose_schedule_job_failure,
+    find_long_running_schedule_builds,
     get_schedule_job_build_history,
     get_schedule_job_build_log,
     get_schedule_job_build_status,
     get_schedule_job_last_failure,
+    get_schedule_job_queue_stats,
     search_schedule_jobs,
 )
 
@@ -56,13 +58,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         },
     },
     "blf_get_schedule_job_build_log": {
-        "description": "读取 BLF 调度作业某次构建的 console 日志；服务端强制限流截断，最多读取 64KB、返回 12000 字符。",
+        "description": "读取 BLF 调度作业某次构建的 console 日志尾部；服务端强制限流截断，最多读取并返回 256KB。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "job_display_name": {"type": "string", "description": "调度作业名称（Jenkins job 名称）。"},
                 "build_ref": {"type": ["string", "integer"], "default": "lastBuild", "description": "构建引用或构建号。"},
-                "max_chars": {"type": "integer", "default": 8000, "description": "返回日志字符数，上限 12000。"},
+                "max_chars": {"type": "integer", "default": 8000, "description": "返回日志尾部字符数，上限 262144。"},
             },
             "required": ["job_display_name"],
         },
@@ -74,7 +76,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "properties": {
                 "job_display_name": {"type": "string", "description": "调度作业名称（Jenkins job 名称）。"},
                 "error_lines_limit": {"type": "integer", "default": 50, "description": "最多返回多少条错误行，上限 100。"},
-                "log_max_chars": {"type": "integer", "default": 6000, "description": "返回日志字符数，上限 12000。"},
+                "log_max_chars": {"type": "integer", "default": 6000, "description": "返回日志尾部字符数，上限 262144。"},
             },
             "required": ["job_display_name"],
         },
@@ -86,7 +88,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "properties": {
                 "job_display_name": {"type": "string", "description": "调度作业名称（Jenkins job 名称）。"},
                 "history_limit": {"type": "integer", "default": 5, "description": "最近构建数量，上限 20。"},
-                "log_max_chars": {"type": "integer", "default": 8000, "description": "返回日志字符数，上限 12000。"},
+                "log_max_chars": {"type": "integer", "default": 8000, "description": "返回日志尾部字符数，上限 262144。"},
             },
             "required": ["job_display_name"],
         },
@@ -100,6 +102,29 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "limit": {"type": "integer", "default": 20, "description": "最多返回条数，上限 5000。"},
             },
             "required": ["keyword"],
+        },
+    },
+    "blf_find_long_running_schedule_builds": {
+        "description": "扫描 Jenkins 当前正在运行的 BLF 调度构建，找出运行超过阈值的异常长任务；默认阈值 24 小时。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "min_running_hours": {"type": "integer", "default": 24, "description": "判定为长时间运行的小时阈值，默认 24。"},
+                "max_results": {"type": "integer", "default": 50, "description": "最多返回多少个异常运行构建，上限 500。"},
+            },
+        },
+    },
+    "blf_get_schedule_job_queue_stats": {
+        "description": "读取 Jenkins 构建队列中的所有 Task，并按 Jenkins 任务名聚合统计排队数量。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_job_results": {
+                    "type": "integer",
+                    "default": 500,
+                    "description": "按 job 聚合后最多返回多少个任务统计项，上限 1000；items 始终返回全部队列 Task。",
+                },
+            },
         },
     },
 }
@@ -137,6 +162,8 @@ class BlfScheduleMcpApplication:
             "blf_get_schedule_job_last_failure": functools.partial(get_schedule_job_last_failure, jenkins_client),
             "blf_diagnose_schedule_job_failure": functools.partial(diagnose_schedule_job_failure, jenkins_client),
             "blf_search_schedule_job": functools.partial(search_schedule_jobs, datahub_client),
+            "blf_find_long_running_schedule_builds": functools.partial(find_long_running_schedule_builds, jenkins_client),
+            "blf_get_schedule_job_queue_stats": functools.partial(get_schedule_job_queue_stats, jenkins_client),
         }
 
     def authorized(self, header_value: str | None) -> bool:

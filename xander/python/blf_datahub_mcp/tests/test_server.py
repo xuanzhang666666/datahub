@@ -39,4 +39,12 @@ def test_tools_list_contains_blf_tools() -> None:
     assert "blf_search_hive_assets" in names
     assert "blf_audit_hive_table" in names
     assert "blf_explain_hive_table_context" in names
+    etl_script_tool = next(
+        tool for tool in response["result"]["tools"]
+        if tool["name"] == "blf_get_hive_etl_script"
+    )
+    assert (
+        etl_script_tool["inputSchema"]["properties"]["max_value_chars"]["default"]
+        == 50000
+    )
     assert "blf_explain_hive_field_lineage" in names

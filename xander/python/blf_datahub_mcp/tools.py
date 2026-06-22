@@ -418,7 +418,7 @@ def get_hive_etl_script(
     *,
     public_base_url: str,
     table: str,
-    max_value_chars: int = 8000,
+    max_value_chars: int = 50000,
 ) -> dict[str, Any]:
     """Return Etl Script structured property for one Hive table."""
     return get_hive_structured_property(

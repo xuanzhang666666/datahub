@@ -11,8 +11,8 @@ from .jenkins_client import JenkinsClient, JenkinsClientError
 
 JENKINS_PUBLIC_BASE_URL = "http://schedule.corp.bianlifeng.com"
 DEFAULT_LOG_MAX_CHARS = 6000
-MAX_LOG_MAX_CHARS = 12000
-LOG_FETCH_BYTES = 65536
+MAX_LOG_MAX_CHARS = 262144
+LOG_FETCH_BYTES = 262144
 ERROR_PATTERNS = (
     "ERROR",
     "FATAL",
@@ -86,6 +86,19 @@ def _format_build(build: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _format_timestamp_ms(timestamp_ms: int) -> str:
+    if not timestamp_ms:
+        return ""
+    return (
+        datetime.fromtimestamp(
+            timestamp_ms / 1000,
+            tz=timezone.utc,
+        )
+        .replace(tzinfo=None)
+        .isoformat(timespec="seconds")
+    )
+
+
 def _status_from_build(build: dict[str, Any]) -> str:
     if build.get("building"):
         return "running"
@@ -124,11 +137,12 @@ def _truncate_log(text: str, max_chars: int) -> dict[str, Any]:
     chars = len(text)
     truncated = chars > max_chars
     return {
-        "text": text[:max_chars],
+        "text": text[-max_chars:],
         "chars": chars,
         "truncated": truncated,
         "omitted_chars": max(chars - max_chars, 0),
         "fetch_limit_bytes": LOG_FETCH_BYTES,
+        "slice": "tail",
     }
 
 
@@ -274,6 +288,119 @@ def get_schedule_job_build_history(
         except Exception:
             base = {"job_display_name": job_display_name}
         return _error_response(exc, **base)
+
+
+def find_long_running_schedule_builds(
+    client: JenkinsClient,
+    *,
+    min_running_hours: int = 24,
+    max_results: int = 50,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    try:
+        threshold_hours = _bounded_int(min_running_hours, default=24, minimum=1, maximum=24 * 30)
+        max_results = _bounded_int(max_results, default=50, minimum=1, maximum=500)
+        if now_ms is None:
+            now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        running_builds = client.get_running_builds()
+        long_running = []
+        skipped_without_timestamp = 0
+        for build in running_builds:
+            started_at_ms = int(build.get("started_at_ms") or 0)
+            if not started_at_ms:
+                skipped_without_timestamp += 1
+                continue
+            running_ms = max(now_ms - started_at_ms, 0)
+            running_hours = running_ms / 1000 / 60 / 60
+            if running_hours < threshold_hours:
+                continue
+            long_running.append(
+                {
+                    "job_display_name": build.get("job_display_name") or "",
+                    "build_number": build.get("build_number"),
+                    "running_hours": round(running_hours, 2),
+                    "started_at": _format_timestamp_ms(started_at_ms),
+                    "build_url": build.get("build_url") or "",
+                    "executor": build.get("executor") or "",
+                }
+            )
+        long_running.sort(key=lambda item: item["running_hours"], reverse=True)
+        returned = long_running[:max_results]
+        risks = []
+        if long_running:
+            risks.append(f"发现 {len(long_running)} 个 Jenkins 构建长时间运行未退出，建议检查是否卡死或等待外部资源")
+        return {
+            "success": True,
+            "summary": {
+                "threshold_hours": threshold_hours,
+                "total_running_builds": len(running_builds),
+                "long_running_count": len(long_running),
+                "returned": len(returned),
+                "skipped_without_timestamp": skipped_without_timestamp,
+                "builds": returned,
+            },
+            "risks": risks,
+            "evidence": {
+                "interface": "Jenkins REST API",
+                "endpoint": "/computer/api/json?tree=computer[executors,currentExecutable]",
+            },
+        }
+    except Exception as exc:
+        return _error_response(exc)
+
+
+def get_schedule_job_queue_stats(
+    client: JenkinsClient,
+    *,
+    max_job_results: int = 500,
+) -> dict[str, Any]:
+    try:
+        max_job_results = _bounded_int(max_job_results, default=500, minimum=1, maximum=1000)
+        queue_items = client.get_queue_items()
+        counts: dict[str, int] = {}
+        job_urls: dict[str, str] = {}
+        for item in queue_items:
+            job_name = str(item.get("job_display_name") or "").strip()
+            if not job_name:
+                continue
+            counts[job_name] = counts.get(job_name, 0) + 1
+            job_urls.setdefault(job_name, str(item.get("jenkins_url") or "").strip())
+        job_counts = [
+            {
+                "job_display_name": job_name,
+                "count": count,
+                "jenkins_url": job_urls.get(job_name)
+                or f"{JENKINS_PUBLIC_BASE_URL}/job/{job_name}",
+            }
+            for job_name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
+        returned_job_counts = job_counts[:max_job_results]
+        blocked_count = sum(1 for item in queue_items if item.get("blocked"))
+        risks = []
+        if blocked_count:
+            risks.append(f"构建队列中有 {blocked_count} 个任务处于 blocked 状态，可能等待上游或资源")
+        if len(job_counts) > max_job_results:
+            risks.append(
+                f"按 job 聚合后有 {len(job_counts)} 个不同任务，仅返回排队数最多的前 {max_job_results} 个"
+            )
+        return {
+            "success": True,
+            "summary": {
+                "total_queue_items": len(queue_items),
+                "distinct_jobs": len(job_counts),
+                "blocked_items": blocked_count,
+                "returned_job_counts": len(returned_job_counts),
+                "job_counts": returned_job_counts,
+                "items": queue_items,
+            },
+            "risks": risks,
+            "evidence": {
+                "interface": "Jenkins REST API",
+                "endpoint": "/queue/api/json?tree=items[id,why,blocked,buildable,inQueueSince,task[...]]",
+            },
+        }
+    except Exception as exc:
+        return _error_response(exc)
 
 
 def get_schedule_job_build_log(

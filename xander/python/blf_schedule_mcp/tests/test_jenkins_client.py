@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import urllib.error
 from unittest.mock import patch
 
@@ -11,8 +12,9 @@ from blf_schedule_mcp.tools import _extract_error_lines
 
 
 class _FakeResponse:
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, headers: dict[str, str] | None = None) -> None:
         self.data = data
+        self.headers = headers or {}
 
     def __enter__(self) -> _FakeResponse:
         return self
@@ -52,6 +54,133 @@ def test_open_json_parses_object() -> None:
     client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
     with patch("urllib.request.urlopen", return_value=_FakeResponse(b'{"name":"foo"}')):
         assert client._open_json("job/foo/api/json") == {"name": "foo"}
+
+
+def test_get_build_log_reads_progressive_text_tail() -> None:
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        calls.append(request.full_url)
+        if "start=0" in request.full_url:
+            return _FakeResponse(b"x", {"X-Text-Size": "2000"})
+        if "start=976" in request.full_url:
+            return _FakeResponse(b"tail log")
+        raise AssertionError(f"unexpected url: {request.full_url}")
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        assert client.get_build_log("demo", 4, max_bytes=1024) == "tail log"
+
+    assert calls == [
+        "https://jenkins.example/job/demo/4/logText/progressiveText?start=0",
+        "https://jenkins.example/job/demo/4/logText/progressiveText?start=976",
+    ]
+
+
+def test_get_running_builds_parses_computer_executors() -> None:
+    payload = {
+        "computer": [
+            {
+                "displayName": "agent-1",
+                "executors": [
+                    {
+                        "currentExecutable": {
+                            "number": 11,
+                            "fullDisplayName": "stuck_job #11",
+                            "timestamp": 1_000,
+                            "url": "https://jenkins.example/job/stuck_job/11/",
+                        }
+                    },
+                    {"currentExecutable": None},
+                ],
+                "oneOffExecutors": [
+                    {
+                        "currentExecutable": {
+                            "number": 12,
+                            "fullDisplayName": "folder » one_off_job #12",
+                            "timestamp": 2_000,
+                            "url": "https://jenkins.example/job/folder/job/one_off_job/12/",
+                        }
+                    }
+                ],
+            }
+        ]
+    }
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+
+    with patch("urllib.request.urlopen", return_value=_FakeResponse(json.dumps(payload).encode("utf-8"))):
+        builds = client.get_running_builds()
+
+    assert builds == [
+        {
+            "job_display_name": "stuck_job",
+            "build_number": 11,
+            "started_at_ms": 1_000,
+            "build_url": "https://jenkins.example/job/stuck_job/11/",
+            "executor": "agent-1#0",
+        },
+        {
+            "job_display_name": "folder » one_off_job",
+            "build_number": 12,
+            "started_at_ms": 2_000,
+            "build_url": "https://jenkins.example/job/folder/job/one_off_job/12/",
+            "executor": "agent-1#oneOff0",
+        },
+    ]
+
+
+def test_get_queue_items_parses_task_job_names() -> None:
+    payload = {
+        "items": [
+            {
+                "id": 101,
+                "why": "Waiting for next available executor",
+                "blocked": False,
+                "buildable": True,
+                "inQueueSince": 1_700_000_000_000,
+                "task": {
+                    "name": "order_daily_job",
+                    "url": "https://jenkins.example/job/order_daily_job/",
+                },
+            },
+            {
+                "id": 102,
+                "why": "Blocked by upstream",
+                "blocked": True,
+                "buildable": False,
+                "inQueueSince": 1_700_000_100_000,
+                "task": {
+                    "name": "one_off_job",
+                    "url": "https://jenkins.example/job/folder/job/one_off_job/",
+                },
+            },
+        ]
+    }
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+
+    with patch("urllib.request.urlopen", return_value=_FakeResponse(json.dumps(payload).encode("utf-8"))):
+        items = client.get_queue_items()
+
+    assert items == [
+        {
+            "queue_id": 101,
+            "job_display_name": "order_daily_job",
+            "why": "Waiting for next available executor",
+            "blocked": False,
+            "buildable": True,
+            "in_queue_since_ms": 1_700_000_000_000,
+            "jenkins_url": "https://jenkins.example/job/order_daily_job/",
+        },
+        {
+            "queue_id": 102,
+            "job_display_name": "folder/one_off_job",
+            "why": "Blocked by upstream",
+            "blocked": True,
+            "buildable": False,
+            "in_queue_since_ms": 1_700_000_100_000,
+            "jenkins_url": "https://jenkins.example/job/folder/job/one_off_job/",
+        },
+    ]
 
 
 def test_extract_error_lines_matches_keywords() -> None:

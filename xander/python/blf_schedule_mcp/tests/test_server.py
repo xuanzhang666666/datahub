@@ -7,6 +7,10 @@ from blf_schedule_mcp.server import TOOL_SPECS, BlfScheduleMcpApplication
 
 
 class FakeJenkinsClient:
+    def __init__(self) -> None:
+        self.running_build_calls = 0
+        self.queue_calls = 0
+
     def get_build_info(self, job_name: str, build_ref: int | str) -> dict[str, Any]:
         return {
             "number": 7,
@@ -16,6 +20,14 @@ class FakeJenkinsClient:
             "url": "",
             "building": False,
         }
+
+    def get_running_builds(self) -> list[dict[str, Any]]:
+        self.running_build_calls += 1
+        return []
+
+    def get_queue_items(self) -> list[dict[str, Any]]:
+        self.queue_calls += 1
+        return []
 
 
 class FakeDataHubClient:
@@ -30,27 +42,30 @@ class FakeDataHubClient:
         }
 
 
-def _build_app() -> tuple[BlfScheduleMcpApplication, FakeDataHubClient]:
+def _build_app() -> tuple[BlfScheduleMcpApplication, FakeDataHubClient, FakeJenkinsClient]:
     datahub_client = FakeDataHubClient()
+    jenkins_client = FakeJenkinsClient()
     app = BlfScheduleMcpApplication(
-        jenkins_client=FakeJenkinsClient(),  # type: ignore[arg-type]
+        jenkins_client=jenkins_client,  # type: ignore[arg-type]
         datahub_client=datahub_client,  # type: ignore[arg-type]
         mcp_token=None,
     )
-    return app, datahub_client
+    return app, datahub_client, jenkins_client
 
 
 def test_tools_list_includes_search_tool() -> None:
-    app, _ = _build_app()
+    app, _, _ = _build_app()
     response = app.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert response is not None
     names = {tool["name"] for tool in response["result"]["tools"]}
     assert "blf_search_schedule_job" in names
+    assert "blf_find_long_running_schedule_builds" in names
+    assert "blf_get_schedule_job_queue_stats" in names
     assert set(TOOL_SPECS) == names
 
 
 def test_tools_call_dispatches_search_to_datahub_client() -> None:
-    app, datahub_client = _build_app()
+    app, datahub_client, _ = _build_app()
     response = app.handle_rpc(
         {
             "jsonrpc": "2.0",
@@ -68,7 +83,7 @@ def test_tools_call_dispatches_search_to_datahub_client() -> None:
 
 
 def test_tools_call_dispatches_jenkins_tool_without_datahub() -> None:
-    app, datahub_client = _build_app()
+    app, datahub_client, _ = _build_app()
     response = app.handle_rpc(
         {
             "jsonrpc": "2.0",
@@ -82,4 +97,39 @@ def test_tools_call_dispatches_jenkins_tool_without_datahub() -> None:
     )
     assert response is not None
     assert response["result"]["isError"] is False
+    assert datahub_client.calls == []
+
+
+def test_tools_call_dispatches_long_running_build_scan_to_jenkins() -> None:
+    app, datahub_client, jenkins_client = _build_app()
+    response = app.handle_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "blf_find_long_running_schedule_builds",
+                "arguments": {"min_running_hours": 24},
+            },
+        }
+    )
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert jenkins_client.running_build_calls == 1
+    assert datahub_client.calls == []
+
+
+def test_tools_call_dispatches_queue_stats_to_jenkins() -> None:
+    app, datahub_client, jenkins_client = _build_app()
+    response = app.handle_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "blf_get_schedule_job_queue_stats", "arguments": {}},
+        }
+    )
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert jenkins_client.queue_calls == 1
     assert datahub_client.calls == []
