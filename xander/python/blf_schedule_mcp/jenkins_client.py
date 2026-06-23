@@ -109,6 +109,43 @@ class JenkinsClient:
                         builds.append(build)
         return builds
 
+    def get_job_config_xml(self, job_name: str) -> str:
+        """Fetch raw config.xml for a job (used to read trigger plugin config)."""
+        if not job_name or not job_name.strip():
+            raise ValueError("job_display_name is required")
+        encoded = urllib.parse.quote(job_name.strip(), safe="")
+        path = f"job/{encoded}/config.xml"
+        raw = self._open(path, max_bytes=262144)
+        return raw.decode("utf-8", errors="replace")
+
+    def get_build_parameters(self, job_name: str, build_ref: int | str) -> dict[str, str]:
+        """Return a flat {param_name: param_value (as str)} map for a build.
+
+        Handles ParametersAction from any of the build's actions.
+        """
+        tree = "actions[parameters[name,value]]"
+        path = self._job_path(job_name, str(build_ref), "api/json") + "?" + urllib.parse.urlencode({"tree": tree})
+        payload = self._open_json(path)
+        actions = payload.get("actions") if isinstance(payload, dict) else None
+        if not isinstance(actions, list):
+            return {}
+        result: dict[str, str] = {}
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            params = action.get("parameters")
+            if not isinstance(params, list):
+                continue
+            for entry in params:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if not name:
+                    continue
+                value = entry.get("value")
+                result[str(name)] = "" if value is None else str(value)
+        return result
+
     def get_queue_items(self) -> list[dict[str, Any]]:
         tree = (
             "items[id,why,blocked,buildable,inQueueSince,"

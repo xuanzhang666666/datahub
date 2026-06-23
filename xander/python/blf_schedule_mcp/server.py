@@ -15,13 +15,19 @@ from typing import Any, Callable
 from .datahub_client import DataHubClient
 from .jenkins_client import JenkinsClient
 from .tools import (
+    check_upstream_time_hour_match,
+    diagnose_dependency_trigger,
     diagnose_schedule_job_failure,
     find_long_running_schedule_builds,
+    format_time_hour_token_tool,
     get_schedule_job_build_history,
     get_schedule_job_build_log,
     get_schedule_job_build_status,
     get_schedule_job_last_failure,
     get_schedule_job_queue_stats,
+    is_user_triggered_build,
+    parse_trigger_condition_tool,
+    parse_upstream_job_params_tool,
     search_schedule_jobs,
 )
 
@@ -127,6 +133,126 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "blf_parse_trigger_condition": {
+        "description": "解析 job-dependency-plugin 的 triggerCondition 字符串(如 h = 1 & 2 / d = @$ / h = *$ - 1),"
+        " 返回 {date_type, logic_symbol, date_list} 并校验格式。"
+        " 端口自 Java: TriggerConditionParser。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "condition_str": {
+                    "type": "string",
+                    "description": "完整的 triggerCondition 字符串,例如 'h = 1 & 2' 或 'd = @$' 或 'h = *$ - 1'。",
+                },
+            },
+            "required": ["condition_str"],
+        },
+    },
+    "blf_parse_upstream_job_params": {
+        "description": "解析 job-dependency-plugin 的 upstreamJobParams 字段(如 A,B 或 A.param,B.3.company)。"
+        " 端口自 Java: UpstreamJobParams.getJobParams。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "params_str": {
+                    "type": "string",
+                    "description": "upstreamJobParams 字段的完整字符串,',' 分隔多个上游参数项。",
+                },
+            },
+            "required": ["params_str"],
+        },
+    },
+    "blf_format_time_hour_token": {
+        "description": "按 date_type (HOUR/DAY/WEEK/MONTH) 归一化 time_hour 字符串。"
+        " 端口自 Java: getOnlyBuildOnceFormatStringContext + DateUtils。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "token": {"type": "string", "description": "time_hour 字符串,格式 yyyy/MM/dd/HH。"},
+                "date_type": {
+                    "type": "string",
+                    "enum": ["HOUR", "DAY", "WEEK", "MONTH"],
+                    "description": "归一化目标粒度。HOUR 不做格式化,DAY/WEEK/MONTH 分别归一化到对应的精度。",
+                },
+            },
+            "required": ["token", "date_type"],
+        },
+    },
+    "blf_check_upstream_time_hour_match": {
+        "description": "给定上游任务 + 下游当前的 time_hour + triggerCondition,"
+        " 列出该上游最近若干次构建,逐个说明 time_hour 是否满足 condition、result 是否 SUCCESS。"
+        " 用于排查'上游跑成功了为什么下游没触发'。"
+        " 端口自 Java: AbstractTriggerDownstream.matchTokenFromBuildHistory。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "upstream_job": {"type": "string", "description": "上游 Jenkins job 名。"},
+                "time_hour": {"type": "string", "description": "下游任务当前携带的 time_hour,格式 yyyy/MM/dd/HH。"},
+                "trigger_condition": {
+                    "type": "string",
+                    "default": "",
+                    "description": "上游对应的 triggerCondition,留空表示只用 time_hour 直接匹配。",
+                },
+                "build_limit": {"type": "integer", "default": 20, "description": "最多返回多少条上游构建评估结果,上限 50。"},
+                "history_limit": {"type": "integer", "default": 30, "description": "从 Jenkins 拉取上游最近构建的数量,上限 50。"},
+            },
+            "required": ["upstream_job", "time_hour"],
+        },
+    },
+    "blf_diagnose_dependency_trigger": {
+        "description": "综合诊断'为什么上游 A 跑完后没触发下游 B'。"
+        " 复刻 JobDependencyBuildTrigger.shouldTriggerBuild 的三道闸门:"
+        " (1) result 是否满足 threshold; (2) onlyBuildOnce 是否被队列里的同 time_hour 项拦截;"
+        " (3) triggerCondition + time_hour 匹配是否成功。"
+        " 每一道闸门单独给出通过/失败结论 + 排查建议。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "downstream_job": {"type": "string", "description": "下游 Jenkins job 名。"},
+                "time_hour": {"type": "string", "description": "下游任务携带的 time_hour。"},
+                "upstream_job": {"type": "string", "description": "上游 Jenkins job 名。"},
+                "trigger_condition": {
+                    "type": "string",
+                    "default": "",
+                    "description": "上游对应的 triggerCondition,留空表示只用 time_hour 直接匹配。",
+                },
+                "threshold": {
+                    "type": "string",
+                    "enum": ["SUCCESS", "UNSTABLE", "FAILED"],
+                    "default": "SUCCESS",
+                    "description": "上游 result 的最低要求,对应 Java ResultCondition。",
+                },
+                "build_ref": {
+                    "type": ["string", "integer"],
+                    "default": "lastBuild",
+                    "description": "上游的构建引用,默认 lastBuild。",
+                },
+            },
+            "required": ["downstream_job", "time_hour", "upstream_job"],
+        },
+    },
+    "blf_is_user_triggered_build": {
+        "description": "递归向上游检查 CauseAction 链,判断这次构建最终是否由用户手动触发。"
+        " 用于排查 onlyBuildOnce 是否会因为'人工触发'而放行。"
+        " 端口自 Java: BuildTriggerUtils.isTriggerByUser。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "Jenkins job 名。"},
+                "build_ref": {
+                    "type": ["string", "integer"],
+                    "default": "lastBuild",
+                    "description": "构建引用。",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "default": 20,
+                    "description": "上游 cause chain 最大递归深度,上限 100。",
+                },
+            },
+            "required": ["job_display_name"],
+        },
+    },
 }
 
 
@@ -164,6 +290,12 @@ class BlfScheduleMcpApplication:
             "blf_search_schedule_job": functools.partial(search_schedule_jobs, datahub_client),
             "blf_find_long_running_schedule_builds": functools.partial(find_long_running_schedule_builds, jenkins_client),
             "blf_get_schedule_job_queue_stats": functools.partial(get_schedule_job_queue_stats, jenkins_client),
+            "blf_parse_trigger_condition": parse_trigger_condition_tool,
+            "blf_parse_upstream_job_params": parse_upstream_job_params_tool,
+            "blf_format_time_hour_token": format_time_hour_token_tool,
+            "blf_check_upstream_time_hour_match": functools.partial(check_upstream_time_hour_match, jenkins_client),
+            "blf_diagnose_dependency_trigger": functools.partial(diagnose_dependency_trigger, jenkins_client),
+            "blf_is_user_triggered_build": functools.partial(is_user_triggered_build, jenkins_client),
         }
 
     def authorized(self, header_value: str | None) -> bool:
