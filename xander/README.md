@@ -114,6 +114,33 @@ mysql_bach_inventory,inventory2.w.mysql.bj1,10.253.2.222,33008,从库'
 sh /data/datahub/scripts/run_mysql_ingest.sh
 ```
 
+### 1e）Jenkins：批量配置 Naginator 失败重试
+
+- **入口脚本**：`[python/scripts/run_update_jenkins_retry_config.sh](python/scripts/run_update_jenkins_retry_config.sh)`
+- **Python 实现**：`[python/job_info_sync_datahub/update_jenkins_retry_config.py](python/job_info_sync_datahub/update_jenkins_retry_config.py)`
+- **Jenkins 参数**：
+  - `ACTION`：`dry-run`（默认）、`apply` 或 `restore`
+  - `JOBS`：Multi-line String，每行一个 Job 名；忽略空行、`#` 注释和重复项
+  - `BACKUP_RUN_DIR`：恢复时必填，指向原更新批次目录
+  - `RESTORE_ALL=1`：`JOBS` 为空时恢复备份批次中的全部成功更新
+- **更新规则**：已有任意 `NaginatorPublisher` 直接跳过；否则配置固定延迟 60 秒、最多重试 1 次。
+- **备份目录**：`/data/datahub/backups/jenkins-retry/<run_id>/`，包含原始 XML、`manifest.jsonl`、任务快照和汇总报告。恢复前会校验当前 XML 与更新后哈希一致，防止覆盖后续人工修改。
+
+```bash
+export ACTION=apply
+export JOBS="${JOBS}"
+sh /data/datahub/scripts/run_update_jenkins_retry_config.sh
+```
+
+按名单恢复：
+
+```bash
+export ACTION=restore
+export BACKUP_RUN_DIR=/data/datahub/backups/jenkins-retry/apply_YYYYMMDD_HHMMSS_xxxxxx
+export JOBS="${JOBS}"
+sh /data/datahub/scripts/run_update_jenkins_retry_config.sh
+```
+
 ### 2）Hive 表清单 xlsx → 切分 → 串行 ingest
 
 - **入口脚本**：`[run/ingest_hive_table_list_serial_from_xlsx.sh](run/ingest_hive_table_list_serial_from_xlsx.sh)`  

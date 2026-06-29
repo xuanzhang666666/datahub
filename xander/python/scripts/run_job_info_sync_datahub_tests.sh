@@ -56,6 +56,7 @@ else
     job_info_sync_datahub/tests/test_export_view_datasets_report.py \
     job_info_sync_datahub/tests/test_batch_update_view_availability_flags.py \
     job_info_sync_datahub/tests/test_mysql_ingest_recipe.py \
+    job_info_sync_datahub/tests/test_update_jenkins_retry_config.py \
     -q "$@"
 fi
 

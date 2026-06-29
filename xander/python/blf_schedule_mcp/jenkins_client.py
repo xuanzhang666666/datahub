@@ -33,7 +33,12 @@ class JenkinsClient:
     timeout_sec: int = 30
 
     def get_job_info(self, job_name: str) -> dict[str, Any]:
-        return self._open_json(self._job_path(job_name, "api/json"))
+        # 用 tree= 限定返回字段,避免触发 AbstractProject.getAllDownstreamProjects()
+        # 那个递归会遍历整棵下游依赖树(可能数千节点),导致 Jenkins CPU 飙升。
+        # 调用方只用了 builds 字段(取长度),所以只请求 build number 列表。
+        tree = "name,url,buildable,displayName,nextBuildNumber,builds[number]"
+        path = self._job_path(job_name, "api/json") + "?" + urllib.parse.urlencode({"tree": tree})
+        return self._open_json(path)
 
     def get_last_build(self, job_name: str) -> dict[str, Any]:
         return self.get_build_info(job_name, "lastBuild")
@@ -45,7 +50,15 @@ class JenkinsClient:
         return self.get_build_info(job_name, "lastSuccessfulBuild")
 
     def get_build_info(self, job_name: str, build_ref: int | str) -> dict[str, Any]:
-        return self._open_json(self._job_path(job_name, str(build_ref), "api/json"))
+        # 用 tree= 限定返回字段,避免触发 AbstractProject.getAllDownstreamProjects()
+        # 调用方实际只用 number/result/timestamp/duration/url/building/actions。
+        # actions 里 is_user_triggered_build 只看 _class 和 causes[shortDescription,_class]。
+        tree = (
+            "number,result,timestamp,duration,url,building,"
+            "actions[_class,causes[shortDescription,_class]]"
+        )
+        path = self._job_path(job_name, str(build_ref), "api/json") + "?" + urllib.parse.urlencode({"tree": tree})
+        return self._open_json(path)
 
     def get_build_log(
         self,

@@ -5,7 +5,7 @@
 用法:
   python3 list_no_downstream_jobs.py [--out no_downstream_jobs_TIME.xlsx]
 """
-import concurrent.futures
+import calendar
 import json
 import os
 import sys
@@ -35,11 +35,24 @@ SCHEDULE_URL_PROP_URN = "urn:li:structuredProperty:blf.data.schedule.schedule_ur
 HIVE_PLATFORM_INSTANCE = os.environ.get("BLF_DATAHUB_PLATFORM_INSTANCE", "blf-prod-hive")
 JENKINS_BATCH_CLUSTER_MINUTES = int(os.environ.get("JENKINS_BATCH_CLUSTER_MINUTES", "10"))
 JENKINS_DELETED_THRESHOLD_HOURS = int(os.environ.get("JENKINS_DELETED_THRESHOLD_HOURS", "2"))
+BUILD_HISTORY_TABLE = os.environ.get(
+    "BUILD_HISTORY_TABLE",
+    "default.pdw_data_platform_dmp_schedule_build_history",
+)
 
 _PDW_ODS_PREFIXES = ("pdw", "ods")
 _JENKINS_EXISTS = "存在"
 _JENKINS_DELETED = "疑似已删除"
 _JENKINS_UNKNOWN = "未知"
+_INTEGER_EXCEL_FIELDS = {
+    "job_count",
+    "build_cnt",
+    "success_build_cnt",
+    "recent_7d_success_build_cnt",
+    "avg_rmb",
+    "avg_duration_min",
+}
+_RATE_EXCEL_FIELDS = {"success_build_rate"}
 
 # job 名前缀 → Hive 库名（前缀越长越优先，fallback 为 default）
 _JOB_PREFIX_TO_DB = {
@@ -275,6 +288,28 @@ def _format_batch_exec_time(value):
     return parsed.strftime("%Y-%m-%d %H:%M:%S") if parsed else ""
 
 
+def _format_cell_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, _dt.datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, _dt.date):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
+
+
+def _excel_cell_value_and_format(field, value):
+    if value in ("", None):
+        return "", None
+    if field == "job_size":
+        return round(float(value) / (1024 * 1024), 2), "0.00"
+    if field in _INTEGER_EXCEL_FIELDS:
+        return int(float(value)), "0"
+    if field in _RATE_EXCEL_FIELDS:
+        return float(value), "0.00%"
+    return value, None
+
+
 def _mysql_connection():
     try:
         from scheduler_datajob_sync.mysql_client import default_connection_factory
@@ -297,33 +332,52 @@ def _mysql_connection():
     )
 
 
-def fetch_jenkins_batch_exec_times():
+def fetch_jenkins_job_metadata():
     conn = _mysql_connection()
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT job_display_name, batch_exec_time "
+            "SELECT job_display_name, batch_exec_time, job_size, job_count, assigned_node "
             "FROM dmp_schedule_job_basic_info "
             "WHERE job_display_name IS NOT NULL"
         )
-        batch_times = {}
+        job_metadata = {}
         latest_batch_exec_time = None
         for row in cur.fetchall():
             job_name = row.get("job_display_name")
             batch_time = _parse_batch_exec_time(row.get("batch_exec_time"))
             if not job_name:
                 continue
-            existing = batch_times.get(job_name)
-            if existing is None or (batch_time is not None and batch_time > existing):
-                batch_times[job_name] = batch_time
+            existing = job_metadata.get(job_name, {})
+            existing_time = _parse_batch_exec_time(existing.get("batch_exec_time"))
+            if existing_time is None or (
+                batch_time is not None and batch_time > existing_time
+            ):
+                job_metadata[job_name] = {
+                    "batch_exec_time": batch_time,
+                    "job_size": _format_cell_value(row.get("job_size")),
+                    "job_count": _format_cell_value(row.get("job_count")),
+                    "assigned_node": _format_cell_value(row.get("assigned_node")),
+                }
             if batch_time is not None and (
                 latest_batch_exec_time is None or batch_time > latest_batch_exec_time
             ):
                 latest_batch_exec_time = batch_time
-        return batch_times, latest_batch_exec_time
+        return job_metadata, latest_batch_exec_time
     finally:
         cur.close()
         conn.close()
+
+
+def fetch_jenkins_batch_exec_times():
+    job_metadata, latest_batch_exec_time = fetch_jenkins_job_metadata()
+    return (
+        {
+            job_name: info.get("batch_exec_time")
+            for job_name, info in job_metadata.items()
+        },
+        latest_batch_exec_time,
+    )
 
 
 def classify_jenkins_job_status(
@@ -342,6 +396,138 @@ def classify_jenkins_job_status(
         else _JENKINS_EXISTS
     )
     return (status, _format_batch_exec_time(batch_time))
+
+
+def _trino_connection():
+    try:
+        import trino
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖：请先安装 trino") from exc
+    return trino.dbapi.connect(
+        host=os.getenv("TRINO_HOST", "10.253.7.167"),
+        port=int(os.getenv("TRINO_PORT", "8081")),
+        user=os.getenv("TRINO_USER", "xuan.zhang"),
+        catalog=os.getenv("TRINO_CATALOG", "hive"),
+        schema=os.getenv("TRINO_SCHEMA", "default"),
+    )
+
+
+def _one_month_ago_start(day):
+    year = day.year
+    month = day.month - 1
+    if month == 0:
+        year -= 1
+        month = 12
+    last_day = calendar.monthrange(year, month)[1]
+    return _dt.datetime(year, month, min(day.day, last_day)).strftime(
+        "%Y-%m-%d 00:00:00"
+    )
+
+
+def _days_ago_start(day, days):
+    return (_dt.datetime.combine(day, _dt.time.min) - _dt.timedelta(days=days)).strftime(
+        "%Y-%m-%d 00:00:00"
+    )
+
+
+def _parse_dt_partition(value):
+    return _dt.datetime.strptime(str(value), "%Y%m%d").date()
+
+
+def build_job_build_stats_sql(table, latest_dt, since_time, recent_7d_since_time):
+    safe_table = table.replace("'", "''")
+    safe_dt = str(latest_dt).replace("'", "''")
+    safe_since = since_time.replace("'", "''")
+    safe_recent_7d_since = recent_7d_since_time.replace("'", "''")
+    return f"""
+WITH tmp1 AS (
+  SELECT *
+  FROM {safe_table}
+  WHERE dt = '{safe_dt}'
+    AND build_time >= '{safe_since}'
+)
+SELECT
+  job_name,
+  COUNT(DISTINCT build_id) AS build_cnt,
+  COUNT(DISTINCT CASE WHEN result = '成功' THEN build_id END) AS success_build_cnt,
+  COUNT(DISTINCT CASE WHEN result = '成功' AND build_time >= '{safe_recent_7d_since}' THEN build_id END) AS recent_7d_success_build_cnt,
+  CAST(COUNT(DISTINCT CASE WHEN result = '成功' THEN build_id END) AS DOUBLE) / COUNT(DISTINCT build_id) AS success_build_rate,
+  MAX(build_time) AS last_build_time,
+  MAX(queue) AS queue,
+  MAX(agent) AS agent,
+  MAX(trigger_user) AS trigger_user,
+  CEIL(AVG(CASE WHEN result = '成功' THEN rmb END)) AS avg_rmb,
+  CEIL(AVG(CASE WHEN result = '成功' THEN duration END) / (60 * 1000)) AS avg_duration_min
+FROM tmp1
+GROUP BY job_name
+""".strip()
+
+
+def _log_sql(title, sql):
+    print(f"\n--- {title} ---", flush=True)
+    print(sql, flush=True)
+    print(f"--- end {title} ---\n", flush=True)
+
+
+def normalize_build_history_stats(rows):
+    stats = {}
+    for row in rows:
+        if not row or not row[0]:
+            continue
+        success_rate = row[4]
+        if success_rate is None:
+            success_rate_text = ""
+        else:
+            success_rate_text = f"{float(success_rate):.4f}"
+        stats[str(row[0])] = {
+            "build_cnt": _format_cell_value(row[1]),
+            "success_build_cnt": _format_cell_value(row[2]),
+            "recent_7d_success_build_cnt": _format_cell_value(row[3]),
+            "success_build_rate": success_rate_text,
+            "last_build_time": _format_batch_exec_time(row[5]),
+            "queue": _format_cell_value(row[6]),
+            "agent": _format_cell_value(row[7]),
+            "trigger_user": _format_cell_value(row[8]),
+            "avg_rmb": _format_cell_value(row[9]),
+            "avg_duration_min": _format_cell_value(row[10]),
+        }
+    return stats
+
+
+def fetch_job_build_history_stats():
+    conn = _trino_connection()
+    cur = conn.cursor()
+    try:
+        dt_sql = f"SELECT max(dt) FROM {BUILD_HISTORY_TABLE}"
+        print(f"构建统计表: {BUILD_HISTORY_TABLE}", flush=True)
+        _log_sql("build_history_latest_dt_sql", dt_sql)
+        cur.execute(dt_sql)
+        latest_dt = (cur.fetchone() or [None])[0]
+        if not latest_dt:
+            print("构建统计表未查询到 dt，跳过构建统计。", flush=True)
+            return {}, ""
+        latest_dt_day = _parse_dt_partition(latest_dt)
+        since_time = _one_month_ago_start(latest_dt_day)
+        recent_7d_since_time = _days_ago_start(latest_dt_day, 7)
+        print(
+            f"构建统计参数: latest_dt={latest_dt}, since_time={since_time}, "
+            f"recent_7d_since_time={recent_7d_since_time}",
+            flush=True,
+        )
+        stats_sql = build_job_build_stats_sql(
+            BUILD_HISTORY_TABLE,
+            latest_dt,
+            since_time,
+            recent_7d_since_time,
+        )
+        _log_sql("build_history_stats_sql", stats_sql)
+        cur.execute(stats_sql)
+        stats = normalize_build_history_stats(cur.fetchall())
+        print(f"构建统计查询完成: {len(stats)} 个任务", flush=True)
+        return stats, str(latest_dt)
+    finally:
+        cur.close()
+        conn.close()
 
 
 def main():
@@ -390,21 +576,37 @@ def main():
     never_descendants = bfs_descendants(NEVER_EXECUTE_JOB, downstream_of)
     print(f"never_execute_job 的下游任务数（直接+间接）: {len(never_descendants)}", flush=True)
 
-    jenkins_batch_exec_times = {}
+    jenkins_job_metadata = {}
     latest_batch_exec_time = None
     jenkins_lookup_failed = False
     try:
         print("正在查询 Jenkins 任务元数据批次时间（MySQL）...", flush=True)
-        jenkins_batch_exec_times, latest_batch_exec_time = fetch_jenkins_batch_exec_times()
+        jenkins_job_metadata, latest_batch_exec_time = fetch_jenkins_job_metadata()
         latest_text = _format_batch_exec_time(latest_batch_exec_time) or "-"
         print(
-            f"Jenkins 元数据任务数: {len(jenkins_batch_exec_times)}  |  "
+            f"Jenkins 元数据任务数: {len(jenkins_job_metadata)}  |  "
             f"最新批次时间: {latest_text}  |  批次聚合窗口: {JENKINS_BATCH_CLUSTER_MINUTES} 分钟",
             flush=True,
         )
     except Exception as exc:
         jenkins_lookup_failed = True
         print(f"[warning] 查询 Jenkins 任务元数据批次失败: {exc}", file=sys.stderr, flush=True)
+
+    build_history_stats = {}
+    try:
+        print("正在查询近一个月构建统计（Trino/Hive）...", flush=True)
+        build_history_stats, latest_build_dt = fetch_job_build_history_stats()
+        print(
+            f"构建统计任务数: {len(build_history_stats)}  |  最新 dt: {latest_build_dt or '-'}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[warning] 查询构建统计失败: {exc}", file=sys.stderr, flush=True)
+
+    jenkins_batch_exec_times = {
+        job_name: metadata.get("batch_exec_time")
+        for job_name, metadata in jenkins_job_metadata.items()
+    }
 
     rows = []
     for job_name, info in job_data.items():
@@ -422,6 +624,8 @@ def main():
         custom = info["custom"]
         job_id = info["job_id"]
         prefix = job_id.split("_")[0] if job_id else ""
+        jenkins_metadata = jenkins_job_metadata.get(job_name, {})
+        build_stats = build_history_stats.get(job_name, {})
         if jenkins_lookup_failed:
             jenkins_status, jenkins_batch_exec_time = (_JENKINS_UNKNOWN, "")
         else:
@@ -442,9 +646,18 @@ def main():
             "remark": info["remark"],
             "documentation": info["documentation"],
             "owners": info["owners"],
-            "hive_type": "",
-            "hive_downstream": "",
-            "hive_view_downstream": "",
+            "job_size": jenkins_metadata.get("job_size", ""),
+            "job_count": jenkins_metadata.get("job_count", ""),
+            "assigned_node": jenkins_metadata.get("assigned_node", ""),
+            "build_cnt": build_stats.get("build_cnt", ""),
+            "success_build_cnt": build_stats.get("success_build_cnt", ""),
+            "recent_7d_success_build_cnt": build_stats.get("recent_7d_success_build_cnt", ""),
+            "success_build_rate": build_stats.get("success_build_rate", ""),
+            "queue": build_stats.get("queue", ""),
+            "agent": build_stats.get("agent", ""),
+            "trigger_user": build_stats.get("trigger_user", ""),
+            "avg_rmb": build_stats.get("avg_rmb", ""),
+            "avg_duration_min": build_stats.get("avg_duration_min", ""),
             "jenkins_status": jenkins_status,
             "jenkins_batch_exec_time": jenkins_batch_exec_time,
         })
@@ -456,33 +669,6 @@ def main():
     has_ds_count = sum(1 for r in rows if r["reason"] == "有下游依赖")
     print(f"无下游依赖: {no_ds_count}  |  never_execute_job 下游: {never_count}  |  有下游依赖: {has_ds_count}  |  合计: {len(rows)}", flush=True)
 
-    # ── 并发查询 pdw/ods job 的 hive 表信息（类型 + 下游总数 + view 数）────────
-    pdw_ods_indices = [
-        i for i, r in enumerate(rows)
-        if r["prefix"] in _PDW_ODS_PREFIXES
-    ]
-    if pdw_ods_indices:
-        print(f"\n正在查询 {len(pdw_ods_indices)} 个 pdw/ods job 的 Hive 表信息"
-              f"（并发 20 线程）...", flush=True)
-        done_count = [0]
-
-        def _query_and_set(idx):
-            hive_type, total, views = fetch_hive_info(
-                rows[idx]["job_name"],
-                schedule_url=rows[idx].get("schedule_url", ""),
-            )
-            rows[idx]["hive_type"] = hive_type
-            rows[idx]["hive_downstream"] = total
-            rows[idx]["hive_view_downstream"] = views
-            done_count[0] += 1
-            n = len(pdw_ods_indices)
-            if done_count[0] % 200 == 0 or done_count[0] == n:
-                print(f"  已查询 {done_count[0]}/{n}...", end="\r", flush=True)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            list(executor.map(_query_and_set, pdw_ods_indices))
-        print(flush=True)
-
     # ── Excel ─────────────────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -492,7 +678,6 @@ def main():
     HEADER_FONT  = Font(bold=True, color="FFFFFF")
     ROW_FILL     = PatternFill("solid", fgColor="DCE6F1")
     NEVER_FILL   = PatternFill("solid", fgColor="FCE4D6")
-    ZERO_DS_FILL = PatternFill("solid", fgColor="FFC000")   # 下游总数=0 橙黄高亮
 
     HEADERS = [
         ("job名",              55),
@@ -504,9 +689,18 @@ def main():
         ("remark",              25),
         ("Documentation",       50),
         ("Owners",              20),
-        ("Hive表类型",          12),
-        ("Hive下游总数",         12),
-        ("Hive下游非VIEW数",      14),
+        ("job_size(MB)",        14),
+        ("job_count",           12),
+        ("assigned_node",       18),
+        ("近1月构建次数",          14),
+        ("近1月成功次数",          14),
+        ("近7天成功次数",          14),
+        ("近1月成功率",           14),
+        ("queue",               18),
+        ("agent",               18),
+        ("trigger_user",        18),
+        ("成功平均RMB",           14),
+        ("成功平均耗时分钟",        16),
         ("Jenkins状态",          14),
         ("Jenkins元数据批次时间",  22),
     ]
@@ -514,7 +708,10 @@ def main():
         "job_name", "prefix", "build_update_time", "job_disable",
         "direct_downstream_count", "reason",
         "remark", "documentation", "owners",
-        "hive_type", "hive_downstream", "hive_view_downstream",
+        "job_size", "job_count", "assigned_node",
+        "build_cnt", "success_build_cnt", "recent_7d_success_build_cnt",
+        "success_build_rate", "queue", "agent", "trigger_user",
+        "avg_rmb", "avg_duration_min",
         "jenkins_status", "jenkins_batch_exec_time",
     ]
     ncols = len(HEADERS)
@@ -526,23 +723,19 @@ def main():
         cell.alignment = Alignment(horizontal="center")
         ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = w
 
-    COL_DS    = FIELDS.index("hive_downstream") + 1
-    COL_VIEWS = FIELDS.index("hive_view_downstream") + 1
-
     for r, job in enumerate(rows, 2):
         is_never = job["reason"] == "never_execute_job 的下游"
         row_fill = NEVER_FILL if is_never else (ROW_FILL if r % 2 == 0 else None)
 
         for c, key in enumerate(FIELDS, 1):
-            ws.cell(r, c, job[key])
+            value, number_format = _excel_cell_value_and_format(key, job[key])
+            cell = ws.cell(r, c, value)
+            if number_format:
+                cell.number_format = number_format
 
         if row_fill:
             for c in range(1, ncols + 1):
                 ws.cell(r, c).fill = row_fill
-
-        # 下游总数=0 单独橙黄高亮，便于识别可删候选
-        if job["hive_downstream"] == "0":
-            ws.cell(r, COL_DS).fill = ZERO_DS_FILL
 
     ws.freeze_panes = "A2"
     last_col = ws.cell(row=1, column=ncols).column_letter
