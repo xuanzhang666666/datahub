@@ -44,7 +44,7 @@ ssh -i ~/.ssh/agent-bastion -p 7233 -o StrictHostKeyChecking=no agent@10.253.40.
 printf '#!/bin/bash\n\
 FTP_HOST="10.253.58.18"\n\
 FTP_USER="xuan.zhang"\n\
-FTP_PASS="Zx7758522"\n\
+FTP_PASS="<FTP_PASS_FROM_EXISTING_PUT2_GET2_CONFIG_OR_OPERATOR>"\n\
 ftp_upload() {\n\
   local F=$1; local R=$2\n\
   ftp -niv << EOF\n\

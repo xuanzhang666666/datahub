@@ -106,8 +106,38 @@ MCP 客户端 (HTTP POST /mcp)
 - 登录态文件在 `/root/.btalk/`，挂载到宿主机，容器重建后不丢失
 - 异常时用 `wsso_cookie(reset=true)` 强制刷新
 
+## 构建 & 部署
+
+| 文件 | 作用 |
+|------|------|
+| `Dockerfile` | 基于 `node:22.23.1-slim`，装 `@wnpm/btalk-cli` + `supergateway`，**用本目录 `src/mcp/tools.js` 覆盖上游的 6 工具版** |
+| `scripts/build.sh` | `docker build -t btalk-mcp:enhanced[-<cli>-<date>]`；保留不可变标签用于回滚 |
+| `scripts/deploy.sh` | ssh 跳板到 neo4j2，rm 旧容器 → run 新容器 → 等就绪 → 跑 smoke |
+| `scripts/smoke-test.sh` | `initialize` + `tools/list` 计数 + 抽样调用 6 个工具；< 24 即视为回退 |
+
+### 一次完整升级（CLI 新版本发布）
+
+```bash
+cd /Users/zhangxuan/Documents/wormpex/code-project/github/datahub/xander/python/btalk_mcp
+
+# 1. 查 btalk-cli 最新版本
+npm view @wnpm/btalk-cli version --registry=https://registry.corp.bianlifeng.com
+
+# 2. 如有 SDK 行为变更(zod/SDK API),改 src/mcp/tools.js 适配
+
+# 3. 升级
+./scripts/build.sh 0.4.7        # 构建 btalk-mcp:enhanced-0.4.7-20260701
+./scripts/deploy.sh              # 部署到 neo4j2,自动跑 smoke
+
+# 4. 失败回滚
+./scripts/deploy.sh --rollback   # 取上一个 btalk-mcp:enhanced-<cli>-<date> 镜像回滚
+```
+
 ## 注意事项
 
-- 本目录是**源码镜像**，不是可直接运行的项目（缺少 node_modules 和 native `.node` 预编译库）
-- 修改后需重新打包镜像并在 neo4j2 重建容器
-- native 模块 `btalksdk-node.node` 需要 `libresolv.so.2`，镜像需基于带该库的 Linux 发行版
+- 本目录是**源码镜像**，`src/mcp/tools.js` 是相对于 npm 上游 6 工具的**增强补丁**。
+  上游发布时只覆盖 6 个 SDK 直连工具，需要本目录的 `tools.js` 来补全 18 个 CLI 桥接工具。
+- **必须用本目录的 `Dockerfile` 构建**，否则会用 npm 上游默认的 6 工具版。
+- 改完 `tools.js` 后用 `./scripts/build.sh` 重新出镜像，再用 `./scripts/deploy.sh` 部署。
+- native 模块 `btalksdk-node.node` 需要 `libresolv.so.2`，镜像需基于带该库的 Linux 发行版。
+- 容器名固定 `btalk-mcp`，端口 `9013`，登录态卷 `/root/.btalk`，**重建容器时不要漏挂这个卷**。
