@@ -29,6 +29,7 @@ from .tools import (
     parse_trigger_condition_tool,
     parse_upstream_job_params_tool,
     search_schedule_jobs,
+    trigger_schedule_job_build,
 )
 
 logger = logging.getLogger("blf_schedule_mcp")
@@ -131,6 +132,25 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "description": "按 job 聚合后最多返回多少个任务统计项，上限 1000；items 始终返回全部队列 Task。",
                 },
             },
+        },
+    },
+    "blf_trigger_schedule_job_build": {
+        "description": "触发一个 BLF 调度作业构建。该工具会产生真实 Jenkins 构建请求，必须显式传 confirm=true。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "要触发构建的 Jenkins 调度作业名称。"},
+                "parameters": {
+                    "type": "object",
+                    "default": {},
+                    "description": "可选构建参数，例如 {\"time_hour\":\"2026/07/01/20\"}；没有参数时触发普通 build。",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "安全确认开关。只有传 true 时才会实际触发构建。",
+                },
+            },
+            "required": ["job_display_name", "confirm"],
         },
     },
     "blf_parse_trigger_condition": {
@@ -290,6 +310,7 @@ class BlfScheduleMcpApplication:
             "blf_search_schedule_job": functools.partial(search_schedule_jobs, datahub_client),
             "blf_find_long_running_schedule_builds": functools.partial(find_long_running_schedule_builds, jenkins_client),
             "blf_get_schedule_job_queue_stats": functools.partial(get_schedule_job_queue_stats, jenkins_client),
+            "blf_trigger_schedule_job_build": functools.partial(trigger_schedule_job_build, jenkins_client),
             "blf_parse_trigger_condition": parse_trigger_condition_tool,
             "blf_parse_upstream_job_params": parse_upstream_job_params_tool,
             "blf_format_time_hour_token": format_time_hour_token_tool,

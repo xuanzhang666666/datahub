@@ -177,6 +177,27 @@ class JenkinsClient:
                 queue_items.append(formatted)
         return queue_items
 
+    def trigger_build(
+        self,
+        job_name: str,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        params = _normalize_build_parameters(parameters)
+        endpoint = "buildWithParameters" if params else "build"
+        raw, headers = self._post_with_headers(
+            self._job_path(job_name, endpoint),
+            data=params,
+            max_bytes=4096,
+        )
+        location = headers.get("Location") or ""
+        return {
+            "endpoint": f"/job/{{name}}/{endpoint}",
+            "queue_url": location,
+            "queue_id": _queue_id_from_location(location),
+            "response_text": raw.decode("utf-8", errors="replace"),
+        }
+
     def _open_json(self, path: str) -> dict[str, Any]:
         raw = self._open(path, max_bytes=262144)
         if not raw:
@@ -227,6 +248,64 @@ class JenkinsClient:
             ) from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             raise JenkinsClientError(f"Jenkins API request failed: {exc}") from exc
+
+    def _post_with_headers(
+        self,
+        path: str,
+        *,
+        data: dict[str, str],
+        max_bytes: int,
+    ) -> tuple[bytes, Message]:
+        try:
+            return self._open_post_with_headers(path, data=data, max_bytes=max_bytes)
+        except JenkinsClientError as exc:
+            if exc.status_code != 403:
+                raise
+        crumb_headers = self._crumb_headers()
+        return self._open_post_with_headers(
+            path,
+            data=data,
+            max_bytes=max_bytes,
+            extra_headers=crumb_headers,
+        )
+
+    def _open_post_with_headers(
+        self,
+        path: str,
+        *,
+        data: dict[str, str],
+        max_bytes: int,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[bytes, Message]:
+        headers = self._headers()
+        headers.update(extra_headers or {})
+        encoded = urllib.parse.urlencode(data).encode("utf-8")
+        if encoded:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        request = urllib.request.Request(
+            self._url(path),
+            data=encoded,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
+                return response.read(max_bytes + 1)[:max_bytes], response.headers
+        except urllib.error.HTTPError as exc:
+            raise JenkinsClientError(
+                f"Jenkins API request failed with HTTP {exc.code}",
+                status_code=exc.code,
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            raise JenkinsClientError(f"Jenkins API request failed: {exc}") from exc
+
+    def _crumb_headers(self) -> dict[str, str]:
+        payload = self._open_json("crumbIssuer/api/json")
+        crumb_request_field = payload.get("crumbRequestField")
+        crumb = payload.get("crumb")
+        if not crumb_request_field or not crumb:
+            raise JenkinsClientError("Jenkins crumbIssuer response missing crumb fields", status_code=403)
+        return {str(crumb_request_field): str(crumb)}
 
     def _headers(self) -> dict[str, str]:
         headers = {"User-Agent": "blf-schedule-mcp/0.1"}
@@ -303,3 +382,26 @@ def _job_display_name_from_task(task: dict[str, Any]) -> str:
     if full_display_name:
         return full_display_name
     return str(task.get("name") or "").strip()
+
+
+def _normalize_build_parameters(parameters: dict[str, Any] | None) -> dict[str, str]:
+    if parameters is None:
+        return {}
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters must be an object")
+    result: dict[str, str] = {}
+    for key, value in parameters.items():
+        name = str(key).strip()
+        if not name:
+            raise ValueError("parameters contains an empty parameter name")
+        if isinstance(value, (dict, list, tuple, set)):
+            raise ValueError(f"parameter {name} must be a scalar value")
+        result[name] = "" if value is None else str(value)
+    return result
+
+
+def _queue_id_from_location(location: str) -> int | None:
+    match = re.search(r"/queue/item/(\d+)/?", location)
+    if not match:
+        return None
+    return int(match.group(1))

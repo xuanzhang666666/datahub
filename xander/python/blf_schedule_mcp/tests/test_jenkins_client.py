@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from blf_schedule_mcp.jenkins_client import JenkinsClient, JenkinsClientError
+from blf_schedule_mcp.jenkins_client import _normalize_build_parameters
 from blf_schedule_mcp.tools import _extract_error_lines
 
 
@@ -181,6 +182,75 @@ def test_get_queue_items_parses_task_job_names() -> None:
             "jenkins_url": "https://jenkins.example/job/folder/job/one_off_job/",
         },
     ]
+
+
+def test_trigger_build_posts_build_with_parameters_and_reads_queue_location() -> None:
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+    requests = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        requests.append(request)
+        return _FakeResponse(b"", {"Location": "https://jenkins.example/queue/item/321/"})
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.trigger_build(
+            "demo",
+            parameters={"time_hour": "2026/07/01/20", "retry": 1},
+        )
+
+    assert requests[0].full_url == "https://jenkins.example/job/demo/buildWithParameters"
+    assert requests[0].get_method() == "POST"
+    assert requests[0].data == b"time_hour=2026%2F07%2F01%2F20&retry=1"
+    assert result["queue_id"] == 321
+    assert result["queue_url"] == "https://jenkins.example/queue/item/321/"
+
+
+def test_trigger_build_posts_plain_build_without_parameters() -> None:
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+    requests = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        requests.append(request)
+        return _FakeResponse(b"", {"Location": "https://jenkins.example/queue/item/322/"})
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.trigger_build("demo")
+
+    assert requests[0].full_url == "https://jenkins.example/job/demo/build"
+    assert requests[0].get_method() == "POST"
+    assert requests[0].data == b""
+    assert result["queue_id"] == 322
+
+
+def test_trigger_build_retries_with_crumb_after_403() -> None:
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+    requests = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        requests.append(request)
+        if len(requests) == 1:
+            raise _http_error(403)
+        if "crumbIssuer/api/json" in request.full_url:
+            return _FakeResponse(b'{"crumbRequestField":"Jenkins-Crumb","crumb":"abc"}')
+        return _FakeResponse(b"", {"Location": "https://jenkins.example/queue/item/323/"})
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.trigger_build("demo")
+
+    assert requests[0].full_url == "https://jenkins.example/job/demo/build"
+    assert requests[1].full_url == "https://jenkins.example/crumbIssuer/api/json"
+    assert requests[2].headers["Jenkins-crumb"] == "abc"
+    assert result["queue_id"] == 323
+
+
+def test_normalize_build_parameters_rejects_nested_values() -> None:
+    assert _normalize_build_parameters({"a": 1, "b": False, "c": None}) == {
+        "a": "1",
+        "b": "False",
+        "c": "",
+    }
+    with pytest.raises(ValueError):
+        _normalize_build_parameters({"nested": {"x": 1}})
 
 
 def test_extract_error_lines_matches_keywords() -> None:

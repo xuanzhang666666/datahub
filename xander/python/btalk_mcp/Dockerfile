@@ -3,7 +3,7 @@
 #
 # Base layout: 源镜像装好 @wnpm/btalk-cli 与 supergateway,
 # 源镜像的 src/mcp/tools.js 上游只注册 6 个 SDK 直连工具,
-# 本文件用 build context 里的 src/mcp/tools.js 覆盖掉,暴露 24 个工具
+# 本文件用 build context 里的 src/mcp/tools.js 覆盖掉,暴露 23 个工具
 # (SDK 直连 + btalk CLI 子命令桥接)。
 #
 # Build:  docker build -t btalk-mcp:enhanced .

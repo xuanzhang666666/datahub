@@ -18,6 +18,7 @@ cd "$ROOT_DIR"
 
 BTALK_CLI_VERSION="${1:-${BTALK_CLI_VERSION:-}}"
 DATE_TAG="$(date +%Y%m%d)"
+PLATFORM="${PLATFORM:-linux/amd64}"
 
 if [ -z "$BTALK_CLI_VERSION" ]; then
   # 取 Dockerfile 默认 ARG
@@ -31,8 +32,9 @@ fi
 
 IMMUTABLE_TAG="btalk-mcp:enhanced-${BTALK_CLI_VERSION}-${DATE_TAG}"
 
-echo "==> 构建 $IMMUTABLE_TAG (同时打 :enhanced 最新标签)"
+echo "==> 构建 $IMMUTABLE_TAG (platform=${PLATFORM}, 同时打 :enhanced 最新标签)"
 docker build \
+  --platform "$PLATFORM" \
   --build-arg "BTALK_CLI_VERSION=${BTALK_CLI_VERSION}" \
   -t "$IMMUTABLE_TAG" \
   -t btalk-mcp:enhanced \

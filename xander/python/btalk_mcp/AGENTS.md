@@ -32,7 +32,7 @@ MCP 客户端 (HTTP POST /mcp)
 **stateful 说明**：supergateway `--stateful` 模式下，每个 MCP session 结束后子进程正常回收重启，
 日志里的 `Child exited: SIGTERM` 是正常行为，不是崩溃。
 
-## 工具列表（24 个）
+## 工具列表（23 个）
 
 | 工具名 | 功能 |
 |--------|------|
@@ -45,7 +45,6 @@ MCP 客户端 (HTTP POST /mcp)
 | `btalk_status` | 查看 btalk daemon 登录与运行状态 |
 | `btalk_version` | 查看 btalk CLI 与 Node 版本 |
 | `user_lookup` | 当前用户 / uid 查询 / 关键词搜索用户 |
-| `message_search` | 离线全文搜索历史消息 |
 | `group_manage` | 建群、拉人、踢人、群列表、详情、退群 |
 | `otp` | 获取 6 位动态口令 |
 | `wsso_cookie` | 获取或强制刷新公司内部系统 SSO Cookie |
@@ -113,7 +112,18 @@ MCP 客户端 (HTTP POST /mcp)
 | `Dockerfile` | 基于 `node:22.23.1-slim`，装 `@wnpm/btalk-cli` + `supergateway`，**用本目录 `src/mcp/tools.js` 覆盖上游的 6 工具版** |
 | `scripts/build.sh` | `docker build -t btalk-mcp:enhanced[-<cli>-<date>]`；保留不可变标签用于回滚 |
 | `scripts/deploy.sh` | ssh 跳板到 neo4j2，rm 旧容器 → run 新容器 → 等就绪 → 跑 smoke |
-| `scripts/smoke-test.sh` | `initialize` + `tools/list` 计数 + 抽样调用 6 个工具；< 24 即视为回退 |
+| `scripts/smoke-test.sh` | `initialize` + `tools/list` 计数 + 抽样调用 7 个工具；< 23 即视为回退；确认不暴露 `message_search` |
+| `scripts/maintenance.py` | 清理可丢弃的 search/presearch 索引，避免 SQLite WAL 膨胀 |
+| `scripts/healthcheck.py` | 检查 `btalk status` 登录态，异常时重启一次容器 |
+
+## 运行时维护
+
+neo4j2 上有两个 cron：
+
+- `/etc/cron.d/btalk-mcp-healthcheck`: 每 10 分钟执行 `/root/btalk_mcp_healthcheck.py`，`loggedIn=true` 且 `state=ready` 才算健康；异常时 `docker restart btalk-mcp` 一次。
+- `/etc/cron.d/btalk-mcp-maintenance`: 每天 04:20 执行 `/root/btalk_mcp_maintenance.py`，search/presearch 索引超过 512MB 时停容器、删除索引、再启动。
+
+日志在 `/root/btalk_backups/healthcheck.log` 和 `/root/btalk_backups/maintenance.log`。
 
 ### 一次完整升级（CLI 新版本发布）
 

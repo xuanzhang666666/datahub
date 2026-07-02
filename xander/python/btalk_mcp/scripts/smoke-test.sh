@@ -3,7 +3,7 @@
 #
 # 检查项:
 #   1. /mcp initialize 通过
-#   2. tools/list 数量 >= 24(基线,低于 24 即视为回退)
+#   2. tools/list 数量 >= 23(基线,低于 23 即视为回退),且 inputSchema 是有效 object schema
 #   3. 抽样调 6 个工具,每个都返回 ok=true
 
 set -euo pipefail
@@ -48,15 +48,34 @@ post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 tl = post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
 tools = tl['result']['tools']
 print(f"tool_count: {len(tools)}")
-if len(tools) < 24:
-    print(f"FAIL: 工具数 {len(tools)} < 24 基线,疑似回退到默认 btalk-mcp", file=sys.stderr)
+if len(tools) < 23:
+    print(f"FAIL: 工具数 {len(tools)} < 23 基线,疑似回退到默认 btalk-mcp", file=sys.stderr)
     sys.exit(2)
+
+tool_names = {t.get('name') for t in tools}
+if 'message_search' in tool_names:
+    print("FAIL: message_search 已禁用,但 tools/list 仍暴露该工具", file=sys.stderr)
+    sys.exit(4)
+
+bad_schema = []
+for t in tools:
+    schema = t.get('inputSchema') or {}
+    if schema.get('type') != 'object' or not isinstance(schema.get('properties', {}), dict):
+        bad_schema.append(f"{t.get('name')}: {schema}")
+if bad_schema:
+    print("FAIL: inputSchema 非标准 object schema,opencode 可能不会注册这些工具", file=sys.stderr)
+    for item in bad_schema[:10]:
+        print(f"  {item}", file=sys.stderr)
+    if len(bad_schema) > 10:
+        print(f"  ... and {len(bad_schema) - 10} more", file=sys.stderr)
+    sys.exit(3)
 
 # 3. 抽样调用
 CASES = [
     ('btalk_status', {}),
     ('btalk_version', {}),
     ('user_lookup', {'action': 'me'}),
+    ('fetch_history', {'conversation_id': 'jingliang.zhang', 'count': 20, 'is_group': False}),
     ('otp', {}),
     ('ripple_category', {'tab': 1}),
     ('ripple_list', {'tab': 1, 'page': 1, 'size': 3}),

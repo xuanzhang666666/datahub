@@ -12,6 +12,7 @@ from blf_schedule_mcp.tools import (
     get_schedule_job_last_failure,
     get_schedule_job_queue_stats,
     search_schedule_jobs,
+    trigger_schedule_job_build,
 )
 
 
@@ -26,6 +27,7 @@ class FakeJenkinsClient:
         )
         self.running_builds: list[dict[str, Any]] = []
         self.queue_items: list[dict[str, Any]] = []
+        self.trigger_calls: list[tuple[str, dict[str, Any] | None]] = []
 
     def get_job_info(self, job_name: str) -> dict[str, Any]:
         return {"builds": [{"number": 4}, {"number": 3}, {"number": 2}, {"number": 1}]}
@@ -67,6 +69,20 @@ class FakeJenkinsClient:
 
     def get_queue_items(self) -> list[dict[str, Any]]:
         return self.queue_items
+
+    def trigger_build(
+        self,
+        job_name: str,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.trigger_calls.append((job_name, parameters))
+        return {
+            "endpoint": "/job/{name}/buildWithParameters",
+            "queue_url": "https://schedule.corp.bianlifeng.com/queue/item/456/",
+            "queue_id": 456,
+            "response_text": "",
+        }
 
 
 def test_get_schedule_job_build_status_success_has_no_risks() -> None:
@@ -210,6 +226,31 @@ def test_get_schedule_job_queue_stats_aggregates_by_job_name() -> None:
     assert len(result["summary"]["items"]) == 3
     assert result["summary"]["blocked_items"] == 1
     assert any("blocked" in risk for risk in result["risks"])
+
+
+def test_trigger_schedule_job_build_requires_confirm() -> None:
+    client = FakeJenkinsClient()
+    result = trigger_schedule_job_build(client, job_display_name="demo")
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_input"
+    assert client.trigger_calls == []
+
+
+def test_trigger_schedule_job_build_returns_queue_info() -> None:
+    client = FakeJenkinsClient()
+    result = trigger_schedule_job_build(
+        client,
+        job_display_name=" demo ",
+        parameters={"time_hour": "2026/07/01/20", "dry_run": False},
+        confirm=True,
+    )
+    assert result["success"] is True
+    assert result["job_display_name"] == "demo"
+    assert result["summary"]["triggered"] is True
+    assert result["summary"]["queue_id"] == 456
+    assert client.trigger_calls == [
+        ("demo", {"time_hour": "2026/07/01/20", "dry_run": False})
+    ]
 
 
 class FakeDataHubClient:

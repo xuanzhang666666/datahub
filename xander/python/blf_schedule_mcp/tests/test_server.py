@@ -10,6 +10,7 @@ class FakeJenkinsClient:
     def __init__(self) -> None:
         self.running_build_calls = 0
         self.queue_calls = 0
+        self.trigger_calls: list[tuple[str, dict[str, Any] | None]] = []
 
     def get_build_info(self, job_name: str, build_ref: int | str) -> dict[str, Any]:
         return {
@@ -28,6 +29,20 @@ class FakeJenkinsClient:
     def get_queue_items(self) -> list[dict[str, Any]]:
         self.queue_calls += 1
         return []
+
+    def trigger_build(
+        self,
+        job_name: str,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.trigger_calls.append((job_name, parameters))
+        return {
+            "endpoint": "/job/{name}/buildWithParameters",
+            "queue_url": "https://jenkins.example/queue/item/123/",
+            "queue_id": 123,
+            "response_text": "",
+        }
 
 
 class FakeDataHubClient:
@@ -61,6 +76,7 @@ def test_tools_list_includes_search_tool() -> None:
     assert "blf_search_schedule_job" in names
     assert "blf_find_long_running_schedule_builds" in names
     assert "blf_get_schedule_job_queue_stats" in names
+    assert "blf_trigger_schedule_job_build" in names
     assert set(TOOL_SPECS) == names
 
 
@@ -132,4 +148,45 @@ def test_tools_call_dispatches_queue_stats_to_jenkins() -> None:
     assert response is not None
     assert response["result"]["isError"] is False
     assert jenkins_client.queue_calls == 1
+    assert datahub_client.calls == []
+
+
+def test_tools_call_requires_confirm_before_triggering_build() -> None:
+    app, _, jenkins_client = _build_app()
+    response = app.handle_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "blf_trigger_schedule_job_build",
+                "arguments": {"job_display_name": "demo", "confirm": False},
+            },
+        }
+    )
+    assert response is not None
+    assert response["result"]["isError"] is True
+    assert jenkins_client.trigger_calls == []
+
+
+def test_tools_call_dispatches_trigger_build_to_jenkins() -> None:
+    app, datahub_client, jenkins_client = _build_app()
+    response = app.handle_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "blf_trigger_schedule_job_build",
+                "arguments": {
+                    "job_display_name": "demo",
+                    "parameters": {"time_hour": "2026/07/01/20"},
+                    "confirm": True,
+                },
+            },
+        }
+    )
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert jenkins_client.trigger_calls == [("demo", {"time_hour": "2026/07/01/20"})]
     assert datahub_client.calls == []

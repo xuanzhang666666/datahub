@@ -443,6 +443,48 @@ def get_schedule_job_queue_stats(
         return _error_response(exc)
 
 
+def trigger_schedule_job_build(
+    client: JenkinsClient,
+    *,
+    job_display_name: str,
+    parameters: dict[str, Any] | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    try:
+        base = _job_base(job_display_name)
+        if confirm is not True:
+            raise ValueError("confirm must be true to trigger a schedule job build")
+        normalized_parameters = parameters or {}
+        trigger = client.trigger_build(
+            base["job_display_name"],
+            parameters=normalized_parameters,
+        )
+        risks = ["已向 Jenkins 提交构建请求，请继续查询队列或构建状态确认实际执行结果"]
+        if normalized_parameters:
+            risks.append("本次为参数化触发，请确认传入参数与该 job 的参数定义一致")
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "triggered": True,
+                "parameters": normalized_parameters,
+                "queue_id": trigger.get("queue_id"),
+                "queue_url": trigger.get("queue_url") or "",
+            },
+            "risks": risks,
+            "evidence": {
+                "interface": "Jenkins REST API",
+                "endpoint": trigger.get("endpoint") or "/job/{name}/build",
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _job_base(job_display_name)
+        except Exception:
+            base = {"job_display_name": job_display_name}
+        return _error_response(exc, **base)
+
+
 def get_schedule_job_build_log(
     client: JenkinsClient,
     *,

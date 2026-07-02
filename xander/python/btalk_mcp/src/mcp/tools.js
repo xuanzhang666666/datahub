@@ -70,10 +70,6 @@ const schemas = {
     keyword: z.string().optional().describe('action=search 时必填'),
     mobile: z.boolean().optional().describe('是否返回手机号，默认 false；涉及隐私，需显式开启'),
   }),
-  message_search: z.object({
-    keyword: z.string().describe('搜索关键词'),
-    conversation_id: z.string().optional().describe('可选，会话内搜索；不传则全局消息搜索'),
-  }),
   group_manage: z.object({
     action: z.enum(['create', 'invite', 'kick', 'list', 'info', 'leave']).describe('群操作'),
     group_id: z.string().optional().describe('invite/kick/info/leave 时的群 id'),
@@ -154,7 +150,6 @@ const descriptors = [
   { name: 'btalk_status', description: '查看 btalk daemon 登录与运行状态。排查 MCP/btalk 是否可用时先调用。', inputSchema: z.toJSONSchema(schemas.btalk_status) },
   { name: 'btalk_version', description: '查看 btalk CLI 与 Node 版本，确认 MCP 是否已升级到新版。', inputSchema: z.toJSONSchema(schemas.btalk_version) },
   { name: 'user_lookup', description: '查询当前用户、按 uid 查用户、或按关键词搜索用户；手机号默认不返回。', inputSchema: z.toJSONSchema(schemas.user_lookup) },
-  { name: 'message_search', description: '离线全文搜索历史消息；可全局搜或限定会话。', inputSchema: z.toJSONSchema(schemas.message_search) },
   { name: 'group_manage', description: '群聊管理：建群、拉人、踢人、列表、详情、退群。成员支持 uid 或姓名。', inputSchema: z.toJSONSchema(schemas.group_manage) },
   { name: 'otp', description: '获取 6 位动态口令，常用于登录跳板机等需要二次验证的场景。', inputSchema: z.toJSONSchema(schemas.otp) },
   { name: 'wsso_cookie', description: '获取或强制刷新公司内部系统 SSO Cookie。Ripple 工单命令报响应解析失败/401 时用 reset=true。', inputSchema: z.toJSONSchema(schemas.wsso_cookie) },
@@ -233,11 +228,6 @@ const rawHandlers = {
       args.push(keyword);
     }
     if (mobile) args.push('--mobile');
-    return runBtalk(args);
-  },
-  async message_search({ keyword, conversation_id }) {
-    const args = ['message-search', keyword];
-    if (conversation_id) args.push('--conversation-id', conversation_id);
     return runBtalk(args);
   },
   async group_manage({ action, group_id, members, name }) {
