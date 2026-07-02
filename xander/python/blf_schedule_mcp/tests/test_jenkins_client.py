@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
+import urllib.parse
 from unittest.mock import patch
 
 import pytest
@@ -241,6 +242,52 @@ def test_trigger_build_retries_with_crumb_after_403() -> None:
     assert requests[1].full_url == "https://jenkins.example/crumbIssuer/api/json"
     assert requests[2].headers["Jenkins-crumb"] == "abc"
     assert result["queue_id"] == 323
+
+
+def test_trigger_single_build_posts_build1_with_single_build_flag() -> None:
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+    requests = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        requests.append(request)
+        return _FakeResponse(b"", {"Location": "https://jenkins.example/queue/item/324/"})
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.trigger_single_build(
+            "demo",
+            parameters={"time_hour": "2026/07/01/20"},
+        )
+
+    assert requests[0].full_url == "https://jenkins.example/job/demo/build1?delay=0sec&singleBuild=true"
+    assert requests[0].get_method() == "POST"
+    form = urllib.parse.parse_qs(requests[0].data.decode("utf-8"))
+    submitted = json.loads(form["json"][0])
+    assert submitted == {
+        "parameter": [{"name": "time_hour", "value": "2026/07/01/20"}],
+        "statusCode": "201",
+    }
+    assert result["queue_id"] == 324
+
+
+def test_rebuild_build_posts_parameterized_rebuild_for_build_number() -> None:
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+    requests = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        requests.append(request)
+        return _FakeResponse(b"", {"Location": "https://jenkins.example/queue/item/325/"})
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.rebuild_build(
+            "demo",
+            10,
+            parameters={"time_hour": "2026/07/01/20"},
+        )
+
+    assert requests[0].full_url == "https://jenkins.example/job/demo/10/rebuild/parameterized"
+    assert requests[0].get_method() == "POST"
+    assert requests[0].data == b"time_hour=2026%2F07%2F01%2F20"
+    assert result["queue_id"] == 325
 
 
 def test_normalize_build_parameters_rejects_nested_values() -> None:

@@ -485,6 +485,95 @@ def trigger_schedule_job_build(
         return _error_response(exc, **base)
 
 
+def trigger_schedule_job_single_build(
+    client: JenkinsClient,
+    *,
+    job_display_name: str,
+    parameters: dict[str, Any] | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    try:
+        base = _job_base(job_display_name)
+        if confirm is not True:
+            raise ValueError("confirm must be true to trigger a schedule job single build")
+        normalized_parameters = parameters or {}
+        trigger = client.trigger_single_build(
+            base["job_display_name"],
+            parameters=normalized_parameters,
+        )
+        risks = ["已向 Jenkins 提交单次构建请求；按调度约定，该构建完成后不会触发下游 job"]
+        if normalized_parameters:
+            risks.append("本次为参数化单次构建，请确认传入参数与该 job 的参数定义一致")
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "triggered": True,
+                "trigger_mode": "single_build",
+                "parameters": normalized_parameters,
+                "queue_id": trigger.get("queue_id"),
+                "queue_url": trigger.get("queue_url") or "",
+            },
+            "risks": risks,
+            "evidence": {
+                "interface": "Jenkins REST API",
+                "endpoint": trigger.get("endpoint") or "/job/{name}/build1?delay=0sec&singleBuild=true",
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _job_base(job_display_name)
+        except Exception:
+            base = {"job_display_name": job_display_name}
+        return _error_response(exc, **base)
+
+
+def rebuild_schedule_job_build(
+    client: JenkinsClient,
+    *,
+    job_display_name: str,
+    build_number: int,
+    parameters: dict[str, Any] | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    try:
+        base = _job_base(job_display_name)
+        if confirm is not True:
+            raise ValueError("confirm must be true to rebuild a schedule job build")
+        normalized_parameters = parameters or {}
+        trigger = client.rebuild_build(
+            base["job_display_name"],
+            build_number,
+            parameters=normalized_parameters,
+        )
+        risks = ["已向 Jenkins 提交重新构建请求；按调度约定，该构建完成后不会触发下游 job"]
+        if normalized_parameters:
+            risks.append("本次 rebuild 覆盖了构建参数，请确认参数与原构建及 job 定义一致")
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "triggered": True,
+                "trigger_mode": "rebuild",
+                "build_number": int(build_number),
+                "parameters": normalized_parameters,
+                "queue_id": trigger.get("queue_id"),
+                "queue_url": trigger.get("queue_url") or "",
+            },
+            "risks": risks,
+            "evidence": {
+                "interface": "Jenkins REST API",
+                "endpoint": trigger.get("endpoint") or "/job/{name}/{build}/rebuild/parameterized",
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _job_base(job_display_name)
+        except Exception:
+            base = {"job_display_name": job_display_name}
+        return _error_response(exc, **base)
+
+
 def get_schedule_job_build_log(
     client: JenkinsClient,
     *,

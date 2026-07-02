@@ -11,7 +11,9 @@ from blf_schedule_mcp.tools import (
     get_schedule_job_build_status,
     get_schedule_job_last_failure,
     get_schedule_job_queue_stats,
+    rebuild_schedule_job_build,
     search_schedule_jobs,
+    trigger_schedule_job_single_build,
     trigger_schedule_job_build,
 )
 
@@ -28,6 +30,8 @@ class FakeJenkinsClient:
         self.running_builds: list[dict[str, Any]] = []
         self.queue_items: list[dict[str, Any]] = []
         self.trigger_calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.single_build_calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.rebuild_calls: list[tuple[str, int, dict[str, Any] | None]] = []
 
     def get_job_info(self, job_name: str) -> dict[str, Any]:
         return {"builds": [{"number": 4}, {"number": 3}, {"number": 2}, {"number": 1}]}
@@ -81,6 +85,35 @@ class FakeJenkinsClient:
             "endpoint": "/job/{name}/buildWithParameters",
             "queue_url": "https://schedule.corp.bianlifeng.com/queue/item/456/",
             "queue_id": 456,
+            "response_text": "",
+        }
+
+    def trigger_single_build(
+        self,
+        job_name: str,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.single_build_calls.append((job_name, parameters))
+        return {
+            "endpoint": "/job/{name}/build1?delay=0sec&singleBuild=true",
+            "queue_url": "https://schedule.corp.bianlifeng.com/queue/item/457/",
+            "queue_id": 457,
+            "response_text": "",
+        }
+
+    def rebuild_build(
+        self,
+        job_name: str,
+        build_number: int,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.rebuild_calls.append((job_name, build_number, parameters))
+        return {
+            "endpoint": "/job/{name}/{build}/rebuild/parameterized",
+            "queue_url": "https://schedule.corp.bianlifeng.com/queue/item/458/",
+            "queue_id": 458,
             "response_text": "",
         }
 
@@ -251,6 +284,56 @@ def test_trigger_schedule_job_build_returns_queue_info() -> None:
     assert client.trigger_calls == [
         ("demo", {"time_hour": "2026/07/01/20", "dry_run": False})
     ]
+
+
+def test_trigger_schedule_job_single_build_requires_confirm() -> None:
+    client = FakeJenkinsClient()
+    result = trigger_schedule_job_single_build(client, job_display_name="demo")
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_input"
+    assert client.single_build_calls == []
+
+
+def test_trigger_schedule_job_single_build_returns_queue_info() -> None:
+    client = FakeJenkinsClient()
+    result = trigger_schedule_job_single_build(
+        client,
+        job_display_name=" demo ",
+        parameters={"time_hour": "2026/07/01/20"},
+        confirm=True,
+    )
+    assert result["success"] is True
+    assert result["job_display_name"] == "demo"
+    assert result["summary"]["triggered"] is True
+    assert result["summary"]["trigger_mode"] == "single_build"
+    assert result["summary"]["queue_id"] == 457
+    assert client.single_build_calls == [("demo", {"time_hour": "2026/07/01/20"})]
+
+
+def test_rebuild_schedule_job_build_requires_confirm() -> None:
+    client = FakeJenkinsClient()
+    result = rebuild_schedule_job_build(client, job_display_name="demo", build_number=10)
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_input"
+    assert client.rebuild_calls == []
+
+
+def test_rebuild_schedule_job_build_returns_queue_info() -> None:
+    client = FakeJenkinsClient()
+    result = rebuild_schedule_job_build(
+        client,
+        job_display_name=" demo ",
+        build_number=10,
+        parameters={"time_hour": "2026/07/01/20"},
+        confirm=True,
+    )
+    assert result["success"] is True
+    assert result["job_display_name"] == "demo"
+    assert result["summary"]["triggered"] is True
+    assert result["summary"]["trigger_mode"] == "rebuild"
+    assert result["summary"]["build_number"] == 10
+    assert result["summary"]["queue_id"] == 458
+    assert client.rebuild_calls == [("demo", 10, {"time_hour": "2026/07/01/20"})]
 
 
 class FakeDataHubClient:

@@ -198,6 +198,49 @@ class JenkinsClient:
             "response_text": raw.decode("utf-8", errors="replace"),
         }
 
+    def trigger_single_build(
+        self,
+        job_name: str,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        params = _single_build_form_data(parameters)
+        endpoint = self._job_path(job_name, "build1") + "?delay=0sec&singleBuild=true"
+        raw, headers = self._post_with_headers(
+            endpoint,
+            data=params,
+            max_bytes=4096,
+        )
+        location = headers.get("Location") or ""
+        return {
+            "endpoint": "/job/{name}/build1?delay=0sec&singleBuild=true",
+            "queue_url": location,
+            "queue_id": _queue_id_from_location(location),
+            "response_text": raw.decode("utf-8", errors="replace"),
+        }
+
+    def rebuild_build(
+        self,
+        job_name: str,
+        build_number: int,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        build_number = _normalize_build_number(build_number)
+        params = _normalize_build_parameters(parameters)
+        raw, headers = self._post_with_headers(
+            self._job_path(job_name, str(build_number), "rebuild/parameterized"),
+            data=params,
+            max_bytes=4096,
+        )
+        location = headers.get("Location") or ""
+        return {
+            "endpoint": "/job/{name}/{build}/rebuild/parameterized",
+            "queue_url": location,
+            "queue_id": _queue_id_from_location(location),
+            "response_text": raw.decode("utf-8", errors="replace"),
+        }
+
     def _open_json(self, path: str) -> dict[str, Any]:
         raw = self._open(path, max_bytes=262144)
         if not raw:
@@ -398,6 +441,32 @@ def _normalize_build_parameters(parameters: dict[str, Any] | None) -> dict[str, 
             raise ValueError(f"parameter {name} must be a scalar value")
         result[name] = "" if value is None else str(value)
     return result
+
+
+def _normalize_build_number(build_number: int) -> int:
+    try:
+        parsed = int(build_number)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("build_number must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError("build_number must be a positive integer")
+    return parsed
+
+
+def _single_build_form_data(parameters: dict[str, Any] | None) -> dict[str, str]:
+    params = _normalize_build_parameters(parameters)
+    return {
+        "json": json.dumps(
+            {
+                "parameter": [
+                    {"name": name, "value": value}
+                    for name, value in params.items()
+                ],
+                "statusCode": "201",
+            },
+            ensure_ascii=False,
+        )
+    }
 
 
 def _queue_id_from_location(location: str) -> int | None:

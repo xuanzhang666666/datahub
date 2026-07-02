@@ -11,6 +11,8 @@ class FakeJenkinsClient:
         self.running_build_calls = 0
         self.queue_calls = 0
         self.trigger_calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.single_build_calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.rebuild_calls: list[tuple[str, int, dict[str, Any] | None]] = []
 
     def get_build_info(self, job_name: str, build_ref: int | str) -> dict[str, Any]:
         return {
@@ -41,6 +43,35 @@ class FakeJenkinsClient:
             "endpoint": "/job/{name}/buildWithParameters",
             "queue_url": "https://jenkins.example/queue/item/123/",
             "queue_id": 123,
+            "response_text": "",
+        }
+
+    def trigger_single_build(
+        self,
+        job_name: str,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.single_build_calls.append((job_name, parameters))
+        return {
+            "endpoint": "/job/{name}/build1?delay=0sec&singleBuild=true",
+            "queue_url": "https://jenkins.example/queue/item/124/",
+            "queue_id": 124,
+            "response_text": "",
+        }
+
+    def rebuild_build(
+        self,
+        job_name: str,
+        build_number: int,
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.rebuild_calls.append((job_name, build_number, parameters))
+        return {
+            "endpoint": "/job/{name}/{build}/rebuild/parameterized",
+            "queue_url": "https://jenkins.example/queue/item/125/",
+            "queue_id": 125,
             "response_text": "",
         }
 
@@ -77,6 +108,8 @@ def test_tools_list_includes_search_tool() -> None:
     assert "blf_find_long_running_schedule_builds" in names
     assert "blf_get_schedule_job_queue_stats" in names
     assert "blf_trigger_schedule_job_build" in names
+    assert "blf_trigger_schedule_job_single_build" in names
+    assert "blf_rebuild_schedule_job_build" in names
     assert set(TOOL_SPECS) == names
 
 
@@ -189,4 +222,51 @@ def test_tools_call_dispatches_trigger_build_to_jenkins() -> None:
     assert response is not None
     assert response["result"]["isError"] is False
     assert jenkins_client.trigger_calls == [("demo", {"time_hour": "2026/07/01/20"})]
+    assert datahub_client.calls == []
+
+
+def test_tools_call_dispatches_single_build_to_jenkins() -> None:
+    app, datahub_client, jenkins_client = _build_app()
+    response = app.handle_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "blf_trigger_schedule_job_single_build",
+                "arguments": {
+                    "job_display_name": "demo",
+                    "parameters": {"time_hour": "2026/07/01/20"},
+                    "confirm": True,
+                },
+            },
+        }
+    )
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert jenkins_client.single_build_calls == [("demo", {"time_hour": "2026/07/01/20"})]
+    assert datahub_client.calls == []
+
+
+def test_tools_call_dispatches_rebuild_to_jenkins() -> None:
+    app, datahub_client, jenkins_client = _build_app()
+    response = app.handle_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "blf_rebuild_schedule_job_build",
+                "arguments": {
+                    "job_display_name": "demo",
+                    "build_number": 10,
+                    "parameters": {"time_hour": "2026/07/01/20"},
+                    "confirm": True,
+                },
+            },
+        }
+    )
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert jenkins_client.rebuild_calls == [("demo", 10, {"time_hour": "2026/07/01/20"})]
     assert datahub_client.calls == []

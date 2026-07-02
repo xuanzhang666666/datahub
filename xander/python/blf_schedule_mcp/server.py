@@ -28,7 +28,9 @@ from .tools import (
     is_user_triggered_build,
     parse_trigger_condition_tool,
     parse_upstream_job_params_tool,
+    rebuild_schedule_job_build,
     search_schedule_jobs,
+    trigger_schedule_job_single_build,
     trigger_schedule_job_build,
 )
 
@@ -151,6 +153,45 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 },
             },
             "required": ["job_display_name", "confirm"],
+        },
+    },
+    "blf_trigger_schedule_job_single_build": {
+        "description": "触发一个 BLF 调度作业单次构建。该工具会产生真实 Jenkins 构建请求，构建完成后不会触发下游，必须显式传 confirm=true。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "要触发单次构建的 Jenkins 调度作业名称。"},
+                "parameters": {
+                    "type": "object",
+                    "default": {},
+                    "description": "可选构建参数，例如 {\"time_hour\":\"2026/07/01/20\"}。",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "安全确认开关。只有传 true 时才会实际触发单次构建。",
+                },
+            },
+            "required": ["job_display_name", "confirm"],
+        },
+    },
+    "blf_rebuild_schedule_job_build": {
+        "description": "重新构建 BLF 调度作业的某一次历史 build。该工具会产生真实 Jenkins rebuild 请求，构建完成后不会触发下游，必须显式传 confirm=true。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "要重新构建的 Jenkins 调度作业名称。"},
+                "build_number": {"type": "integer", "description": "要重新构建的历史构建号。"},
+                "parameters": {
+                    "type": "object",
+                    "default": {},
+                    "description": "可选参数覆盖，例如 {\"time_hour\":\"2026/07/01/20\"}。",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "安全确认开关。只有传 true 时才会实际触发 rebuild。",
+                },
+            },
+            "required": ["job_display_name", "build_number", "confirm"],
         },
     },
     "blf_parse_trigger_condition": {
@@ -311,6 +352,8 @@ class BlfScheduleMcpApplication:
             "blf_find_long_running_schedule_builds": functools.partial(find_long_running_schedule_builds, jenkins_client),
             "blf_get_schedule_job_queue_stats": functools.partial(get_schedule_job_queue_stats, jenkins_client),
             "blf_trigger_schedule_job_build": functools.partial(trigger_schedule_job_build, jenkins_client),
+            "blf_trigger_schedule_job_single_build": functools.partial(trigger_schedule_job_single_build, jenkins_client),
+            "blf_rebuild_schedule_job_build": functools.partial(rebuild_schedule_job_build, jenkins_client),
             "blf_parse_trigger_condition": parse_trigger_condition_tool,
             "blf_parse_upstream_job_params": parse_upstream_job_params_tool,
             "blf_format_time_hour_token": format_time_hour_token_tool,
