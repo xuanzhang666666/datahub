@@ -12,7 +12,12 @@ const Card = styled.div<{ isCompact?: boolean }>`
     max-width: 450px;
 
     ${(props) => !props.isCompact && `height: 380px;`}
-    ${(props) => props.isCompact && `max-width: 650px;`}
+    ${(props) =>
+        props.isCompact &&
+        `
+        width: 100%;
+        max-width: none;
+    `}
 `;
 
 type Props = {

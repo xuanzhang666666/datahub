@@ -13,6 +13,7 @@ from job_info_sync_datahub.sql_audit_usage import (
     OperationEvent,
     build_query_candidates,
     dataset_usage_delete_query,
+    dataset_top_sql_queries,
     aggregate_usage,
     filter_new_operations,
     fingerprint_sql,
@@ -22,6 +23,8 @@ from job_info_sync_datahub.sql_audit_usage import (
     parse_audit_record,
     split_sql_statements,
     usage_bucket_window,
+    usage_retention_delete_window,
+    _fetch_latest_audit_date,
     _fetch_trino_records,
 )
 
@@ -31,9 +34,12 @@ def _b64(text: str) -> str:
 
 
 class FakeCursor:
-    def __init__(self) -> None:
+    def __init__(self, results: list[list[dict[str, object]]] | None = None) -> None:
         self.sql: str | None = None
         self.params: tuple[object, ...] | None = None
+        self.executed_sql: list[str] = []
+        self.results = results or [[]]
+        self.fetch_count = 0
 
     def __enter__(self) -> "FakeCursor":
         return self
@@ -44,14 +50,19 @@ class FakeCursor:
     def execute(self, sql: str, params: tuple[object, ...]) -> None:
         self.sql = sql
         self.params = params
+        self.executed_sql.append(sql)
 
     def fetchall(self) -> list[dict[str, object]]:
-        return []
+        if self.fetch_count >= len(self.results):
+            return []
+        result = self.results[self.fetch_count]
+        self.fetch_count += 1
+        return result
 
 
 class FakeConnection:
-    def __init__(self) -> None:
-        self.cursor_instance = FakeCursor()
+    def __init__(self, results: list[list[dict[str, object]]] | None = None) -> None:
+        self.cursor_instance = FakeCursor(results)
 
     def cursor(self) -> FakeCursor:
         return self.cursor_instance
@@ -299,6 +310,32 @@ class SqlAuditUsageTest(unittest.TestCase):
         self.assertEqual(candidates[0].subjects, {"default.dw_order_v1"})
         self.assertNotIn("20260701", candidates[0].sample_sql)
 
+    def test_dataset_top_sql_queries_uses_normalized_table_fingerprint_samples(self) -> None:
+        records = [
+            parse_audit_record(
+                AuditSqlRecord(
+                    engine="hive",
+                    user="wstats",
+                    source="EXEC",
+                    query_id=None,
+                    executed_at=f"2026-07-01 0{i}:00:00",
+                    sql_text=(
+                        "select order_no from dw_order_v1 "
+                        f"where dt='2026070{i}' and store_code='{10000 + i}'"
+                    ),
+                )
+            )
+            for i in range(1, 4)
+        ]
+        usage = aggregate_usage(records)
+
+        top_queries = dataset_top_sql_queries(usage.datasets["default.dw_order_v1"], usage)
+
+        self.assertEqual(len(top_queries), 1)
+        self.assertIn("dw_order_v1", top_queries[0])
+        self.assertNotIn("20260701", top_queries[0])
+        self.assertNotIn("10001", top_queries[0])
+
     def test_merge_usage_statistics_replaces_same_day_and_keeps_other_days(self) -> None:
         existing = [
             {
@@ -336,6 +373,11 @@ class SqlAuditUsageTest(unittest.TestCase):
         self.assertEqual(int(start.timestamp() * 1000), 1782777600000)
         self.assertEqual(int(end.timestamp() * 1000), 1782863999999)
 
+    def test_usage_retention_window_uses_reference_date_not_bucket_date(self) -> None:
+        window = usage_retention_delete_window("2026-07-01", 30)
+
+        self.assertEqual(window, (0, 1780358399999))
+
     def test_dataset_usage_delete_query_is_limited_to_day_platform_and_env(self) -> None:
         query = dataset_usage_delete_query(
             platform_instance="blf-prod-hive",
@@ -357,6 +399,19 @@ class SqlAuditUsageTest(unittest.TestCase):
             },
             filters,
         )
+
+    def test_fetch_latest_audit_date_uses_max_of_hive_and_trino_sources(self) -> None:
+        conn = FakeConnection(
+            [
+                [{"max_date": "2026-07-01"}],
+                [{"max_date": "2026-07-02"}],
+            ]
+        )
+
+        latest = _fetch_latest_audit_date(conn, "both")
+
+        self.assertEqual(latest, "2026-07-02")
+        self.assertEqual(len(conn.cursor_instance.executed_sql), 2)
 
     def test_split_sql_statements_ignores_semicolon_inside_string(self) -> None:
         statements = split_sql_statements(

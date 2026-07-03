@@ -881,6 +881,39 @@ def _fetch_trino_records(conn, dt: str, limit: Optional[int]) -> list[AuditSqlRe
         ]
 
 
+def _fetch_latest_audit_date(conn, engine: str) -> Optional[str]:
+    queries: list[str] = []
+    if engine in ("hive", "both"):
+        queries.append(
+            "SELECT date AS max_date FROM hive_sql_audit "
+            "FORCE INDEX(index_hive_sql_audit_date) "
+            "WHERE date IS NOT NULL ORDER BY date DESC LIMIT 1"
+        )
+    if engine in ("trino", "both"):
+        queries.append(
+            "SELECT DATE(create_time) AS max_date FROM trino_query_history "
+            "FORCE INDEX(idx_create_time) "
+            "WHERE create_time IS NOT NULL ORDER BY create_time DESC LIMIT 1"
+        )
+
+    latest: Optional[str] = None
+    with conn.cursor() as cur:
+        for sql in queries:
+            cur.execute(sql, ())
+            rows = cur.fetchall()
+            if not rows:
+                continue
+            value = rows[0].get("max_date")
+            if value is None:
+                continue
+            candidate = str(value)[:10]
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", candidate) and (
+                latest is None or candidate > latest
+            ):
+                latest = candidate
+    return latest
+
+
 def _counter_dict(counter: Counter[str], limit: int = 20) -> dict[str, int]:
     return dict(counter.most_common(limit))
 
@@ -948,6 +981,17 @@ def usage_bucket_window(bucket_date: str) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1) - timedelta(milliseconds=1)
 
 
+def usage_retention_delete_window(
+    reference_date: str,
+    retention_days: int,
+) -> Optional[tuple[int, int]]:
+    if retention_days <= 0:
+        return None
+    start, _ = usage_bucket_window(reference_date)
+    cutoff = start - timedelta(days=retention_days - 1)
+    return 0, int(cutoff.timestamp() * 1000) - 1
+
+
 def dataset_usage_delete_query(
     *,
     platform_instance: str,
@@ -1005,6 +1049,24 @@ def bulk_delete_dataset_usage_statistics(
     return int(body.get("deleted") or 0)
 
 
+def dataset_top_sql_queries(
+    item: DatasetUsage,
+    usage: AggregatedUsage,
+    limit: int = 10,
+) -> list[str]:
+    queries: list[str] = []
+    seen: set[str] = set()
+    for fingerprint, _ in item.fingerprints.most_common(limit * 2):
+        detail = usage.fingerprint_details.get(fingerprint)
+        if not detail or not detail.sample_sql or detail.sample_sql in seen:
+            continue
+        queries.append(detail.sample_sql)
+        seen.add(detail.sample_sql)
+        if len(queries) >= limit:
+            break
+    return queries
+
+
 def emit_to_datahub(
     usage: AggregatedUsage,
     *,
@@ -1016,6 +1078,8 @@ def emit_to_datahub(
     query_candidates: list[QueryCandidate],
     operation_checkpoint: Optional[FileOperationCheckpoint] = None,
     clean_usage_before_emit: bool = False,
+    usage_retention_days: int = 30,
+    usage_retention_reference_date: Optional[str] = None,
 ) -> dict[str, int]:
     from datahub.emitter.mcp import MetadataChangeProposalWrapper
     from datahub.emitter.rest_emitter import DatahubRestEmitter
@@ -1056,6 +1120,24 @@ def emit_to_datahub(
             start_ms=start_ms,
             end_ms=end_ms,
         )
+    retention_deleted_usage_rows = 0
+    retention_window = usage_retention_delete_window(
+        usage_retention_reference_date or bucket_date,
+        usage_retention_days,
+    )
+    if retention_window is not None:
+        retention_start_ms, retention_end_ms = retention_window
+        retention_deleted_usage_rows = bulk_delete_dataset_usage_statistics(
+            elasticsearch_url=os.getenv("DATAHUB_ELASTICSEARCH_URL", "http://localhost:9200"),
+            index_name=os.getenv(
+                "DATAHUB_DATASET_USAGE_INDEX",
+                "dataset_datasetusagestatisticsaspect_v1",
+            ),
+            platform_instance=platform_instance,
+            env=env,
+            start_ms=retention_start_ms,
+            end_ms=retention_end_ms,
+        )
     for item in usage.datasets.values():
         db, table = item.table.split(".", 1)
         urn = make_hive_dataset_urn(db, table, platform_instance=platform_instance, env=env)
@@ -1066,7 +1148,7 @@ def emit_to_datahub(
             metrics=UsageAggregationMetricsClass(
                 uniqueUserCount=len(item.users),
                 totalSqlQueries=item.query_count,
-                topSqlQueries=None,
+                topSqlQueries=dataset_top_sql_queries(item, usage),
                 users=[
                     UserUsageCountsClass(
                         user=f"urn:li:corpuser:{user}",
@@ -1161,7 +1243,10 @@ def emit_to_datahub(
                 ),
             )
         )
-    return {"cleaned_usage_rows": cleaned_usage_rows}
+    return {
+        "cleaned_usage_rows": cleaned_usage_rows,
+        "retention_deleted_usage_rows": retention_deleted_usage_rows,
+    }
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1172,6 +1257,11 @@ def run(args: argparse.Namespace) -> int:
             records.extend(_fetch_hive_records(conn, args.date, args.limit))
         if args.engine in ("trino", "both"):
             records.extend(_fetch_trino_records(conn, args.date, args.limit))
+        usage_retention_reference_date = (
+            args.usage_retention_reference_date
+            or _fetch_latest_audit_date(conn, args.engine)
+            or args.date
+        )
     finally:
         conn.close()
     parsed = [parse_audit_record(record) for record in records]
@@ -1200,6 +1290,8 @@ def run(args: argparse.Namespace) -> int:
     report["input_records"] = len(records)
     report["date"] = args.date
     report["engine"] = args.engine
+    report["usage_retention_days"] = args.usage_retention_days
+    report["usage_retention_reference_date"] = usage_retention_reference_date
     if args.emit:
         operation_checkpoint = (
             FileOperationCheckpoint(Path(args.operation_checkpoint))
@@ -1216,11 +1308,14 @@ def run(args: argparse.Namespace) -> int:
             query_candidates=query_candidates,
             operation_checkpoint=operation_checkpoint,
             clean_usage_before_emit=args.clean_usage_before_emit,
+            usage_retention_days=args.usage_retention_days,
+            usage_retention_reference_date=usage_retention_reference_date,
         )
         report.update(emit_result)
         report["emitted_query_count"] = len(query_candidates)
     else:
         report["cleaned_usage_rows"] = 0
+        report["retention_deleted_usage_rows"] = 0
         report["emitted_query_count"] = 0
     if args.output:
         Path(args.output).write_text(
@@ -1247,6 +1342,17 @@ def main() -> int:
     parser.add_argument("--query-top-n", type=int, default=100)
     parser.add_argument("--query-core-table-top-n", type=int, default=100)
     parser.add_argument("--query-per-core-table", type=int, default=3)
+    parser.add_argument(
+        "--usage-retention-days",
+        type=int,
+        default=int(os.getenv("USAGE_RETENTION_DAYS", "30")),
+        help="Keep only this many days of DatasetUsageStatistics; <=0 disables retention cleanup",
+    )
+    parser.add_argument(
+        "--usage-retention-reference-date",
+        default=os.getenv("USAGE_RETENTION_REFERENCE_DATE"),
+        help="Reference date for DatasetUsageStatistics retention; defaults to latest audit date",
+    )
     parser.add_argument(
         "--clean-usage-before-emit",
         action="store_true",

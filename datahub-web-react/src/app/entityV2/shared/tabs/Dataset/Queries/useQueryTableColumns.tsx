@@ -73,11 +73,12 @@ export default function useQueryTableColumns({
         title: 'Query Text',
         dataIndex: 'query',
         key: 'query',
+        width: width || undefined,
         render: (rowQuery: string) => {
             const query = queries.find(({ query: q }) => q === rowQuery);
             if (!query) return null;
             return (
-                <div style={{ width: width || 450 }}>
+                <div style={{ width: '100%', minWidth: width || 450 }}>
                     <QueryComponent
                         urn={query.urn}
                         title={query.title || undefined}

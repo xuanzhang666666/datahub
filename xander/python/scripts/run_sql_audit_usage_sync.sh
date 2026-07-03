@@ -14,6 +14,8 @@
 #   QUERY_CORE_TABLE_TOP_N  核心表数量；默认 100
 #   QUERY_PER_CORE_TABLE    每个核心表保留的 SQL fingerprint 数；默认 3
 #   CLEAN_USAGE_BEFORE_EMIT 1=写入前按 DATE 清理当天 DatasetUsageStatistics；写入时默认 1
+#   USAGE_RETENTION_DAYS    DatasetUsageStatistics 保留天数；默认 30，<=0 关闭
+#   USAGE_RETENTION_REFERENCE_DATE  保留窗口基准日期；默认从审计源表取最后日期
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -81,6 +83,8 @@ ARGS=(
 [[ -n "${QUERY_TOP_N:-}" ]] && ARGS+=(--query-top-n "$QUERY_TOP_N")
 [[ -n "${QUERY_CORE_TABLE_TOP_N:-}" ]] && ARGS+=(--query-core-table-top-n "$QUERY_CORE_TABLE_TOP_N")
 [[ -n "${QUERY_PER_CORE_TABLE:-}" ]] && ARGS+=(--query-per-core-table "$QUERY_PER_CORE_TABLE")
+[[ -n "${USAGE_RETENTION_DAYS:-}" ]] && ARGS+=(--usage-retention-days "$USAGE_RETENTION_DAYS")
+[[ -n "${USAGE_RETENTION_REFERENCE_DATE:-}" ]] && ARGS+=(--usage-retention-reference-date "$USAGE_RETENTION_REFERENCE_DATE")
 [[ "$CLEAN_USAGE_BEFORE_EMIT" == "1" ]] && ARGS+=(--clean-usage-before-emit)
 [[ "${DRY_RUN:-1}" == "0" ]] && ARGS+=(--emit)
 
@@ -92,6 +96,8 @@ echo " RUN_DATE=$RUN_DATE"
 echo " ENGINE=$ENGINE"
 echo " DRY_RUN=${DRY_RUN:-1}"
 echo " CLEAN_USAGE_BEFORE_EMIT=$CLEAN_USAGE_BEFORE_EMIT"
+echo " USAGE_RETENTION_DAYS=${USAGE_RETENTION_DAYS:-30}"
+echo " USAGE_RETENTION_REFERENCE_DATE=${USAGE_RETENTION_REFERENCE_DATE:-latest_audit_date}"
 echo " OUT_JSON=$OUT_JSON"
 echo " OPERATION_CHECKPOINT_FILE=$OP_CKPT"
 echo "==================================================================="
