@@ -574,6 +574,86 @@ def rebuild_schedule_job_build(
         return _error_response(exc, **base)
 
 
+def cancel_schedule_job_build(
+    client: JenkinsClient,
+    *,
+    job_display_name: str,
+    build_ref: int | str = "lastBuild",
+    queue_id: int | None = None,
+    cancel_running: bool = True,
+    cancel_queued: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    try:
+        base = _job_base(job_display_name)
+        if confirm is not True:
+            raise ValueError("confirm must be true to cancel schedule job builds")
+        running_build_number = None
+        running_build_cancelled = False
+        cancelled_queue_ids: list[int] = []
+        cancelled_queue_items: list[dict[str, Any]] = []
+        risks = []
+
+        if cancel_running:
+            ref = _validate_build_ref(build_ref)
+            build = client.get_build_info(base["job_display_name"], ref)
+            if build:
+                running_build_number = build.get("number")
+                if build.get("building") and running_build_number:
+                    client.cancel_build(base["job_display_name"], int(running_build_number))
+                    running_build_cancelled = True
+                else:
+                    risks.append("指定构建当前不在运行中，没有取消正在运行的构建")
+            else:
+                risks.append("未找到指定构建，没有取消正在运行的构建")
+
+        if cancel_queued:
+            queue_items = client.get_queue_items()
+            for item in queue_items:
+                item_queue_id = item.get("queue_id")
+                if not item_queue_id:
+                    continue
+                if queue_id is not None:
+                    if int(item_queue_id) != int(queue_id):
+                        continue
+                elif str(item.get("job_display_name") or "").strip() != base["job_display_name"]:
+                    continue
+                client.cancel_queue_item(int(item_queue_id))
+                cancelled_queue_ids.append(int(item_queue_id))
+                cancelled_queue_items.append(item)
+            if queue_id is not None and not cancelled_queue_ids:
+                risks.append("未在 Jenkins 队列中找到指定 queue_id")
+            elif queue_id is None and not cancelled_queue_ids:
+                risks.append("未在 Jenkins 队列中找到该 job 的排队构建")
+
+        if not running_build_cancelled and not cancelled_queue_ids:
+            risks.append("没有实际取消任何 Jenkins 构建或队列项")
+
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "running_build_cancelled": running_build_cancelled,
+                "running_build_number": running_build_number,
+                "cancelled_queue_ids": cancelled_queue_ids,
+                "cancelled_queue_items": cancelled_queue_items,
+                "cancel_running": bool(cancel_running),
+                "cancel_queued": bool(cancel_queued),
+            },
+            "risks": sorted(set(risks)),
+            "evidence": {
+                "interface": "Jenkins REST API",
+                "endpoints": ["/job/{name}/{build}/stop", "/queue/cancelItem?id={queue_id}"],
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _job_base(job_display_name)
+        except Exception:
+            base = {"job_display_name": job_display_name}
+        return _error_response(exc, **base)
+
+
 def get_schedule_job_build_log(
     client: JenkinsClient,
     *,

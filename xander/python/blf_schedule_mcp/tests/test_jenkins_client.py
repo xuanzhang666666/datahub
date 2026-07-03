@@ -290,6 +290,40 @@ def test_rebuild_build_posts_parameterized_rebuild_for_build_number() -> None:
     assert result["queue_id"] == 325
 
 
+def test_cancel_build_posts_stop_for_build_number() -> None:
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+    requests = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        requests.append(request)
+        return _FakeResponse(b"")
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.cancel_build("demo", 12)
+
+    assert requests[0].full_url == "https://jenkins.example/job/demo/12/stop"
+    assert requests[0].get_method() == "POST"
+    assert requests[0].data == b""
+    assert result["endpoint"] == "/job/{name}/{build}/stop"
+
+
+def test_cancel_queue_item_posts_cancel_item_with_id() -> None:
+    client = JenkinsClient(base_url="https://jenkins.example", username="u", token="t")
+    requests = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        requests.append(request)
+        return _FakeResponse(b"")
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        result = client.cancel_queue_item(101)
+
+    assert requests[0].full_url == "https://jenkins.example/queue/cancelItem?id=101"
+    assert requests[0].get_method() == "POST"
+    assert requests[0].data == b""
+    assert result["endpoint"] == "/queue/cancelItem?id={queue_id}"
+
+
 def test_normalize_build_parameters_rejects_nested_values() -> None:
     assert _normalize_build_parameters({"a": 1, "b": False, "c": None}) == {
         "a": "1",

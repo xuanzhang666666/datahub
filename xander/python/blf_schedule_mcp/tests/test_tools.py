@@ -4,6 +4,7 @@ from typing import Any
 
 from blf_schedule_mcp.datahub_client import DataHubClientError
 from blf_schedule_mcp.tools import (
+    cancel_schedule_job_build,
     diagnose_schedule_job_failure,
     find_long_running_schedule_builds,
     get_schedule_job_build_history,
@@ -19,8 +20,9 @@ from blf_schedule_mcp.tools import (
 
 
 class FakeJenkinsClient:
-    def __init__(self, result: str = "SUCCESS") -> None:
+    def __init__(self, result: str = "SUCCESS", building: bool = False) -> None:
         self.result = result
+        self.building = building
         self.log_calls = 0
         self.last_log_max_bytes: int | None = None
         self.log_text = (
@@ -32,6 +34,8 @@ class FakeJenkinsClient:
         self.trigger_calls: list[tuple[str, dict[str, Any] | None]] = []
         self.single_build_calls: list[tuple[str, dict[str, Any] | None]] = []
         self.rebuild_calls: list[tuple[str, int, dict[str, Any] | None]] = []
+        self.cancel_build_calls: list[tuple[str, int]] = []
+        self.cancel_queue_calls: list[int] = []
 
     def get_job_info(self, job_name: str) -> dict[str, Any]:
         return {"builds": [{"number": 4}, {"number": 3}, {"number": 2}, {"number": 1}]}
@@ -43,7 +47,7 @@ class FakeJenkinsClient:
             "timestamp": 1781233200000,
             "duration": 47000,
             "url": "https://schedule.corp.bianlifeng.com/job/demo/4/",
-            "building": False,
+            "building": self.building,
         }
 
     def get_last_failed_build(self, job_name: str) -> dict[str, Any]:
@@ -114,6 +118,20 @@ class FakeJenkinsClient:
             "endpoint": "/job/{name}/{build}/rebuild/parameterized",
             "queue_url": "https://schedule.corp.bianlifeng.com/queue/item/458/",
             "queue_id": 458,
+            "response_text": "",
+        }
+
+    def cancel_build(self, job_name: str, build_number: int) -> dict[str, Any]:
+        self.cancel_build_calls.append((job_name, build_number))
+        return {
+            "endpoint": "/job/{name}/{build}/stop",
+            "response_text": "",
+        }
+
+    def cancel_queue_item(self, queue_id: int) -> dict[str, Any]:
+        self.cancel_queue_calls.append(queue_id)
+        return {
+            "endpoint": "/queue/cancelItem?id={queue_id}",
             "response_text": "",
         }
 
@@ -334,6 +352,72 @@ def test_rebuild_schedule_job_build_returns_queue_info() -> None:
     assert result["summary"]["build_number"] == 10
     assert result["summary"]["queue_id"] == 458
     assert client.rebuild_calls == [("demo", 10, {"time_hour": "2026/07/01/20"})]
+
+
+def test_cancel_schedule_job_build_requires_confirm() -> None:
+    client = FakeJenkinsClient(building=True)
+    result = cancel_schedule_job_build(client, job_display_name="demo")
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_input"
+    assert client.cancel_build_calls == []
+    assert client.cancel_queue_calls == []
+
+
+def test_cancel_schedule_job_build_stops_running_build_and_matching_queue_items() -> None:
+    client = FakeJenkinsClient(building=True)
+    client.queue_items = [
+        {"queue_id": 101, "job_display_name": "demo", "jenkins_url": "http://schedule/job/demo/"},
+        {"queue_id": 102, "job_display_name": "other", "jenkins_url": "http://schedule/job/other/"},
+        {"queue_id": 103, "job_display_name": "demo", "jenkins_url": "http://schedule/job/demo/"},
+    ]
+
+    result = cancel_schedule_job_build(client, job_display_name=" demo ", confirm=True)
+
+    assert result["success"] is True
+    assert result["job_display_name"] == "demo"
+    assert result["summary"]["running_build_cancelled"] is True
+    assert result["summary"]["running_build_number"] == 4
+    assert result["summary"]["cancelled_queue_ids"] == [101, 103]
+    assert client.cancel_build_calls == [("demo", 4)]
+    assert client.cancel_queue_calls == [101, 103]
+
+
+def test_cancel_schedule_job_build_can_target_queue_id_only() -> None:
+    client = FakeJenkinsClient(building=False)
+    client.queue_items = [
+        {"queue_id": 101, "job_display_name": "demo", "jenkins_url": "http://schedule/job/demo/"},
+        {"queue_id": 102, "job_display_name": "demo", "jenkins_url": "http://schedule/job/demo/"},
+    ]
+
+    result = cancel_schedule_job_build(
+        client,
+        job_display_name="demo",
+        queue_id=102,
+        cancel_running=False,
+        confirm=True,
+    )
+
+    assert result["success"] is True
+    assert result["summary"]["running_build_cancelled"] is False
+    assert result["summary"]["cancelled_queue_ids"] == [102]
+    assert client.cancel_build_calls == []
+    assert client.cancel_queue_calls == [102]
+
+
+def test_cancel_schedule_job_build_skips_completed_build() -> None:
+    client = FakeJenkinsClient(building=False)
+    result = cancel_schedule_job_build(
+        client,
+        job_display_name="demo",
+        cancel_queued=False,
+        confirm=True,
+    )
+    assert result["success"] is True
+    assert result["summary"]["running_build_cancelled"] is False
+    assert result["summary"]["running_build_number"] == 4
+    assert result["summary"]["cancelled_queue_ids"] == []
+    assert any("没有取消正在运行的构建" in risk for risk in result["risks"])
+    assert client.cancel_build_calls == []
 
 
 class FakeDataHubClient:

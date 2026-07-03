@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .datahub_client import DataHubClient
 from .jenkins_client import JenkinsClient
 from .tools import (
+    cancel_schedule_job_build,
     check_upstream_time_hour_match,
     diagnose_dependency_trigger,
     diagnose_schedule_job_failure,
@@ -194,6 +195,39 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["job_display_name", "build_number", "confirm"],
         },
     },
+    "blf_cancel_schedule_job_build": {
+        "description": "取消 BLF 调度作业正在运行的构建，或取消 Jenkins 队列中该作业的排队构建。该工具会真实停止/取消 Jenkins 构建，必须显式传 confirm=true。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_display_name": {"type": "string", "description": "要取消构建或排队项的 Jenkins 调度作业名称。"},
+                "build_ref": {
+                    "type": ["string", "integer"],
+                    "default": "lastBuild",
+                    "description": "要检查并取消的运行中构建引用：lastBuild 或具体构建号。",
+                },
+                "queue_id": {
+                    "type": "integer",
+                    "description": "可选。传入后只取消这个 Jenkins queue item；不传则取消该 job 的所有排队项。",
+                },
+                "cancel_running": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否取消正在运行的指定构建。",
+                },
+                "cancel_queued": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否取消 Jenkins 队列中的排队项。",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "安全确认开关。只有传 true 时才会实际取消构建或队列项。",
+                },
+            },
+            "required": ["job_display_name", "confirm"],
+        },
+    },
     "blf_parse_trigger_condition": {
         "description": "解析 job-dependency-plugin 的 triggerCondition 字符串(如 h = 1 & 2 / d = @$ / h = *$ - 1),"
         " 返回 {date_type, logic_symbol, date_list} 并校验格式。"
@@ -354,6 +388,7 @@ class BlfScheduleMcpApplication:
             "blf_trigger_schedule_job_build": functools.partial(trigger_schedule_job_build, jenkins_client),
             "blf_trigger_schedule_job_single_build": functools.partial(trigger_schedule_job_single_build, jenkins_client),
             "blf_rebuild_schedule_job_build": functools.partial(rebuild_schedule_job_build, jenkins_client),
+            "blf_cancel_schedule_job_build": functools.partial(cancel_schedule_job_build, jenkins_client),
             "blf_parse_trigger_condition": parse_trigger_condition_tool,
             "blf_parse_upstream_job_params": parse_upstream_job_params_tool,
             "blf_format_time_hour_token": format_time_hour_token_tool,

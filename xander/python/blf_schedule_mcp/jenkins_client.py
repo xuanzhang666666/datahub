@@ -241,6 +241,30 @@ class JenkinsClient:
             "response_text": raw.decode("utf-8", errors="replace"),
         }
 
+    def cancel_build(self, job_name: str, build_number: int) -> dict[str, Any]:
+        build_number = _normalize_build_number(build_number)
+        raw, _ = self._post_with_headers(
+            self._job_path(job_name, str(build_number), "stop"),
+            data={},
+            max_bytes=4096,
+        )
+        return {
+            "endpoint": "/job/{name}/{build}/stop",
+            "response_text": raw.decode("utf-8", errors="replace"),
+        }
+
+    def cancel_queue_item(self, queue_id: int) -> dict[str, Any]:
+        queue_id = _normalize_queue_id(queue_id)
+        raw, _ = self._post_with_headers(
+            "queue/cancelItem?" + urllib.parse.urlencode({"id": queue_id}),
+            data={},
+            max_bytes=4096,
+        )
+        return {
+            "endpoint": "/queue/cancelItem?id={queue_id}",
+            "response_text": raw.decode("utf-8", errors="replace"),
+        }
+
     def _open_json(self, path: str) -> dict[str, Any]:
         raw = self._open(path, max_bytes=262144)
         if not raw:
@@ -450,6 +474,16 @@ def _normalize_build_number(build_number: int) -> int:
         raise ValueError("build_number must be a positive integer") from exc
     if parsed <= 0:
         raise ValueError("build_number must be a positive integer")
+    return parsed
+
+
+def _normalize_queue_id(queue_id: int) -> int:
+    try:
+        parsed = int(queue_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("queue_id must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError("queue_id must be a positive integer")
     return parsed
 
 

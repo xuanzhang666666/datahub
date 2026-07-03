@@ -13,6 +13,8 @@ class FakeJenkinsClient:
         self.trigger_calls: list[tuple[str, dict[str, Any] | None]] = []
         self.single_build_calls: list[tuple[str, dict[str, Any] | None]] = []
         self.rebuild_calls: list[tuple[str, int, dict[str, Any] | None]] = []
+        self.cancel_build_calls: list[tuple[str, int]] = []
+        self.cancel_queue_calls: list[int] = []
 
     def get_build_info(self, job_name: str, build_ref: int | str) -> dict[str, Any]:
         return {
@@ -43,6 +45,20 @@ class FakeJenkinsClient:
             "endpoint": "/job/{name}/buildWithParameters",
             "queue_url": "https://jenkins.example/queue/item/123/",
             "queue_id": 123,
+            "response_text": "",
+        }
+
+    def cancel_build(self, job_name: str, build_number: int) -> dict[str, Any]:
+        self.cancel_build_calls.append((job_name, build_number))
+        return {
+            "endpoint": "/job/{name}/{build}/stop",
+            "response_text": "",
+        }
+
+    def cancel_queue_item(self, queue_id: int) -> dict[str, Any]:
+        self.cancel_queue_calls.append(queue_id)
+        return {
+            "endpoint": "/queue/cancelItem?id={queue_id}",
             "response_text": "",
         }
 
@@ -110,6 +126,7 @@ def test_tools_list_includes_search_tool() -> None:
     assert "blf_trigger_schedule_job_build" in names
     assert "blf_trigger_schedule_job_single_build" in names
     assert "blf_rebuild_schedule_job_build" in names
+    assert "blf_cancel_schedule_job_build" in names
     assert set(TOOL_SPECS) == names
 
 
@@ -269,4 +286,29 @@ def test_tools_call_dispatches_rebuild_to_jenkins() -> None:
     assert response is not None
     assert response["result"]["isError"] is False
     assert jenkins_client.rebuild_calls == [("demo", 10, {"time_hour": "2026/07/01/20"})]
+    assert datahub_client.calls == []
+
+
+def test_tools_call_dispatches_cancel_to_jenkins() -> None:
+    app, datahub_client, jenkins_client = _build_app()
+    response = app.handle_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "blf_cancel_schedule_job_build",
+                "arguments": {
+                    "job_display_name": "demo",
+                    "build_ref": 7,
+                    "cancel_queued": False,
+                    "confirm": True,
+                },
+            },
+        }
+    )
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert jenkins_client.cancel_build_calls == []
+    assert jenkins_client.cancel_queue_calls == []
     assert datahub_client.calls == []
