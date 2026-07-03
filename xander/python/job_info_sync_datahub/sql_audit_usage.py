@@ -20,6 +20,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
+from urllib import error, request
 
 try:
     import sqlglot
@@ -121,7 +122,6 @@ class DatasetUsage:
     query_count: int = 0
     users: Counter[str] = dataclasses.field(default_factory=Counter)
     sources: Counter[str] = dataclasses.field(default_factory=Counter)
-    fields: Counter[str] = dataclasses.field(default_factory=Counter)
     fingerprints: Counter[str] = dataclasses.field(default_factory=Counter)
     engines: Counter[str] = dataclasses.field(default_factory=Counter)
 
@@ -143,8 +143,30 @@ class AggregatedUsage:
     datasets: dict[str, DatasetUsage] = dataclasses.field(default_factory=dict)
     operations: list[OperationEvent] = dataclasses.field(default_factory=list)
     fingerprints: Counter[str] = dataclasses.field(default_factory=Counter)
+    fingerprint_details: dict[str, "QueryFingerprintUsage"] = dataclasses.field(default_factory=dict)
     failed_queries: int = 0
     parse_report: ParseReport = dataclasses.field(default_factory=ParseReport)
+
+
+@dataclasses.dataclass
+class QueryFingerprintUsage:
+    fingerprint: str
+    sample_sql: str
+    query_count: int = 0
+    users: Counter[str] = dataclasses.field(default_factory=Counter)
+    subjects: set[str] = dataclasses.field(default_factory=set)
+    last_executed_at: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class QueryCandidate:
+    fingerprint: str
+    urn: str
+    sample_sql: str
+    query_count: int
+    users: dict[str, int]
+    subjects: set[str]
+    last_executed_at: str
 
 
 class FileOperationCheckpoint:
@@ -626,6 +648,23 @@ def fingerprint_sql(statement: str) -> str:
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
 
 
+def normalize_sql_sample(statement: str, limit: int = 4000) -> str:
+    normalized = _strip_comments(statement).strip()
+    normalized = re.sub(r"`([^`]+)`", r"\1", normalized)
+    normalized = re.sub(r"'(?:\\'|[^'])*'", "?", normalized)
+    normalized = re.sub(r'"(?:\\"|[^"])*"', "?", normalized)
+    normalized = re.sub(r"\b20\d{6}\b", "?", normalized)
+    normalized = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", "?", normalized)
+    normalized = re.sub(r"\b\d+(?:\.\d+)?\b", "?", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = re.sub(r"\s*,\s*", ", ", normalized)
+    return normalized[:limit]
+
+
+def make_query_urn(fingerprint: str) -> str:
+    return f"urn:li:query:sql_audit_{fingerprint}"
+
+
 def _operation_type(kind: str) -> Optional[str]:
     return {
         "insert": "INSERT",
@@ -654,6 +693,20 @@ def aggregate_usage(records: Iterable[ParsedAuditRecord]) -> AggregatedUsage:
             continue
         for statement in record.statements:
             aggregated.fingerprints[statement.fingerprint] += 1
+            subjects = statement.read_tables | statement.write_tables
+            if subjects:
+                detail = aggregated.fingerprint_details.setdefault(
+                    statement.fingerprint,
+                    QueryFingerprintUsage(
+                        fingerprint=statement.fingerprint,
+                        sample_sql=normalize_sql_sample(statement.statement),
+                    ),
+                )
+                detail.query_count += 1
+                detail.users[statement.user] += 1
+                detail.subjects.update(subjects)
+                if statement.executed_at > detail.last_executed_at:
+                    detail.last_executed_at = statement.executed_at
             for table in statement.read_tables:
                 usage = aggregated.datasets.setdefault(table, DatasetUsage(table=table))
                 usage.query_count += 1
@@ -661,8 +714,6 @@ def aggregate_usage(records: Iterable[ParsedAuditRecord]) -> AggregatedUsage:
                 usage.sources[statement.source] += 1
                 usage.fingerprints[statement.fingerprint] += 1
                 usage.engines[statement.engine] += 1
-                for field in statement.fields_by_table.get(table, set()):
-                    usage.fields[field] += 1
             op_type = _operation_type(statement.kind)
             if op_type:
                 for table in statement.write_tables:
@@ -679,6 +730,50 @@ def aggregate_usage(records: Iterable[ParsedAuditRecord]) -> AggregatedUsage:
                         )
                     )
     return aggregated
+
+
+def build_query_candidates(
+    usage: AggregatedUsage,
+    *,
+    platform_instance: str,
+    env: str,
+    top_n: int,
+    core_table_top_n: int,
+    per_core_table: int,
+) -> list[QueryCandidate]:
+    selected: dict[str, QueryFingerprintUsage] = {}
+    for fingerprint, _ in usage.fingerprints.most_common(top_n):
+        detail = usage.fingerprint_details.get(fingerprint)
+        if detail and detail.subjects:
+            selected[fingerprint] = detail
+
+    core_tables = sorted(
+        usage.datasets.values(),
+        key=lambda item: item.query_count,
+        reverse=True,
+    )[:core_table_top_n]
+    for table_usage in core_tables:
+        for fingerprint, _ in table_usage.fingerprints.most_common(per_core_table):
+            detail = usage.fingerprint_details.get(fingerprint)
+            if detail and detail.subjects:
+                selected[fingerprint] = detail
+
+    return [
+        QueryCandidate(
+            fingerprint=detail.fingerprint,
+            urn=make_query_urn(detail.fingerprint),
+            sample_sql=detail.sample_sql,
+            query_count=detail.query_count,
+            users=dict(detail.users.most_common(100)),
+            subjects=set(detail.subjects),
+            last_executed_at=detail.last_executed_at,
+        )
+        for detail in sorted(
+            selected.values(),
+            key=lambda item: (item.query_count, item.last_executed_at),
+            reverse=True,
+        )
+    ]
 
 
 def _bytes_from_text(value: object) -> Optional[int]:
@@ -809,7 +904,7 @@ def build_report(usage: AggregatedUsage) -> dict[str, object]:
                 "users": _counter_dict(item.users),
                 "sources": _counter_dict(item.sources),
                 "engines": _counter_dict(item.engines),
-                "fields": _counter_dict(item.fields),
+                "fingerprints": _counter_dict(item.fingerprints),
             }
             for item in hot_tables
         ],
@@ -820,6 +915,96 @@ def build_report(usage: AggregatedUsage) -> dict[str, object]:
     }
 
 
+def _usage_stat_to_dict(aspect: object) -> dict[str, object]:
+    if isinstance(aspect, dict):
+        result = dict(aspect)
+    elif hasattr(aspect, "to_obj"):
+        result = dict(aspect.to_obj())
+    else:
+        result = dict(dataclasses.asdict(aspect))
+    result.pop("fieldCounts", None)
+    return result
+
+
+def merge_usage_statistics(
+    existing: Iterable[object],
+    current: object,
+) -> list[dict[str, object]]:
+    by_bucket: dict[int, dict[str, object]] = {}
+    for aspect in existing:
+        row = _usage_stat_to_dict(aspect)
+        timestamp = row.get("timestampMillis")
+        if isinstance(timestamp, int):
+            by_bucket[timestamp] = row
+    current_row = _usage_stat_to_dict(current)
+    current_timestamp = current_row.get("timestampMillis")
+    if isinstance(current_timestamp, int):
+        by_bucket[current_timestamp] = current_row
+    return [by_bucket[key] for key in sorted(by_bucket)]
+
+
+def usage_bucket_window(bucket_date: str) -> tuple[datetime, datetime]:
+    start = datetime.strptime(bucket_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return start, start + timedelta(days=1) - timedelta(milliseconds=1)
+
+
+def dataset_usage_delete_query(
+    *,
+    platform_instance: str,
+    env: str,
+    start_ms: int,
+    end_ms: int,
+) -> dict[str, object]:
+    urn_prefix = (
+        "urn:li:dataset:(urn:li:dataPlatform:hive,"
+        f"{platform_instance}."
+    )
+    return {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"range": {"timestampMillis": {"gte": start_ms, "lte": end_ms}}},
+                    {"wildcard": {"urn": f"{urn_prefix}*{env})"}},
+                ]
+            }
+        }
+    }
+
+
+def bulk_delete_dataset_usage_statistics(
+    *,
+    elasticsearch_url: str,
+    index_name: str,
+    platform_instance: str,
+    env: str,
+    start_ms: int,
+    end_ms: int,
+) -> int:
+    payload = dataset_usage_delete_query(
+        platform_instance=platform_instance,
+        env=env,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
+    url = (
+        f"{elasticsearch_url.rstrip('/')}/{index_name}/_delete_by_query"
+        "?conflicts=proceed&refresh=true&wait_for_completion=true"
+    )
+    req = request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=300) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"delete_by_query failed: {exc.code} {detail}") from exc
+    return int(body.get("deleted") or 0)
+
+
 def emit_to_datahub(
     usage: AggregatedUsage,
     *,
@@ -828,45 +1013,71 @@ def emit_to_datahub(
     platform_instance: str,
     env: str,
     bucket_date: str,
+    query_candidates: list[QueryCandidate],
     operation_checkpoint: Optional[FileOperationCheckpoint] = None,
-) -> None:
+    clean_usage_before_emit: bool = False,
+) -> dict[str, int]:
     from datahub.emitter.mcp import MetadataChangeProposalWrapper
     from datahub.emitter.rest_emitter import DatahubRestEmitter
     from datahub.metadata.schema_classes import (
-        DatasetFieldUsageCountsClass,
-        DatasetUsageStatisticsClass,
+        AuditStampClass,
         DatasetUserUsageCountsClass,
         OperationClass,
         OperationSourceTypeClass,
         OperationTypeClass,
+        QueryLanguageClass,
+        QueryPropertiesClass,
+        QuerySourceClass,
+        QueryStatementClass,
+        QuerySubjectClass,
+        QuerySubjectsClass,
+        QueryUsageStatisticsClass,
         TimeWindowSizeClass,
+        UsageAggregationClass,
+        UsageAggregationMetricsClass,
+        UserUsageCountsClass,
     )
 
-    start = datetime.strptime(bucket_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    emitter = DatahubRestEmitter(gms_url or os.getenv("DATAHUB_GMS_URL", "http://127.0.0.1:8080"), token=token)
+    start, end = usage_bucket_window(bucket_date)
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+    resolved_gms_url = gms_url or os.getenv("DATAHUB_GMS_URL", "http://127.0.0.1:8080")
+    emitter = DatahubRestEmitter(resolved_gms_url, token=token)
+    cleaned_usage_rows = 0
+    if clean_usage_before_emit:
+        cleaned_usage_rows = bulk_delete_dataset_usage_statistics(
+            elasticsearch_url=os.getenv("DATAHUB_ELASTICSEARCH_URL", "http://localhost:9200"),
+            index_name=os.getenv(
+                "DATAHUB_DATASET_USAGE_INDEX",
+                "dataset_datasetusagestatisticsaspect_v1",
+            ),
+            platform_instance=platform_instance,
+            env=env,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
     for item in usage.datasets.values():
         db, table = item.table.split(".", 1)
         urn = make_hive_dataset_urn(db, table, platform_instance=platform_instance, env=env)
-        aspect = DatasetUsageStatisticsClass(
-            timestampMillis=int(start.timestamp() * 1000),
-            eventGranularity=TimeWindowSizeClass(unit="DAY", multiple=1),
-            uniqueUserCount=len(item.users),
-            totalSqlQueries=item.query_count,
-            topSqlQueries=None,
-            userCounts=[
-                DatasetUserUsageCountsClass(
-                    user=f"urn:li:corpuser:{user}",
-                    count=count,
-                    userEmail=None,
-                )
-                for user, count in item.users.most_common(100)
-            ],
-            fieldCounts=[
-                DatasetFieldUsageCountsClass(fieldPath=field, count=count)
-                for field, count in item.fields.most_common(500)
-            ],
+        usage_stats = UsageAggregationClass(
+            bucket=start_ms,
+            duration="DAY",
+            resource=urn,
+            metrics=UsageAggregationMetricsClass(
+                uniqueUserCount=len(item.users),
+                totalSqlQueries=item.query_count,
+                topSqlQueries=None,
+                users=[
+                    UserUsageCountsClass(
+                        user=f"urn:li:corpuser:{user}",
+                        count=count,
+                    )
+                    for user, count in item.users.most_common(100)
+                ],
+                fields=None,
+            ),
         )
-        emitter.emit_mcp(MetadataChangeProposalWrapper(entityUrn=urn, aspect=aspect))
+        emitter.emit_usage(usage_stats)
     op_type_by_name = {
         "INSERT": OperationTypeClass.INSERT,
         "CREATE": OperationTypeClass.CREATE,
@@ -893,6 +1104,65 @@ def emit_to_datahub(
         if operation_checkpoint is not None:
             operation_checkpoint.mark_written(op)
 
+    audit_stamp = AuditStampClass(
+        time=int(start.timestamp() * 1000),
+        actor="urn:li:corpuser:wstats",
+    )
+    for query in query_candidates:
+        subject_urns = [
+            make_hive_dataset_urn(*subject.split(".", 1), platform_instance=platform_instance, env=env)
+            for subject in sorted(query.subjects)
+        ]
+        emitter.emit_mcp(
+            MetadataChangeProposalWrapper(
+                entityUrn=query.urn,
+                aspect=QueryPropertiesClass(
+                    statement=QueryStatementClass(
+                        value=query.sample_sql,
+                        language=QueryLanguageClass.SQL,
+                    ),
+                    source=QuerySourceClass.SYSTEM,
+                    name=f"SQL audit fingerprint {query.fingerprint[:12]}",
+                    description="Normalized SQL fingerprint sample from Hive/Trino audit logs.",
+                    created=audit_stamp,
+                    lastModified=audit_stamp,
+                ),
+            )
+        )
+        emitter.emit_mcp(
+            MetadataChangeProposalWrapper(
+                entityUrn=query.urn,
+                aspect=QuerySubjectsClass(
+                    subjects=[QuerySubjectClass(entity=urn) for urn in subject_urns]
+                ),
+            )
+        )
+        emitter.emit_mcp(
+            MetadataChangeProposalWrapper(
+                entityUrn=query.urn,
+                aspect=QueryUsageStatisticsClass(
+                    timestampMillis=int(start.timestamp() * 1000),
+                    eventGranularity=TimeWindowSizeClass(unit="DAY", multiple=1),
+                    queryCount=query.query_count,
+                    lastExecutedAt=(
+                        int(datetime.fromisoformat(query.last_executed_at.replace("Z", "+00:00")).timestamp() * 1000)
+                        if query.last_executed_at
+                        else None
+                    ),
+                    uniqueUserCount=len(query.users),
+                    userCounts=[
+                        DatasetUserUsageCountsClass(
+                            user=f"urn:li:corpuser:{user}",
+                            count=count,
+                            userEmail=None,
+                        )
+                        for user, count in query.users.items()
+                    ],
+                ),
+            )
+        )
+    return {"cleaned_usage_rows": cleaned_usage_rows}
+
 
 def run(args: argparse.Namespace) -> int:
     conn = _mysql_connection(args.database)
@@ -907,9 +1177,51 @@ def run(args: argparse.Namespace) -> int:
     parsed = [parse_audit_record(record) for record in records]
     usage = aggregate_usage(parsed)
     report = build_report(usage)
+    query_candidates = build_query_candidates(
+        usage,
+        platform_instance=args.platform_instance,
+        env=args.env,
+        top_n=args.query_top_n,
+        core_table_top_n=args.query_core_table_top_n,
+        per_core_table=args.query_per_core_table,
+    )
+    report["query_candidate_count"] = len(query_candidates)
+    report["query_candidates"] = [
+        {
+            "urn": item.urn,
+            "fingerprint": item.fingerprint,
+            "query_count": item.query_count,
+            "users": item.users,
+            "subjects": sorted(item.subjects),
+            "sample_sql": item.sample_sql,
+        }
+        for item in query_candidates[:200]
+    ]
     report["input_records"] = len(records)
     report["date"] = args.date
     report["engine"] = args.engine
+    if args.emit:
+        operation_checkpoint = (
+            FileOperationCheckpoint(Path(args.operation_checkpoint))
+            if args.operation_checkpoint
+            else None
+        )
+        emit_result = emit_to_datahub(
+            usage,
+            gms_url=args.gms_url,
+            token=args.gms_token,
+            platform_instance=args.platform_instance,
+            env=args.env,
+            bucket_date=args.date,
+            query_candidates=query_candidates,
+            operation_checkpoint=operation_checkpoint,
+            clean_usage_before_emit=args.clean_usage_before_emit,
+        )
+        report.update(emit_result)
+        report["emitted_query_count"] = len(query_candidates)
+    else:
+        report["cleaned_usage_rows"] = 0
+        report["emitted_query_count"] = 0
     if args.output:
         Path(args.output).write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
@@ -917,21 +1229,6 @@ def run(args: argparse.Namespace) -> int:
         )
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2))
-    if args.emit:
-        operation_checkpoint = (
-            FileOperationCheckpoint(Path(args.operation_checkpoint))
-            if args.operation_checkpoint
-            else None
-        )
-        emit_to_datahub(
-            usage,
-            gms_url=args.gms_url,
-            token=args.gms_token,
-            platform_instance=args.platform_instance,
-            env=args.env,
-            bucket_date=args.date,
-            operation_checkpoint=operation_checkpoint,
-        )
     return 0
 
 
@@ -947,6 +1244,14 @@ def main() -> int:
     parser.add_argument("--gms-token", default=os.getenv("DATAHUB_GMS_TOKEN"))
     parser.add_argument("--platform-instance", default=os.getenv("BLF_DATAHUB_PLATFORM_INSTANCE", "blf-prod-hive"))
     parser.add_argument("--env", default="PROD")
+    parser.add_argument("--query-top-n", type=int, default=100)
+    parser.add_argument("--query-core-table-top-n", type=int, default=100)
+    parser.add_argument("--query-per-core-table", type=int, default=3)
+    parser.add_argument(
+        "--clean-usage-before-emit",
+        action="store_true",
+        help="Hard-delete this day's datasetUsageStatistics rows before re-emitting usage",
+    )
     parser.add_argument(
         "--operation-checkpoint",
         help="Local JSONL checkpoint file for deduplicating Operation emission",

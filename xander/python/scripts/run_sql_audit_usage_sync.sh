@@ -10,6 +10,10 @@
 #   LIMIT             可选，限制每个来源读取行数，用于冒烟
 #   REPORT_DIR        报告目录
 #   OPERATION_CHECKPOINT_FILE  Operation 去重文件；默认按 DATE 放在 Jenkins workspace 下
+#   QUERY_TOP_N       高频 SQL fingerprint 候选数；默认 100
+#   QUERY_CORE_TABLE_TOP_N  核心表数量；默认 100
+#   QUERY_PER_CORE_TABLE    每个核心表保留的 SQL fingerprint 数；默认 3
+#   CLEAN_USAGE_BEFORE_EMIT 1=写入前按 DATE 清理当天 DatasetUsageStatistics；写入时默认 1
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,6 +40,11 @@ done
 
 RUN_DATE="${DATE:-$(date -d yesterday +%F)}"
 ENGINE="${ENGINE:-both}"
+if [[ "${DRY_RUN:-1}" == "0" ]]; then
+  CLEAN_USAGE_BEFORE_EMIT="${CLEAN_USAGE_BEFORE_EMIT:-1}"
+else
+  CLEAN_USAGE_BEFORE_EMIT="${CLEAN_USAGE_BEFORE_EMIT:-0}"
+fi
 
 if [[ -n "${REPORT_DIR:-}" ]]; then
   OUT_DIR="$REPORT_DIR"
@@ -69,6 +78,10 @@ ARGS=(
 [[ -n "${DATAHUB_GMS_TOKEN:-}" ]] && ARGS+=(--gms-token "$DATAHUB_GMS_TOKEN")
 [[ -n "${BLF_DATAHUB_PLATFORM_INSTANCE:-}" ]] && ARGS+=(--platform-instance "$BLF_DATAHUB_PLATFORM_INSTANCE")
 [[ -n "${DATAHUB_ENV:-}" ]] && ARGS+=(--env "$DATAHUB_ENV")
+[[ -n "${QUERY_TOP_N:-}" ]] && ARGS+=(--query-top-n "$QUERY_TOP_N")
+[[ -n "${QUERY_CORE_TABLE_TOP_N:-}" ]] && ARGS+=(--query-core-table-top-n "$QUERY_CORE_TABLE_TOP_N")
+[[ -n "${QUERY_PER_CORE_TABLE:-}" ]] && ARGS+=(--query-per-core-table "$QUERY_PER_CORE_TABLE")
+[[ "$CLEAN_USAGE_BEFORE_EMIT" == "1" ]] && ARGS+=(--clean-usage-before-emit)
 [[ "${DRY_RUN:-1}" == "0" ]] && ARGS+=(--emit)
 
 echo "==================================================================="
@@ -78,6 +91,7 @@ echo " PYTHON=$PYTHON"
 echo " RUN_DATE=$RUN_DATE"
 echo " ENGINE=$ENGINE"
 echo " DRY_RUN=${DRY_RUN:-1}"
+echo " CLEAN_USAGE_BEFORE_EMIT=$CLEAN_USAGE_BEFORE_EMIT"
 echo " OUT_JSON=$OUT_JSON"
 echo " OPERATION_CHECKPOINT_FILE=$OP_CKPT"
 echo "==================================================================="

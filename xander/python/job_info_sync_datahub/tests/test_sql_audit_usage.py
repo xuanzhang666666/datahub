@@ -12,6 +12,7 @@ from job_info_sync_datahub.sql_audit_usage import (
     FileOperationCheckpoint,
     OperationEvent,
     build_query_candidates,
+    dataset_usage_delete_query,
     aggregate_usage,
     filter_new_operations,
     fingerprint_sql,
@@ -20,6 +21,7 @@ from job_info_sync_datahub.sql_audit_usage import (
     operation_key,
     parse_audit_record,
     split_sql_statements,
+    usage_bucket_window,
     _fetch_trino_records,
 )
 
@@ -233,11 +235,10 @@ class SqlAuditUsageTest(unittest.TestCase):
         self.assertEqual(usage.datasets["dwd.user_behavior"].query_count, 2)
         self.assertEqual(usage.datasets["dwd.user_behavior"].users["wstats"], 1)
         self.assertEqual(usage.datasets["dwd.user_behavior"].users["jingliang.zhang"], 1)
-        self.assertEqual(usage.datasets["dwd.user_behavior"].fields["user_id"], 2)
+        self.assertEqual(usage.datasets["dwd.user_behavior"].fingerprints.total(), 2)
         self.assertEqual(usage.operations[0].table, "dm.user_tag")
         self.assertEqual(usage.operations[0].operation_type, "INSERT")
         self.assertEqual(usage.failed_queries, 1)
-        self.assertEqual(usage.datasets["dwd.user_behavior"].fields, {})
 
     def test_normalize_sql_sample_redacts_literals_without_hiding_structure(self) -> None:
         sample = normalize_sql_sample(
@@ -328,6 +329,34 @@ class SqlAuditUsageTest(unittest.TestCase):
         self.assertEqual([item["totalSqlQueries"] for item in merged], [77, 78])
         self.assertNotIn("fieldCounts", merged[0])
         self.assertNotIn("fieldCounts", merged[1])
+
+    def test_usage_bucket_window_covers_one_utc_day_without_touching_next_day(self) -> None:
+        start, end = usage_bucket_window("2026-06-30")
+
+        self.assertEqual(int(start.timestamp() * 1000), 1782777600000)
+        self.assertEqual(int(end.timestamp() * 1000), 1782863999999)
+
+    def test_dataset_usage_delete_query_is_limited_to_day_platform_and_env(self) -> None:
+        query = dataset_usage_delete_query(
+            platform_instance="blf-prod-hive",
+            env="PROD",
+            start_ms=1782777600000,
+            end_ms=1782863999999,
+        )
+
+        filters = query["query"]["bool"]["filter"]  # type: ignore[index]
+        self.assertIn(
+            {"range": {"timestampMillis": {"gte": 1782777600000, "lte": 1782863999999}}},
+            filters,
+        )
+        self.assertIn(
+            {
+                "wildcard": {
+                    "urn": "urn:li:dataset:(urn:li:dataPlatform:hive,blf-prod-hive.*PROD)"
+                }
+            },
+            filters,
+        )
 
     def test_split_sql_statements_ignores_semicolon_inside_string(self) -> None:
         statements = split_sql_statements(
