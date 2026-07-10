@@ -10,11 +10,11 @@
 | 服务器 | neo4j2.dp.data.bj1 |
 | 端口 | 9013 |
 | 容器名 | btalk-mcp |
-| 镜像 | btalk-mcp:enhanced |
+| 镜像 | `btalk-mcp:enhanced-0.4.6-20260701`（实际部署的具体 tag，见 `docker ps`） |
 | MCP 端点 | `http://neo4j2:9013/mcp` |
 | 传输 | supergateway（stdio → streamable HTTP，stateful 模式） |
 | 登录态 | `/root/.btalk/`（挂载到宿主机） |
-| npm 包 | `@wnpm/btalk-cli@0.3.9`（内网 registry） |
+| npm 包 | `@wnpm/btalk-cli@0.4.6`（内网 registry） |
 
 ## 架构
 
@@ -114,13 +114,13 @@ MCP 客户端 (HTTP POST /mcp)
 | `scripts/deploy.sh` | ssh 跳板到 neo4j2，rm 旧容器 → run 新容器 → 等就绪 → 跑 smoke |
 | `scripts/smoke-test.sh` | `initialize` + `tools/list` 计数 + 抽样调用 7 个工具；< 23 即视为回退；确认不暴露 `message_search` |
 | `scripts/maintenance.py` | 清理可丢弃的 search/presearch 索引，避免 SQLite WAL 膨胀 |
-| `scripts/healthcheck.py` | 检查 `btalk status` 登录态，异常时重启一次容器 |
+| `scripts/healthcheck.py` | 检查登录态、会话查询、`dataBaseCrash` 和消息新鲜度；连续异常时重启并向监控群告警 |
 
 ## 运行时维护
 
 neo4j2 上有两个 cron：
 
-- `/etc/cron.d/btalk-mcp-healthcheck`: 每 10 分钟执行 `/root/btalk_mcp_healthcheck.py`，`loggedIn=true` 且 `state=ready` 才算健康；异常时 `docker restart btalk-mcp` 一次。
+- `/etc/cron.d/btalk-mcp-healthcheck`: 每 10 分钟执行 `/root/btalk_mcp_healthcheck.py`；连续两次状态/会话检查失败会重启一次，检测到 `dataBaseCrash` 或连续 30 分钟无新消息时向监控群 `baa2330062165177b7ede2ec107d0593` 告警。
 - `/etc/cron.d/btalk-mcp-maintenance`: 每天 04:20 执行 `/root/btalk_mcp_maintenance.py`，search/presearch 索引超过 512MB 时停容器、删除索引、再启动。
 
 日志在 `/root/btalk_backups/healthcheck.log` 和 `/root/btalk_backups/maintenance.log`。
@@ -151,3 +151,32 @@ npm view @wnpm/btalk-cli version --registry=https://registry.corp.bianlifeng.com
 - 改完 `tools.js` 后用 `./scripts/build.sh` 重新出镜像，再用 `./scripts/deploy.sh` 部署。
 - native 模块 `btalksdk-node.node` 需要 `libresolv.so.2`，镜像需基于带该库的 Linux 发行版。
 - 容器名固定 `btalk-mcp`，端口 `9013`，登录态卷 `/root/.btalk`，**重建容器时不要漏挂这个卷**。
+
+## ⚠️ 已知问题：9013 当前不可用（2026-07-10 起）
+
+`btalk-mcp:enhanced-0.4.6-20260701` 在 neo4j2 上跑着，但所有 btalk_* tool（`list_conversations` / `fetch_history` 等）都返回 `[]`。
+
+**根因**：native addon (`btalksdk-node.node`) 内部 SQLite 实例从 2026-07-01 起持续报 `dataBaseCrash 11`，`conversationListUpdatedCallBack` 收到 `{"normal":null,"top":null}`。重启容器 / 删 db / 重建 db 都不能根治。SDK 作者已确认服务端 push 不做过滤，问题在客户端。
+
+**当前 workaround**：
+- 用户切到本机 mac 蜂利器 desktop app 查（db 健康）
+- `~/Library/Application Support/btalk/databases/xuan.zhang.db` 是同 schema 的健康 db
+
+**真正的修复路径**：等 SDK 团队发新版 `@wnpm/btalk-cli` 修复 native addon bug，然后：
+1. `./scripts/build.sh <新版本号>` 重 build 镜像
+2. 删容器内损坏的 `/root/.btalk/prod/databases/xuan.zhang.db*`
+3. `./scripts/deploy.sh` 部署
+
+**不要做的修复**（试过都没用）：
+- 重启容器（已验证 3 次，dataBaseCrash 11 立即复发）
+- 删 db 让 native addon 重建（内部 SQLite 状态坏了，重建的 db 也会很快被损坏）
+- 拷贝 mac 桌面版 db 进去（schema/deviceId 风险 + native addon 仍会损坏新 db）
+- 重 build 同 tag 镜像（native addon 二进制不变）
+
+**完整诊断报告**：[`INCIDENT_2026-07-10-dataBaseCrash.md`](INCIDENT_2026-07-10-dataBaseCrash.md)
+
+**重要：两个日志文件不要搞混**：
+- `/root/.btalk/btalkd.log` —— daemon 生命周期日志（DAEMON_BOOT / NET_UP / SSO_REFRESH），**不写业务事件**
+- `/root/.btalk/prod/logs/btalk/app.log` —— SDK 业务日志（log4js, 36MB），`dataBaseCrash 11` 在这里
+
+排查时两个都要看，特别是 `app.log`，**只看 `btalkd.log` 找不到 native addon 崩溃的证据**。

@@ -2,26 +2,9 @@
 const { z } = require('zod');
 const { execFile } = require('child_process');
 
-const { createBtalk, login, waitConnected } = require('../index');
-const { sendFile } = require('../files');
 const { flattenConversations, renderBody, formatTime, localPathOf } = require('../cli/commands');
-
-let _btalkPromise = null;
-function btalk() {
-  if (!_btalkPromise) {
-    _btalkPromise = (async () => {
-      const b = await createBtalk();
-      const w = waitConnected(b);
-      await login(b);
-      await w;
-      return b;
-    })().catch((e) => {
-      _btalkPromise = null;
-      throw e;
-    });
-  }
-  return _btalkPromise;
-}
+const daemonClient = require('../cli/client');
+const { createDaemonHandlers } = require('./daemon_handlers');
 
 function runBtalk(args) {
   return new Promise((resolve, reject) => {
@@ -166,51 +149,16 @@ const descriptors = [
   { name: 'pc_helper', description: '个人电脑助手：给自己发消息、查看监听状态或停止监听。', inputSchema: z.toJSONSchema(schemas.pc_helper) },
 ];
 
+const daemonHandlers = createDaemonHandlers({
+  request: daemonClient.request,
+  flattenConversations,
+  formatTime,
+  renderBody,
+  localPathOf,
+});
+
 const rawHandlers = {
-  async list_conversations(_args) {
-    const b = await btalk();
-    return flattenConversations(await b.getAllConversationsFromNewSDK()).map((c) => ({
-      id: c.id, type: c.chatType, name: c.name || c.cnName || c.fullname || '', unread: c.unread_msg_cont || 0,
-    }));
-  },
-  async search_contact({ q }) {
-    const b = await btalk();
-    const list = flattenConversations(await b.getAllConversationsFromNewSDK());
-    const ql = q.toLowerCase();
-    return list.filter((c) => (c.id || '').toLowerCase().includes(ql) || (c.name || '').toLowerCase().includes(ql) || (c.cnName || '').toLowerCase().includes(ql) || (c.fullname || '').toLowerCase().includes(ql))
-               .map((c) => ({ id: c.id, name: c.name || c.cnName || c.fullname || '' }));
-  },
-  async fetch_history({ conversation_id, count, is_group }) {
-    const b = await btalk();
-    const raw = await b.fetchHistoryMessages({
-      conversationId: conversation_id.toLowerCase(), pageSize: count ?? 20, isGroupChat: !!is_group, forceFetchRemote: true,
-    });
-    const data = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
-    return (data.message || []).map((m) => ({
-      id: m.id, time: formatTime(m), from: m.fromID, text: renderBody(m.body, m),
-      type: m.msgType, conversation: m.conversationID,
-    }));
-  },
-  async send_message({ to, text, is_group }) {
-    const b = await btalk();
-    const ret = await b.commit({ toID: to.toLowerCase(), body: text, chatType: is_group ? 'groupchat' : 'chat' });
-    return { ok: true, id: ret && ret.id };
-  },
-  async send_file({ to, file_path, is_group }) {
-    const b = await btalk();
-    const ret = await sendFile(b, { toID: to, filePath: file_path, chatType: is_group ? 'groupchat' : 'chat' });
-    return { ok: true, id: ret && ret.id };
-  },
-  async get_image_path({ conversation_id, message_id }) {
-    const b = await btalk();
-    const raw = await b.fetchHistoryMessages({ conversationId: conversation_id.toLowerCase(), pageSize: 50, forceFetchRemote: true });
-    const data = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
-    const list = (data.message || []).filter((m) => m.msgType === 3 || m.msgType === 5);
-    const m = message_id ? list.find((x) => x.id === message_id) : list[list.length - 1];
-    if (!m) return { found: false };
-    const p = localPathOf(m, b.appDataPath);
-    return { found: true, id: m.id, type: m.msgType === 3 ? 'image' : 'file', local_path: p };
-  },
+  ...daemonHandlers,
 
   async btalk_status() {
     return runBtalk(['status']);

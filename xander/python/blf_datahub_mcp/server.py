@@ -28,6 +28,8 @@ from .tools import (
     get_hive_structured_properties,
     get_hive_structured_property,
     get_hive_table_profile,
+    get_hive_table_queries,
+    get_hive_table_stats,
     get_schedule_job_content_xml,
     get_schedule_job_execute_shell,
     get_schedule_job_lineage,
@@ -319,6 +321,69 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "required": ["table"],
         },
     },
+    "blf_get_hive_table_stats": {
+        "description": "读取 DataHub Stats tab 数据：最近 30 天查询/用户摘要、最近 dataset profile（行数/列数/大小）、usageStats 聚合指标。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "range": {
+                    "type": "string",
+                    "enum": ["DAY", "WEEK", "MONTH"],
+                    "default": "MONTH",
+                    "description": "usageStats 聚合的时间窗口，对应 GraphQL TimeRange 枚举。",
+                },
+                "profile_limit": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "返回最近多少条 datasetProfile 记录，默认 5。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
+    "blf_get_hive_table_queries": {
+        "description": "读取 DataHub Queries tab 数据：usageStats 聚合的 topSqlQueries 和 SQL queries ingestion 写入的逐次 operations（actor/SQL 文本/时间）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "description": "Hive 表名，支持 db.table 或 table；未写库名时默认使用 default 库。",
+                },
+                "range": {
+                    "type": "string",
+                    "enum": ["DAY", "WEEK", "MONTH"],
+                    "default": "MONTH",
+                    "description": "usageStats 聚合的时间窗口，对应 GraphQL TimeRange 枚举。",
+                },
+                "operation_limit": {
+                    "type": "integer",
+                    "default": 20,
+                    "description": "返回最近多少次 SQL 操作记录，默认 20。",
+                },
+                "operation_window_hours": {
+                    "type": "integer",
+                    "default": 720,
+                    "description": "operations 查询回溯窗口（小时），默认 30 天。",
+                },
+                "top_query_limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "去重后的 topSqlQueries 最多返回多少条，默认 50；设为 0 表示不返回聚合 SQL。",
+                },
+                "max_sql_chars": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "每段 SQL 最多返回的字符数，超出会截断。",
+                },
+            },
+            "required": ["table"],
+        },
+    },
     "blf_explain_hive_table_context": {
         "description": "一次性读取 Hive 表画像、ETL、血缘和风险缺口，供 AI Agent 生成表解释或加工逻辑说明。",
         "inputSchema": {
@@ -493,6 +558,8 @@ class BlfMcpApplication:
             "blf_explain_hive_field_lineage": explain_hive_field_lineage,
             "blf_search_hive_assets": search_hive_assets,
             "blf_audit_hive_table": audit_hive_table,
+            "blf_get_hive_table_stats": get_hive_table_stats,
+            "blf_get_hive_table_queries": get_hive_table_queries,
             "blf_explain_hive_table_context": explain_hive_table_context,
             "blf_get_schedule_job_profile": get_schedule_job_profile,
             "blf_get_schedule_job_execute_shell": get_schedule_job_execute_shell,
@@ -638,7 +705,9 @@ def make_handler(app: BlfMcpApplication) -> type[BaseHTTPRequestHandler]:
 
 
 def build_app() -> BlfMcpApplication:
-    env_file = os.getenv("BLF_DATAHUB_MCP_ENV_FILE", "/data/datahub/scripts/lineage.env")
+    env_file = os.getenv(
+        "BLF_DATAHUB_MCP_ENV_FILE", "/data/datahub/scripts/lineage.env"
+    )
     load_env_file(env_file)
     gms_url = os.getenv("DATAHUB_GMS_URL", "http://localhost:8080")
     token = os.getenv("DATAHUB_GMS_TOKEN")
@@ -659,7 +728,9 @@ def main() -> None:
         type=int,
         default=int(os.getenv("BLF_DATAHUB_MCP_PORT", "9010")),
     )
-    parser.add_argument("--log-level", default=os.getenv("BLF_DATAHUB_MCP_LOG_LEVEL", "INFO"))
+    parser.add_argument(
+        "--log-level", default=os.getenv("BLF_DATAHUB_MCP_LOG_LEVEL", "INFO")
+    )
     args = parser.parse_args()
 
     logging.basicConfig(

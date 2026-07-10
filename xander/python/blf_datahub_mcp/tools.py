@@ -182,9 +182,7 @@ def get_hive_table_profile(
             aspects, "editableDatasetProperties"
         )
         description = (
-            editable_props.get("description")
-            or dataset_props.get("description")
-            or ""
+            editable_props.get("description") or dataset_props.get("description") or ""
         )
         owners = (graph_profile.get("ownership") or {}).get("owners") or []
         tags = (graph_profile.get("tags") or {}).get("tags") or []
@@ -202,7 +200,9 @@ def get_hive_table_profile(
             terms = glossary_aspect["terms"]
         if domain is None and isinstance(domains_aspect.get("domains"), list):
             domain = domains_aspect["domains"][0] if domains_aspect["domains"] else None
-        fields = summarize_schema_fields(schema, field_limit) if include_fields else None
+        fields = (
+            summarize_schema_fields(schema, field_limit) if include_fields else None
+        )
         gaps = governance_gaps(
             has_schema=bool(schema.get("fields")),
             has_documentation=bool(description),
@@ -344,9 +344,7 @@ def get_hive_structured_properties(
                 "missing_properties": missing,
                 "unknown_property_urns": sorted(structured["unknown"]),
             },
-            "risks": [
-                f"缺少 {name} structured property" for name in missing
-            ],
+            "risks": [f"缺少 {name} structured property" for name in missing],
             "evidence": {
                 "interface": "OpenAPI structuredProperties",
                 "known_property_urns": {
@@ -1202,3 +1200,334 @@ def _summarize_lineage_results(
             }
         )
     return entries
+
+
+# Powers blf_get_hive_table_stats and blf_get_hive_table_queries.
+# `operations` is the per-execution record (actor, sql text, timestamp, affected rows)
+# produced by the Hive SQL queries ingestion source. `datasetProfiles` provides the
+# latest row/column counts; `usageStats` aggregates totalSqlQueries / uniqueUserCount /
+# topSqlQueries over a TimeRange; `statsSummary` mirrors the Stats tab "Highlights" card.
+DATASET_STATS_QUERIES_QUERY = """
+query DatasetStatsAndQueries(
+  $urn: String!
+  $range: TimeRange
+  $profileLimit: Int
+  $operationLimit: Int
+  $operationStartMillis: Long
+  $operationEndMillis: Long
+) {
+  dataset(urn: $urn) {
+    urn
+    name
+    exists
+    statsSummary {
+      queryCountLast30Days
+      uniqueUserCountLast30Days
+      topUsersLast30Days { urn username }
+    }
+    usageStats(range: $range) {
+      aggregations {
+        uniqueUserCount
+        totalSqlQueries
+        users { user { urn username } count }
+        fields { fieldName count }
+      }
+      buckets {
+        bucket
+        duration
+        resource
+        metrics {
+          uniqueUserCount
+          totalSqlQueries
+          topSqlQueries
+          users { user { urn username } count }
+          fields { fieldName count }
+        }
+      }
+    }
+    datasetProfiles(limit: $profileLimit) {
+      timestampMillis
+      rowCount
+      columnCount
+      sizeInBytes
+      fieldProfiles {
+        fieldPath
+        nullCount
+        uniqueCount
+        min
+        max
+      }
+    }
+    operations(
+      startTimeMillis: $operationStartMillis
+      endTimeMillis: $operationEndMillis
+      limit: $operationLimit
+    ) {
+      timestampMillis
+      lastUpdatedTimestamp
+      actor
+      operationType
+      affectedDatasets
+      numAffectedRows
+      customProperties { key value }
+    }
+  }
+}
+"""
+
+
+def _summarize_top_users(
+    users: list[dict[str, Any]] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Normalize per-user usage counts to a compact {urn, username, count} shape."""
+    if not users:
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in users[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        user = entry.get("user") or {}
+        out.append(
+            {
+                "urn": user.get("urn") or "",
+                "username": user.get("username") or "",
+                "count": entry.get("count"),
+            }
+        )
+    return out
+
+
+def get_hive_table_stats(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    range: Literal["DAY", "WEEK", "MONTH"] = "MONTH",
+    profile_limit: int = 5,
+) -> dict[str, Any]:
+    """Return the Stats-tab evidence (Highlights + Latest + Recent profiles) for one Hive table."""
+    try:
+        base = _base(table, public_base_url)
+        if range not in {"DAY", "WEEK", "MONTH"}:
+            raise ValueError("range must be DAY, WEEK, or MONTH")
+        profile_limit = max(int(profile_limit), 1)
+        data = client.graphql(
+            DATASET_STATS_QUERIES_QUERY,
+            {
+                "urn": base["dataset_urn"],
+                "range": range,
+                "profileLimit": profile_limit,
+                "operationLimit": 0,
+                "operationStartMillis": None,
+                "operationEndMillis": None,
+            },
+        )
+        dataset = data.get("dataset") or {}
+        if not dataset.get("exists", True):
+            return _error_response(
+                ValueError(f"dataset {base['dataset']} does not exist in DataHub"),
+                **base,
+            )
+        stats_summary = dataset.get("statsSummary") or {}
+        usage_stats = dataset.get("usageStats") or {}
+        aggregations = usage_stats.get("aggregations") or {}
+        buckets = usage_stats.get("buckets") or []
+        profiles = dataset.get("datasetProfiles") or []
+        latest = profiles[0] if profiles else {}
+        risks: list[str] = []
+        if not stats_summary:
+            risks.append("statsSummary 为空：最近 30 天可能尚未采集到 usage")
+        if not latest:
+            risks.append("datasetProfiles 为空：表画像 ingestion 尚未运行")
+        if aggregations.get("totalSqlQueries") in (None, 0) and not stats_summary.get(
+            "queryCountLast30Days"
+        ):
+            risks.append("该表最近 30 天内没有 SQL 查询记录")
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "range": range,
+                "highlights": {
+                    "query_count": stats_summary.get("queryCountLast30Days"),
+                    "unique_user_count": stats_summary.get("uniqueUserCountLast30Days"),
+                    "top_users_last_30_days": [
+                        {
+                            "urn": (u or {}).get("urn") or "",
+                            "username": (u or {}).get("username") or "",
+                        }
+                        for u in (stats_summary.get("topUsersLast30Days") or [])[:5]
+                        if isinstance(u, dict)
+                    ],
+                },
+                "latest": {
+                    "row_count": latest.get("rowCount"),
+                    "column_count": latest.get("columnCount"),
+                    "size_in_bytes": latest.get("sizeInBytes"),
+                    "timestamp_millis": latest.get("timestampMillis"),
+                },
+                "usage": {
+                    "unique_user_count": aggregations.get("uniqueUserCount"),
+                    "total_sql_queries": aggregations.get("totalSqlQueries"),
+                    "top_users": _summarize_top_users(aggregations.get("users"), 10),
+                    "fields": [
+                        {
+                            "field_name": (f or {}).get("fieldName"),
+                            "count": (f or {}).get("count"),
+                        }
+                        for f in (aggregations.get("fields") or [])
+                        if isinstance(f, dict)
+                    ],
+                },
+                "bucket_count": len(buckets),
+                "profiles": [
+                    {
+                        "timestamp_millis": p.get("timestampMillis"),
+                        "row_count": p.get("rowCount"),
+                        "column_count": p.get("columnCount"),
+                        "size_in_bytes": p.get("sizeInBytes"),
+                    }
+                    for p in profiles
+                ],
+            },
+            "risks": risks,
+            "evidence": {
+                "interface": "GraphQL dataset.{statsSummary,usageStats,datasetProfiles}",
+                "note": "Stats tab 数据来自 usage + dataset profile ingestion，缺失即代表对应 ingestion 未接入。",
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _base(table, public_base_url)
+        except Exception:
+            base = {"table": table}
+        return _error_response(exc, **base)
+
+
+def get_hive_table_queries(
+    client: DataHubClient,
+    *,
+    public_base_url: str,
+    table: str,
+    range: Literal["DAY", "WEEK", "MONTH"] = "MONTH",
+    operation_limit: int = 20,
+    operation_window_hours: int = 24 * 30,
+    top_query_limit: int = 50,
+    max_sql_chars: int = 8000,
+) -> dict[str, Any]:
+    """Return the Queries-tab evidence (top SQL + recent operations) for one Hive table."""
+    try:
+        base = _base(table, public_base_url)
+        if range not in {"DAY", "WEEK", "MONTH"}:
+            raise ValueError("range must be DAY, WEEK, or MONTH")
+        operation_limit = max(int(operation_limit), 1)
+        operation_window_hours = max(int(operation_window_hours), 1)
+        top_query_limit = max(int(top_query_limit), 0)
+        # End at the wall-clock now; start is a rolling window in the past.
+        end_millis: int | None = None
+        start_millis: int | None = None
+        try:
+            import time
+
+            end_millis = int(time.time() * 1000)
+            start_millis = end_millis - operation_window_hours * 3600 * 1000
+        except Exception:
+            start_millis = None
+            end_millis = None
+        data = client.graphql(
+            DATASET_STATS_QUERIES_QUERY,
+            {
+                "urn": base["dataset_urn"],
+                "range": range,
+                "profileLimit": 0,
+                "operationLimit": operation_limit,
+                "operationStartMillis": start_millis,
+                "operationEndMillis": end_millis,
+            },
+        )
+        dataset = data.get("dataset") or {}
+        if not dataset.get("exists", True):
+            return _error_response(
+                ValueError(f"dataset {base['table']} does not exist in DataHub"),
+                **base,
+            )
+        usage_stats = dataset.get("usageStats") or {}
+        aggregations = usage_stats.get("aggregations") or {}
+        buckets = usage_stats.get("buckets") or []
+        # Deduplicate topSqlQueries across buckets; order preserved by first appearance.
+        seen: set[str] = set()
+        top_queries: list[str] = []
+        for bucket in buckets:
+            metrics = (bucket or {}).get("metrics") or {}
+            for sql in metrics.get("topSqlQueries") or []:
+                if isinstance(sql, str) and sql not in seen:
+                    seen.add(sql)
+                    top_queries.append(sql)
+        operations = dataset.get("operations") or []
+        query_records: list[dict[str, Any]] = []
+        for op in operations:
+            if not isinstance(op, dict):
+                continue
+            # operations carry the executed SQL text in customProperties under "query_text"
+            sql_text = ""
+            for prop in op.get("customProperties") or []:
+                if not isinstance(prop, dict):
+                    continue
+                if prop.get("key") in {"query_text", "query", "sql"}:
+                    sql_text = prop.get("value") or ""
+                    if sql_text:
+                        break
+            actor = op.get("actor") or ""
+            affected = op.get("affectedDatasets") or []
+            query_records.append(
+                {
+                    "timestamp_millis": op.get("timestampMillis"),
+                    "operation_type": op.get("operationType"),
+                    "actor_urn": actor if isinstance(actor, str) else "",
+                    "affected_datasets": [a for a in affected if isinstance(a, str)],
+                    "num_affected_rows": op.get("numAffectedRows"),
+                    "sql": truncate_text(sql_text, max_sql_chars),
+                }
+            )
+        risks: list[str] = []
+        if not top_queries and not query_records:
+            risks.append(
+                "usageStats.topSqlQueries 与 operations 均为空：可能未接入 Hive SQL queries ingestion"
+            )
+        if not aggregations.get("totalSqlQueries"):
+            risks.append("该时间窗内 totalSqlQueries 为 0")
+        return {
+            "success": True,
+            **base,
+            "summary": {
+                "range": range,
+                "operation_window_hours": operation_window_hours,
+                "totals": {
+                    "total_sql_queries": aggregations.get("totalSqlQueries"),
+                    "unique_user_count": aggregations.get("uniqueUserCount"),
+                    "top_unique_query_count": len(top_queries),
+                    "operation_count": len(query_records),
+                },
+                "top_sql_queries": [
+                    truncate_text(q, max_sql_chars)
+                    for q in top_queries[:top_query_limit]
+                ],
+                "queries": query_records,
+            },
+            "risks": risks,
+            "evidence": {
+                "interface": "GraphQL dataset.{usageStats,operations}",
+                "aspects": ["datasetUsageStatistics", "operation"],
+                "note": (
+                    "topSqlQueries 来自 usage ingestion 聚合；operations 来自 SQL queries ingestion。"
+                    "两者独立来源，单独为空并不代表另一者也为空。"
+                ),
+            },
+        }
+    except Exception as exc:
+        try:
+            base = _base(table, public_base_url)
+        except Exception:
+            base = {"table": table}
+        return _error_response(exc, **base)

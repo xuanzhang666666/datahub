@@ -21,6 +21,7 @@ RUN npm install -g "@wnpm/btalk-cli@${BTALK_CLI_VERSION}" \
 
 # 增强版 tools.js:把 btalk CLI 子命令(ripple/user/group/pc_helper/...)包装成 MCP tools
 COPY src/mcp/tools.js /usr/local/lib/node_modules/@wnpm/btalk-cli/src/mcp/tools.js
+COPY src/mcp/daemon_handlers.js /usr/local/lib/node_modules/@wnpm/btalk-cli/src/mcp/daemon_handlers.js
 
 ENV BTALK_MCP_PORT=9013
 EXPOSE 9013
