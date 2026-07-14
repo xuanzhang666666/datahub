@@ -31,7 +31,7 @@ nohup "$RUN_SCRIPT" >>"$LOG_FILE" 2>&1 </dev/null &
 NEW_PID="$!"
 echo "$NEW_PID" >"$PID_FILE"
 
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   if curl -fsS "http://localhost:9012/health" >/dev/null; then
     echo "BLF Schedule MCP restarted: pid=$NEW_PID"
     exit 0

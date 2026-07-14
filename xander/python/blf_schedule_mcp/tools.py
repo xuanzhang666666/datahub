@@ -6,6 +6,10 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+
+# Jenkins 内部时间戳统一按 UTC 保存,工具对外输出统一转换成北京时间(UTC+8),
+# 避免用户看到 ISO 字符串时再人工 +8 小时换算。
+BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 from typing import Any
 
 from .datahub_client import DataHubClient, DataHubClientError
@@ -113,7 +117,7 @@ def _format_build(build: dict[str, Any]) -> dict[str, Any]:
     if timestamp_ms:
         started_at = datetime.fromtimestamp(
             timestamp_ms / 1000,
-            tz=timezone.utc,
+            tz=BEIJING_TZ,
         ).replace(tzinfo=None).isoformat(timespec="seconds")
     duration_ms = int(build.get("duration") or 0)
     return {
@@ -132,7 +136,7 @@ def _format_timestamp_ms(timestamp_ms: int) -> str:
     return (
         datetime.fromtimestamp(
             timestamp_ms / 1000,
-            tz=timezone.utc,
+            tz=BEIJING_TZ,
         )
         .replace(tzinfo=None)
         .isoformat(timespec="seconds")

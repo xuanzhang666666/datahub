@@ -230,7 +230,10 @@ def main() -> int:
         },
         "sink": {
             "type": "datahub-rest",
-            "config": {"server": args.gms_url_placeholder},
+            "config": {
+                "server": args.gms_url_placeholder,
+                "token": "${DATAHUB_GMS_TOKEN}",
+            },
         },
     }
 
