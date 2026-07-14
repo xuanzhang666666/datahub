@@ -175,3 +175,4 @@ test-models/bin/
 .wtp.yml
 *.gz
 *.xlsx
+*.csv
